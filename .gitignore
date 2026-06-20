@@ -1,0 +1,30 @@
+# Build
+build/
+*.o
+*.elf
+*.bin
+*.img
+
+# IDE
+.vscode/*.log
+.idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Debug
+*.dSYM/
+
+# Survey — work-related research, NOT for publication
+survey/
+
+# Docs — keep local only, NOT for publication
+docs/
+
+# Tools — local-only utilities, NOT for publication
+tools/
+
+# Python cache
+__pycache__/
+*.pyc
