@@ -56,6 +56,10 @@ typedef struct task_struct {
     /* --- 阻塞信息 --- */
     void            *block_obj;    /* 阻塞在哪个对象上 (信号量/互斥量) */
 
+    /* --- 优先级继承 --- */
+    u32             original_priority;  /* PI 提升前的原始优先级 */
+    void            *held_mutex;   /* 当前持有的互斥量 (NULL = 没持有) */
+
 } task_t;
 
 /* =========================== 公共 API =========================== */
@@ -184,5 +188,23 @@ void ready_dequeue(task_t *t);
  * @return 最高优先级的就绪任务, 无任务时返回 IDLE
  */
 task_t *pick_next_task(void);
+
+/**
+ * @brief  动态修改任务优先级 (用于优先级继承)
+ * @param  t            目标任务
+ * @param  new_priority 新的优先级值
+ *
+ * 如果任务在就绪队列中 → 先移出, 改优先级, 再放回新优先级队列。
+ * 如果任务是 RUNNING/BLOCKED → 只改字段。
+ *
+ * 注意: 此函数不检查 new_priority 是否有效, 调用者保证。
+ *       不触发 schedule(), 由调用者决定是否需要重新调度。
+ */
+void task_change_priority(task_t *t, u32 new_priority);
+
+/**
+ * @brief  标记需要重新调度 (供 IPC/中断使用)
+ */
+void sched_request(void);
 
 #endif /* _MOS_TASK_H */

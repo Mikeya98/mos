@@ -284,6 +284,30 @@ void task_yield(void)
     schedule();
 }
 
+void task_change_priority(task_t *t, u32 new_priority)
+{
+    if (!t) return;
+    if (t->priority == new_priority) return;
+
+    /*
+     * 如果任务在就绪队列中 → 从旧优先级移出, 放入新优先级。
+     * RUNNING 任务也在就绪队列中 (MOS 设计), 所以统一处理。
+     * BLOCKED/SLEEPING 任务不在就绪队列 → 只改字段。
+     */
+    if (t->state == TASK_READY || t->state == TASK_RUNNING) {
+        ready_dequeue(t);
+        t->priority = new_priority;
+        ready_enqueue(t);
+    } else {
+        t->priority = new_priority;
+    }
+}
+
+void sched_request(void)
+{
+    need_resched = 1;
+}
+
 void task_sleep(u32 ms)
 {
     if (ms == 0) return;
@@ -364,6 +388,8 @@ void task_init(void)
     idle_tcb.next        = NULL;
     idle_tcb.prev        = NULL;
     idle_tcb.block_obj   = NULL;
+    idle_tcb.original_priority = PRIO_IDLE;
+    idle_tcb.held_mutex  = NULL;
 
     /* IDLE 使用自己的静态栈 (512B, 8 字节对齐) */
     static u8 idle_stack[512] __attribute__((aligned(8)));
@@ -434,6 +460,8 @@ task_t *task_create(void (*entry)(void), const char *name,
     t->next        = NULL;
     t->prev        = NULL;
     t->block_obj   = NULL;
+    t->original_priority = priority;
+    t->held_mutex  = NULL;
 
     /* 填充名称 */
     for (i = 0; i < TASK_NAME_MAX - 1 && name && name[i]; i++) {

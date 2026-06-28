@@ -46,8 +46,7 @@ CFLAGS      = $(ARCH_FLAGS) $(WARN_FLAGS) $(OPT_FLAGS) $(STD_FLAGS) \
 ASFLAGS     = $(ARCH_FLAGS) -I$(INC_DIR)
 
 # 链接选项 (用 gcc 链接以便自动链接 libgcc)
-LDFLAGS     = -Wl,-T,kernel.lds -nostdlib -Wl,-Map,$(BLD_DIR)/mos.map \
-              -Wl,--no-warn-rwx-segments
+LDFLAGS     = -Wl,-T,kernel.lds -nostdlib -Wl,-Map,$(BLD_DIR)/mos.map
 
 # =========================== 源文件 ===========================
 # 汇编
@@ -68,7 +67,8 @@ KERNEL_SRCS = $(SRC_DIR)/kernel/main.c \
               $(SRC_DIR)/kernel/task.c
 
 # IPC
-IPC_SRCS = $(SRC_DIR)/ipc/semaphore.c
+IPC_SRCS = $(SRC_DIR)/ipc/semaphore.c \
+           $(SRC_DIR)/ipc/mutex.c
 
 # 所有 C 源文件
 C_SRCS   = $(LIB_SRCS) $(DRV_SRCS) $(KERNEL_SRCS) $(IPC_SRCS)
