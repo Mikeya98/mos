@@ -68,7 +68,8 @@ KERNEL_SRCS = $(SRC_DIR)/kernel/main.c \
 
 # IPC
 IPC_SRCS = $(SRC_DIR)/ipc/semaphore.c \
-           $(SRC_DIR)/ipc/mutex.c
+           $(SRC_DIR)/ipc/mutex.c \
+           $(SRC_DIR)/ipc/msgq.c
 
 # 所有 C 源文件
 C_SRCS   = $(LIB_SRCS) $(DRV_SRCS) $(KERNEL_SRCS) $(IPC_SRCS)
