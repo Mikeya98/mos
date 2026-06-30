@@ -71,8 +71,11 @@ IPC_SRCS = $(SRC_DIR)/ipc/semaphore.c \
            $(SRC_DIR)/ipc/mutex.c \
            $(SRC_DIR)/ipc/msgq.c
 
+# 内存管理
+MM_SRCS  = $(SRC_DIR)/mm/buddy.c
+
 # 所有 C 源文件
-C_SRCS   = $(LIB_SRCS) $(DRV_SRCS) $(KERNEL_SRCS) $(IPC_SRCS)
+C_SRCS   = $(LIB_SRCS) $(DRV_SRCS) $(KERNEL_SRCS) $(IPC_SRCS) $(MM_SRCS)
 
 # =========================== 目标文件 ===========================
 C_OBJS   = $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(C_SRCS))

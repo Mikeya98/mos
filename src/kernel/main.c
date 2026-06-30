@@ -1,15 +1,16 @@
 /**
  * @file    main.c
- * @brief   MOS RTOS C entry — message queue producer-consumer demo
+ * @brief   MOS RTOS C entry — buddy allocator demo (v0.3 preview)
  *
- * v0.2: mutex (PI) + message queue
- *
- * Demo scenario (yield-driven, no timer needed):
- *   1. msgq capacity=4, msg_size=4 (u32)
- *   2. Producer (prio=2) sends 6 values into a 4-slot queue
- *   3. First 4 sends succeed, 5th blocks (queue full)
- *   4. Consumer (prio=3) receives, each recv wakes producer
- *   5. Producer sends one more, blocks again → cycle repeats
+ * Demo scenario (sequential, before scheduler starts):
+ *   1. buddy_init() with linker-provided heap region
+ *   2. Series of alloc calls → observe splitting
+ *   3. buddy_dump() after allocs
+ *   4. Free some blocks → observe merging
+ *   5. buddy_dump() after frees
+ *   6. Re-alloc → verify split from merged block
+ *   7. Stress: alloc until OOM, then free all
+ *   8. Remaining heap should be back to 1 big block
  */
 
 #include "lib/types.h"
@@ -18,79 +19,112 @@
 #include "drivers/gic.h"
 #include "drivers/timer.h"
 #include "kernel/task.h"
-#include "ipc/semaphore.h"
-#include "ipc/mutex.h"
-#include "ipc/msgq.h"
+#include "mm/buddy.h"
 
-static sem_t   print_sem;
-static msgq_t  test_msgq;
-static u8      msgq_buf[4 * 4];  /* 4 messages × 4 bytes each */
+/* =========================== 外部符号 =========================== */
+/* 由 kernel.lds 提供 */
+extern u8 _heap_start;
+extern u8 _heap_end;
 
-/*
- * Producer (prio=2): send 6 values into a 4-slot queue.
- * No yield — blocking/waking drives the alternation.
- *
- * Flow:
- *   1. Sends 100,200,300,400 → queue full
- *   2. Tries 500 → BLOCKS (no space)
- *   3. Consumer wakes, receives 100 → wakes producer
- *   4. Producer preempts consumer (prio=2 > 3), sends 500 → full, blocks again
- *   5. Cycle repeats for 600
- */
-static void producer(void)
-{
-    u32 vals[] = {100, 200, 300, 400, 500, 600};
-    int i;
-
-    for (i = 0; i < 6; i++) {
-        sem_wait(&print_sem);
-        printf("[PROD] send %u (count=%u)\n", vals[i], test_msgq.count);
-        sem_post(&print_sem);
-
-        msgq_send(&test_msgq, &vals[i], 1);  /* may block here */
-    }
-
-    sem_wait(&print_sem);
-    printf("[PROD] all sent, sleeping\n");
-    sem_post(&print_sem);
-
-    task_sleep(999999);  /* sleep "forever" — removed from ready queue */
-}
+/* =========================== 测试用例 =========================== */
 
 /*
- * Consumer (prio=3): receive 6 values, blocking when empty.
- *
- * Flow:
- *   1. Starts first, tries recv → BLOCKS (queue empty)
- *   2. Producer fills queue, each send wakes consumer but
- *      consumer is lower priority → producer keeps going
- *   3. Producer blocks on 5th send → consumer finally runs
- *   4. Consumer recv → wakes producer (higher prio) → producer preempts
- *   5. Cycle repeats
+ * Buddy allocator demo — run before sched_start.
+ * Tests: rounding, splitting, merging, OOM, stress.
  */
-static void consumer(void)
+static void buddy_demo(void)
 {
-    u32 val;
-    int i;
+    u32 heap_size;
+    void *p[10];
+    u32 i;
 
-    for (i = 0; i < 6; i++) {
-        sem_wait(&print_sem);
-        printf("[CONS] waiting... (count=%u)\n", test_msgq.count);
-        sem_post(&print_sem);
+    heap_size = (u32)(&_heap_end - &_heap_start);
 
-        msgq_recv(&test_msgq, &val, 1);  /* may block here */
+    printf("\n========================================\n");
+    printf("  Buddy Allocator Demo\n");
+    printf("  heap: %X - %X (%u B)\n",
+           (u32)(uintptr_t)&_heap_start,
+           (u32)(uintptr_t)&_heap_end,
+           heap_size);
+    printf("========================================\n\n");
 
-        sem_wait(&print_sem);
-        printf("[CONS] recv %u (count=%u)\n", val, test_msgq.count);
-        sem_post(&print_sem);
+    /* 1. 初始化 */
+    buddy_init(&_heap_start, heap_size);
+    buddy_dump();
+    printf("[PASS] buddy_init — 1 free block (order ~%u)\n\n",
+           (u32)(heap_size / 64));
+
+    /* 2. 分配: 不同大小 → 触发分裂 */
+    p[0] = buddy_alloc(300);   /* → 512B, order 3 */
+    printf("[ALLOC] 300B → 512B (order 3)  ptr=%X\n", (u32)(uintptr_t)p[0]);
+
+    p[1] = buddy_alloc(100);   /* → 128B, order 1 */
+    printf("[ALLOC] 100B → 128B (order 1)  ptr=%X\n", (u32)(uintptr_t)p[1]);
+
+    p[2] = buddy_alloc(1);     /* → 64B,  order 0 */
+    printf("[ALLOC]   1B →  64B (order 0)  ptr=%X\n", (u32)(uintptr_t)p[2]);
+
+    p[3] = buddy_alloc(2000);  /* → 2048B, order 5 */
+    printf("[ALLOC] 2KB → 2KB  (order 5)  ptr=%X\n", (u32)(uintptr_t)p[3]);
+
+    p[4] = buddy_alloc(4096);  /* → 4096B, order 6 */
+    printf("[ALLOC] 4KB → 4KB  (order 6)  ptr=%X\n", (u32)(uintptr_t)p[4]);
+
+    buddy_dump();
+
+    /* 3. 释放 → 测试合并 */
+    printf("[FREE]  ptr=%X (order 3, 512B)\n", (u32)(uintptr_t)p[0]);
+    buddy_free(p[0]);
+
+    printf("[FREE]  ptr=%X (order 0, 64B)\n", (u32)(uintptr_t)p[2]);
+    buddy_free(p[2]);
+
+    printf("[FREE]  ptr=%X (order 1, 128B)\n", (u32)(uintptr_t)p[1]);
+    buddy_free(p[1]);
+    printf("  (freed 3 small blocks)\n");
+
+    buddy_dump();
+
+    /* 4. 重新分配同一位置 → 验证重新分裂 */
+    p[5] = buddy_alloc(512);
+    printf("[ALLOC] 512B → 512B (order 3)  ptr=%X\n", (u32)(uintptr_t)p[5]);
+    buddy_dump();
+
+    /* 5. 压力测试: 分配直到 OOM */
+    printf("\n--- Stress: alloc until OOM ---\n");
+    for (i = 0; i < 10; i++) p[i] = NULL;
+
+    for (i = 0; i < 10; i++) {
+        /*
+         * 每次分配 128KB (order 11), 1MB 堆最多容纳 8 个。
+         * 加上之前已分配的 p[3]=2KB, p[4]=4KB, p[5]=512B,
+         * 预期第 7-8 次会失败。
+         */
+        p[i] = buddy_alloc(128 * 1024);
+        if (p[i]) {
+            printf("  stress[%u] alloc 128KB → ptr=%X\n", i, (u32)(uintptr_t)p[i]);
+        } else {
+            printf("  stress[%u] alloc 128KB → NULL (OOM, expected)\n", i);
+            break;
+        }
+    }
+    buddy_dump();
+
+    /* 6. 全部释放 → 应该回到 1 个大块 */
+    printf("\n--- Free all ---\n");
+    buddy_free(p[5]);   /* 512B */
+    buddy_free(p[4]);   /* 4KB */
+    buddy_free(p[3]);   /* 2KB */
+    for (i = 0; i < 10 && p[i]; i++) {
+        buddy_free(p[i]);  /* 128KB chunks */
+        printf("  freed stress[%u]\n", i);
     }
 
-    sem_wait(&print_sem);
-    printf("[CONS] all received, sleeping\n");
-    sem_post(&print_sem);
-
-    task_sleep(999999);  /* sleep "forever" — removed from ready queue */
+    buddy_dump();
+    printf("[DONE] Buddy allocator demo complete.\n\n");
 }
+
+/* =========================== 中断分发 =========================== */
 
 void irq_dispatch(void)
 {
@@ -108,14 +142,16 @@ void irq_dispatch(void)
     }
 }
 
+/* =========================== 内核入口 =========================== */
+
 void kernel_main(void)
 {
     uart_init(115200);
 
     printf("\n");
     printf("========================================\n");
-    printf("  MOS RTOS v0.2\n");
-    printf("  Message Queue Demo\n");
+    printf("  MOS RTOS v0.3-dev\n");
+    printf("  Buddy Allocator Test\n");
     printf("========================================\n\n");
 
     gic_init();
@@ -124,18 +160,11 @@ void kernel_main(void)
     task_init();
     printf("[INIT] Task subsystem ready\n");
 
-    sem_init(&print_sem, 1);
-    msgq_init(&test_msgq, msgq_buf, 4, 4);
-    printf("[INIT] Semaphore + MsgQ(4x4B) ready\n\n");
-
-    printf("Creating tasks...\n");
-    task_create(producer, "producer", 2, STACK_4K);
-    printf("  [CREATED] producer (prio=2)\n");
-    task_create(consumer, "consumer", 3, STACK_4K);
-    printf("  [CREATED] consumer (prio=3)\n\n");
-
     timer_init(TICK_MS);
     printf("[INIT] Timer started\n");
+
+    /* 在启动调度器之前运行 buddy demo (纯逻辑, 无需任务) */
+    buddy_demo();
 
     printf("Starting scheduler...\n");
     printf("--- MOS RTOS is running now ---\n\n");
