@@ -72,7 +72,8 @@ IPC_SRCS = $(SRC_DIR)/ipc/semaphore.c \
            $(SRC_DIR)/ipc/msgq.c
 
 # 内存管理
-MM_SRCS  = $(SRC_DIR)/mm/buddy.c
+MM_SRCS  = $(SRC_DIR)/mm/buddy.c \
+           $(SRC_DIR)/mm/slab.c
 
 # 所有 C 源文件
 C_SRCS   = $(LIB_SRCS) $(DRV_SRCS) $(KERNEL_SRCS) $(IPC_SRCS) $(MM_SRCS)

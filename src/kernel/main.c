@@ -1,6 +1,6 @@
 /**
  * @file    main.c
- * @brief   MOS RTOS C entry — buddy allocator demo (v0.3 preview)
+ * @brief   MOS RTOS C entry — buddy + SLAB allocator demo (v0.4-dev)
  *
  * Demo scenario (sequential, before scheduler starts):
  *   1. buddy_init() with linker-provided heap region
@@ -20,6 +20,7 @@
 #include "drivers/timer.h"
 #include "kernel/task.h"
 #include "mm/buddy.h"
+#include "mm/slab.h"
 
 /* =========================== 外部符号 =========================== */
 /* 由 kernel.lds 提供 */
@@ -124,6 +125,99 @@ static void buddy_demo(void)
     printf("[DONE] Buddy allocator demo complete.\n\n");
 }
 
+/*
+ * SLAB allocator demo — 在 buddy_demo 之后运行。
+ * 测试: 多 cache 创建、alloc/free 复用、自动 grow、统计。
+ */
+static void slab_demo(void)
+{
+    slab_cache_t *c32, *c128, *c512;
+    void *p[12];
+    void *s[25];
+    u32 i;
+
+    printf("========================================\n");
+    printf("  SLAB Allocator Demo\n");
+    printf("========================================\n\n");
+
+    /* 1. 创建 3 个不同大小的 cache */
+    c32  = slab_create("task_struct", 32);
+    c128 = slab_create("sem_object",  128);
+    c512 = slab_create("stack_512B",  512);
+
+    printf("[CREATE] caches: c32=%s c128=%s c512=%s\n",
+           c32->name, c128->name, c512->name);
+    slab_dump_all();
+
+    /* 2. 从每个 cache 分配若干对象 */
+    printf("--- Alloc from each cache ---\n");
+    for (i = 0; i < 4; i++) {
+        p[i] = slab_alloc(c32);
+        printf("  c32[%u] = %X\n", i, (u32)(uintptr_t)p[i]);
+    }
+    for (i = 0; i < 3; i++) {
+        p[4 + i] = slab_alloc(c128);
+        printf("  c128[%u] = %X\n", i, (u32)(uintptr_t)p[4 + i]);
+    }
+    for (i = 0; i < 3; i++) {
+        p[7 + i] = slab_alloc(c512);
+        printf("  c512[%u] = %X\n", i, (u32)(uintptr_t)p[7 + i]);
+    }
+
+    slab_dump_all();
+
+    /*
+     * 3. 验证地址不重叠 (同一 cache 内对象间隔 = total_size)
+     *    注意: free_list 是 LIFO, 后链入的对象先分配,
+     *    地址降序排列, 用 p[0] - p[1] 避免无符号下溢。
+     */
+    printf("[CHECK] c32 interval: %u (expected %u)\n",
+           (u32)(uintptr_t)p[0] - (u32)(uintptr_t)p[1],
+           c32->total_size);
+
+    /* 4. Free 两个, 再 alloc — 验证 LIFO 复用 */
+    printf("\n--- Free & re-alloc (LIFO reuse) ---\n");
+    printf("[FREE]  c32[0]=%X\n", (u32)(uintptr_t)p[0]);
+    printf("[FREE]  c32[2]=%X\n", (u32)(uintptr_t)p[2]);
+    slab_free(p[0]);
+    slab_free(p[2]);
+
+    p[10] = slab_alloc(c32);
+    p[11] = slab_alloc(c32);
+    printf("[ALLOC] c32 new1=%X (expect == p[2]=%X)\n",
+           (u32)(uintptr_t)p[10], (u32)(uintptr_t)p[2]);
+    printf("[ALLOC] c32 new2=%X (expect == p[0]=%X)\n",
+           (u32)(uintptr_t)p[11], (u32)(uintptr_t)p[0]);
+
+    /* 5. 压力: 分配大量对象 → 触发 slab_grow */
+    printf("\n--- Stress: alloc 25 objects from c32 ---\n");
+    for (i = 0; i < 25; i++) {
+        s[i] = slab_alloc(c32);
+        if (s[i]) {
+            printf("  s[%u] = %X\n", i, (u32)(uintptr_t)s[i]);
+        } else {
+            printf("  s[%u] = NULL (OOM)\n", i);
+            break;
+        }
+    }
+    slab_cache_dump(c32);
+
+    /* 6. 全部释放 */
+    printf("\n--- Free all ---\n");
+    for (i = 0; i < 25 && s[i]; i++) {
+        slab_free(s[i]);
+    }
+    slab_free(p[10]);
+    slab_free(p[11]);
+    slab_free(p[1]);
+    slab_free(p[3]);
+    for (i = 0; i < 3; i++) slab_free(p[4 + i]);
+    for (i = 0; i < 3; i++) slab_free(p[7 + i]);
+
+    slab_dump_all();
+    printf("[DONE] SLAB allocator demo complete.\n\n");
+}
+
 /* =========================== 中断分发 =========================== */
 
 void irq_dispatch(void)
@@ -150,8 +244,8 @@ void kernel_main(void)
 
     printf("\n");
     printf("========================================\n");
-    printf("  MOS RTOS v0.3-dev\n");
-    printf("  Buddy Allocator Test\n");
+    printf("  MOS RTOS v0.4-dev\n");
+    printf("  Buddy + SLAB Allocator Test\n");
     printf("========================================\n\n");
 
     gic_init();
@@ -163,8 +257,9 @@ void kernel_main(void)
     timer_init(TICK_MS);
     printf("[INIT] Timer started\n");
 
-    /* 在启动调度器之前运行 buddy demo (纯逻辑, 无需任务) */
+    /* 在启动调度器之前运行 buddy + slab demo (纯逻辑, 无需任务) */
     buddy_demo();
+    slab_demo();
 
     printf("Starting scheduler...\n");
     printf("--- MOS RTOS is running now ---\n\n");
