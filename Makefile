@@ -75,8 +75,13 @@ IPC_SRCS = $(SRC_DIR)/ipc/semaphore.c \
 MM_SRCS  = $(SRC_DIR)/mm/buddy.c \
            $(SRC_DIR)/mm/slab.c
 
+# 文件系统 (v0.5)
+FS_SRCS  = $(SRC_DIR)/fs/block_dev.c \
+           $(SRC_DIR)/fs/mos_fs.c \
+           $(SRC_DIR)/fs/vfs.c
+
 # 所有 C 源文件
-C_SRCS   = $(LIB_SRCS) $(DRV_SRCS) $(KERNEL_SRCS) $(IPC_SRCS) $(MM_SRCS)
+C_SRCS   = $(LIB_SRCS) $(DRV_SRCS) $(KERNEL_SRCS) $(IPC_SRCS) $(MM_SRCS) $(FS_SRCS)
 
 # =========================== 目标文件 ===========================
 C_OBJS   = $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(C_SRCS))

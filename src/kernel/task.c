@@ -14,6 +14,7 @@
 #include "lib/string.h"
 #include "drivers/gic.h"        /* ENTER_CRITICAL / EXIT_CRITICAL */
 #include "drivers/timer.h"
+#include "mm/slab.h"
 
 /* =========================== 外部引用 =========================== */
 /*
@@ -49,8 +50,11 @@ static volatile u32 need_resched = 0;
 /** IDLE 任务 TCB (静态分配, 因为是最先创建的) */
 static task_t idle_tcb;
 
-/** 全局 TCB 池 + 计数 (供 sys_tick_handler 遍历唤醒) */
-static task_t *tcb_list[16 + 1];  /* 16 user + 1 idle */
+/** TCB SLAB cache (task_init 中创建) */
+static slab_cache_t *task_cache = NULL;
+
+/** 全局 TCB 指针列表 + 计数 (供 sys_tick_handler 遍历唤醒) */
+static task_t *tcb_list[32];  /* 动态增长上限 */
 static u32 tcb_count = 0;
 
 /* =========================== 任务栈池 =========================== */
@@ -418,6 +422,9 @@ void task_init(void)
         idle_tcb.name[i] = idle_name[i];
     }
     idle_tcb.name[i] = '\0';
+
+    /* 创建 TCB SLAB cache — 替代原来的 tcb_pool[16] 静态数组 */
+    task_cache = slab_create("task_t", sizeof(task_t));
 }
 
 task_t *task_create(void (*entry)(void), const char *name,
@@ -439,11 +446,16 @@ task_t *task_create(void (*entry)(void), const char *name,
     /* 2. 初始化栈帧 */
     u32 init_sp = stack_init(sp_top, entry);
 
-    /* 3. 分配 TCB (v0.1: 固定 16 个静态 TCB 池) */
-    static task_t tcb_pool[16];
+    /* 3. 分配 TCB (v0.4: SLAB 动态分配, 不再有 16 个的静态限制) */
+    if (tcb_count >= 32) return NULL;  /* tcb_list 指针数组上限 */
+    t = (task_t *)slab_alloc(task_cache);
+    if (!t) return NULL;               /* SLAB 内存不足 */
 
-    if (tcb_count >= 17) return NULL;  /* 16 user + 1 idle = 17 max */
-    t = &tcb_pool[tcb_count - 1];      /* -1 因为 slot 0 是 IDLE */
+    /* SLAB 复用已释放的内存, 需要清零 (next/prev/block_obj/held_mutex 等) */
+    for (i = 0; i < (int)(sizeof(task_t) / 4); i++) {
+        ((u32 *)t)[i] = 0;
+    }
+
     tcb_list[tcb_count] = t;
     tcb_count++;
 
@@ -462,6 +474,18 @@ task_t *task_create(void (*entry)(void), const char *name,
     t->block_obj   = NULL;
     t->original_priority = priority;
     t->held_mutex  = NULL;
+
+    /* v0.5: 初始化文件描述符表 */
+    {
+        u32 fi;
+        for (fi = 0; fi < MAX_FD_PER_TASK; fi++) {
+            t->fd_table[fi].in_use    = 0;
+            t->fd_table[fi].inode_num = 0;
+            t->fd_table[fi].of_idx    = 0;
+            t->fd_table[fi].offset    = 0;
+            t->fd_table[fi].flags     = 0;
+        }
+    }
 
     /* 填充名称 */
     for (i = 0; i < TASK_NAME_MAX - 1 && name && name[i]; i++) {

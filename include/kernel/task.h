@@ -12,6 +12,7 @@
 #define _MOS_TASK_H
 
 #include "lib/types.h"
+#include "fs/vfs.h"
 
 /* =========================== 常量 =========================== */
 #define PRIO_COUNT      32         /* 优先级级数 */
@@ -59,6 +60,9 @@ typedef struct task_struct {
     /* --- 优先级继承 --- */
     u32             original_priority;  /* PI 提升前的原始优先级 */
     void            *held_mutex;   /* 当前持有的互斥量 (NULL = 没持有) */
+
+    /* --- 文件系统 (v0.5) --- */
+    file_desc_t     fd_table[MAX_FD_PER_TASK];  /* 每个任务的文件描述符表 */
 
 } task_t;
 

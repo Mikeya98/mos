@@ -1,6 +1,6 @@
 /**
  * @file    main.c
- * @brief   MOS RTOS C entry — buddy + SLAB allocator demo (v0.4-dev)
+ * @brief   MOS RTOS C entry — buddy + SLAB allocator + TCB SLAB 化 (v0.4)
  *
  * Demo scenario (sequential, before scheduler starts):
  *   1. buddy_init() with linker-provided heap region
@@ -21,6 +21,9 @@
 #include "kernel/task.h"
 #include "mm/buddy.h"
 #include "mm/slab.h"
+#include "fs/block_dev.h"
+#include "fs/mos_fs.h"
+#include "fs/vfs.h"
 
 /* =========================== 外部符号 =========================== */
 /* 由 kernel.lds 提供 */
@@ -218,6 +221,117 @@ static void slab_demo(void)
     printf("[DONE] SLAB allocator demo complete.\n\n");
 }
 
+/*
+ * Filesystem demo — 在 buddy + slab demo 之后运行。
+ * 测试: RAM 盘创建 → 格式化 → 挂载 → 文件 CRUD → 目录遍历。
+ */
+static void fs_demo(void)
+{
+    block_dev_t *ramdisk;
+    char buf[128];
+    char name[32];
+    int fd, dd, result;
+    u32 i;
+
+    printf("========================================\n");
+    printf("  Filesystem Demo (MOS-FS v0.5)\n");
+    printf("========================================\n\n");
+
+    /* 1. 创建 64KB RAM 盘 */
+    ramdisk = ramdisk_create(64 * 1024);
+    if (!ramdisk) {
+        printf("[FAIL] ramdisk_create\n");
+        return;
+    }
+    printf("[CREATE] RAM disk: %u blocks × %u B = %u KB\n",
+           ramdisk->total_blocks, ramdisk->block_size,
+           ramdisk->total_blocks * ramdisk->block_size / 1024);
+
+    /* 2. 格式化 */
+    result = mos_fs_mkfs(ramdisk);
+    if (result != 0) {
+        printf("[FAIL] mos_fs_mkfs\n");
+        return;
+    }
+    printf("[PASS]  mos_fs_mkfs — MOS-FS formatted\n");
+
+    /* 3. 挂载 */
+    result = mos_mount(ramdisk);
+    if (result != 0) {
+        printf("[FAIL] mos_mount (magic mismatch?)\n");
+        return;
+    }
+    printf("[PASS]  mos_mount — filesystem mounted\n\n");
+
+    /* 4. 创建并写入文件 */
+    printf("--- File create & write ---\n");
+    fd = mos_open("/hello.txt", O_RDWR | O_CREAT);
+    if (fd < 0) {
+        printf("[FAIL] mos_open /hello.txt\n");
+        return;
+    }
+    printf("[OPEN]  /hello.txt → fd=%d\n", fd);
+
+    const char *msg = "Hello from MOS filesystem!";
+    result = mos_write(fd, msg, 27);
+    printf("[WRITE] %d bytes: \"%s\"\n", result, msg);
+
+    mos_close(fd);
+    printf("[CLOSE] fd=%d\n\n", fd);
+
+    /* 5. 重新打开并读取验证 */
+    printf("--- File reopen & read ---\n");
+    fd = mos_open("/hello.txt", O_RDONLY);
+    if (fd < 0) {
+        printf("[FAIL] mos_open /hello.txt (reopen)\n");
+        return;
+    }
+    printf("[OPEN]  /hello.txt → fd=%d\n", fd);
+
+    for (i = 0; i < 128; i++) buf[i] = 0;
+    result = mos_read(fd, buf, 128);
+    printf("[READ]  %d bytes: \"%s\"\n", result, buf);
+    printf("[SIZE]  %d bytes\n", mos_filesize(fd));
+
+    /* 验证内容 */
+    {
+        int match = 1;
+        for (i = 0; i < 27; i++) {
+            if (buf[i] != msg[i]) { match = 0; break; }
+        }
+        printf("[CHECK] content %s\n\n", match ? "MATCH ✓" : "MISMATCH ✗");
+    }
+    mos_close(fd);
+
+    /* 6. 创建第二个文件 */
+    fd = mos_open("/readme.txt", O_RDWR | O_CREAT);
+    if (fd >= 0) {
+        mos_write(fd, "MOS-FS: a minimal filesystem for RTOS.", 39);
+        printf("[WRITE] /readme.txt — 39 bytes\n");
+        mos_close(fd);
+    }
+
+    /* 7. 列根目录 */
+    printf("\n--- Root directory listing ---\n");
+    dd = mos_opendir("/");
+    if (dd < 0) {
+        printf("[FAIL] mos_opendir /\n");
+        return;
+    }
+    while (1) {
+        result = mos_readdir(dd, name, sizeof(name));
+        if (result == 1) break;
+        if (result < 0) {
+            printf("[FAIL] mos_readdir\n");
+            break;
+        }
+        printf("  [ENTRY] %s\n", name);
+    }
+    mos_closedir(dd);
+
+    printf("\n[DONE] Filesystem demo complete.\n\n");
+}
+
 /* =========================== 中断分发 =========================== */
 
 void irq_dispatch(void)
@@ -244,8 +358,8 @@ void kernel_main(void)
 
     printf("\n");
     printf("========================================\n");
-    printf("  MOS RTOS v0.4-dev\n");
-    printf("  Buddy + SLAB Allocator Test\n");
+    printf("  MOS RTOS v0.5\n");
+    printf("  Buddy + SLAB + TCB Dynamic + MOS-FS\n");
     printf("========================================\n\n");
 
     gic_init();
@@ -257,9 +371,10 @@ void kernel_main(void)
     timer_init(TICK_MS);
     printf("[INIT] Timer started\n");
 
-    /* 在启动调度器之前运行 buddy + slab demo (纯逻辑, 无需任务) */
+    /* 在启动调度器之前运行 demo */
     buddy_demo();
     slab_demo();
+    fs_demo();
 
     printf("Starting scheduler...\n");
     printf("--- MOS RTOS is running now ---\n\n");
