@@ -21,6 +21,7 @@
 #include "kernel/task.h"
 #include "mm/buddy.h"
 #include "mm/slab.h"
+#include "mm/mmu.h"
 #include "fs/block_dev.h"
 #include "fs/mos_fs.h"
 #include "fs/vfs.h"
@@ -358,9 +359,12 @@ void kernel_main(void)
 
     printf("\n");
     printf("========================================\n");
-    printf("  MOS RTOS v0.5\n");
-    printf("  Buddy + SLAB + TCB Dynamic + MOS-FS\n");
+    printf("  MOS RTOS v0.6\n");
+    printf("  MMU + Buddy + SLAB + MOS-FS\n");
     printf("========================================\n\n");
+
+    mmu_init();
+    printf("[INIT] MMU enabled (identity map)\n");
 
     gic_init();
     printf("[INIT] GIC initialized\n");

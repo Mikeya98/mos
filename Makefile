@@ -73,7 +73,8 @@ IPC_SRCS = $(SRC_DIR)/ipc/semaphore.c \
 
 # 内存管理
 MM_SRCS  = $(SRC_DIR)/mm/buddy.c \
-           $(SRC_DIR)/mm/slab.c
+           $(SRC_DIR)/mm/slab.c \
+           $(SRC_DIR)/mm/mmu.c
 
 # 文件系统 (v0.5)
 FS_SRCS  = $(SRC_DIR)/fs/block_dev.c \
