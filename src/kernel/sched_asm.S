@@ -79,3 +79,38 @@ _do_restore:
     @ ============================================
     CPSIE   i
     BX      lr
+
+/* ============================================================
+ * 用户态任务首次进入的跳板 (v0.6 阶段2)
+ *
+ * 首次被调度到时, context_switch 恢复 {r4-r11, lr} 后 BX lr 跳到这里。
+ * 入口约定 (由 stack_init_user 伪造):
+ *   r4 = 用户入口函数地址
+ *   r5 = 用户栈顶 (SP_usr)
+ *   lr = 本跳板地址
+ *
+ * 要做三件事:
+ *   1. 设置用户栈 SP_usr (通过 SYS 模式, 因为 SYS 与 USR 共享 SP)
+ *   2. 设置 SPSR_svc = USR 模式 (0x10)
+ *   3. 用 MOVS pc, lr 异常返回 → 恢复 CPSR 并切换到用户态
+ * ============================================================ */
+.equ T_MOD_SYS, 0x1F
+.equ T_MOD_SVC, 0x13
+.equ T_MOD_USR, 0x10
+
+.global user_entry_trampoline
+user_entry_trampoline:
+    @ 1. 切到 SYS 模式设置用户栈 (不能直接 CPS 到 USR, 只能异常返回进入)
+    CPS     #T_MOD_SYS
+    MOV     sp, r5
+
+    @ 2. 回到 SVC 模式, 准备异常返回
+    CPS     #T_MOD_SVC
+
+    @ 3. lr = 用户入口, SPSR_svc = USR 模式
+    MOV     lr, r4
+    MOV     r4, #T_MOD_USR
+    MSR     SPSR_cxsf, r4
+
+    @ 4. 异常返回: pc = lr, CPSR = SPSR(USR) → 进入用户态执行入口
+    MOVS    pc, lr

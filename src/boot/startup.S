@@ -28,6 +28,8 @@
 /* =========================== 外部符号 =========================== */
 /* C 入口函数 (main.c) */
 .extern kernel_main
+/* 系统调用分发 (task.c) */
+.extern svc_dispatch
 
 /* =========================== 链接脚本符号 =========================== */
 /* 数据段边界 (copy data from LMA to VMA) */
@@ -234,10 +236,32 @@ undef_handler:
 
 svc_handler:
     /*
-     * SVC 是系统调用入口 (v0.4 实现)
-     * v0.1: 暂时不做任何事
+     * SVC 是系统调用入口 (v0.6 阶段2 实现)
+     *
+     * 用户态任务执行 SVC 指令时, CPU 自动:
+     *   - 切到 SVC 模式 (SP 自动切到 SP_svc = 任务内核栈)
+     *   - CPSR 保存到 SPSR_svc, 返回地址保存到 lr_svc
+     *
+     * 这里要做:
+     *   1. 保存用户态 r0-r12 + 返回地址到任务内核栈
+     *   2. 读 SVC 指令携带的立即数 (系统调用号)
+     *   3. 调 svc_dispatch 处理
+     *   4. 恢复上下文, MOVS pc, lr 异常返回用户态
      */
-    SUBS    pc, lr, #0    @ 直接返回 (不支持 Thumb 的兼容写法)
+
+    @ 1. 保存用户态 r0-r12 + 返回地址 (lr_svc) 到任务内核栈
+    PUSH    {r0-r12, lr}
+
+    @ 2. 读 SVC 立即数: SVC 指令编码在返回地址的上一字 (lr - 4)
+    LDR     r0, [lr, #-4]
+    BIC     r0, r0, #0xFF000000   @ 取低 24 位 = 系统调用号
+
+    @ 3. 调用 C 分发函数 svc_dispatch(svc_num)
+    BL      svc_dispatch
+
+    @ 4. 恢复用户态上下文, 异常返回 (CPSR ← SPSR_svc)
+    POP     {r0-r12, lr}
+    MOVS    pc, lr
 
 prefetch_handler:
     B       .

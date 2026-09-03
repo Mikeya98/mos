@@ -12,8 +12,10 @@
 
 #include "kernel/task.h"
 #include "lib/string.h"
+#include "lib/printf.h"
 #include "drivers/gic.h"        /* ENTER_CRITICAL / EXIT_CRITICAL */
 #include "drivers/timer.h"
+#include "drivers/uart.h"
 #include "mm/slab.h"
 
 /* =========================== 外部引用 =========================== */
@@ -158,6 +160,45 @@ static u32 stack_init(u32 *sp_top, void (*entry)(void))
     return (u32)sp;
 }
 
+/**
+ * @brief  用户态任务首次进入的跳板 (汇编实现, sched_asm.S)
+ *
+ * 首次被调度到时, context_switch 会 BX 到它的地址。
+ * 它负责: 设置用户栈 SP_usr, 然后通过异常返回切换到 USR 模式。
+ */
+extern void user_entry_trampoline(void);
+
+/**
+ * @brief  初始化用户态任务的内核栈帧
+ *
+ * 与 stack_init 的区别: lr 不再是入口函数, 而是 trampoline。
+ * 入口函数和用户栈顶分别塞进 r4 / r5, 由 trampoline 读取。
+ *
+ * context_switch 恢复 {r4-r11, lr} 后 BX lr 跳到 trampoline:
+ *   r4 = 用户入口, r5 = 用户栈顶, lr = trampoline
+ *
+ * @param  sp_top      内核栈顶
+ * @param  entry       用户入口函数
+ * @param  user_sp_top 用户栈顶
+ * @return 初始化后的内核栈指针, 存入 task->sp
+ */
+static u32 stack_init_user(u32 *sp_top, void (*entry)(void), u32 *user_sp_top)
+{
+    u32 *sp = sp_top - 9;   /* 9 words: r4-r11(8) + lr(1) */
+
+    sp[0] = (u32)(uintptr_t)entry;         /* r4 → 用户入口 */
+    sp[1] = (u32)(uintptr_t)user_sp_top;   /* r5 → 用户栈顶 */
+    sp[2] = 0;                              /* r6  */
+    sp[3] = 0;                              /* r7  */
+    sp[4] = 0;                              /* r8  */
+    sp[5] = 0;                              /* r9  */
+    sp[6] = 0;                              /* r10 */
+    sp[7] = 0;                              /* r11 */
+    sp[8] = (u32)(uintptr_t)user_entry_trampoline;  /* lr → trampoline */
+
+    return (u32)sp;
+}
+
 /* =========================== 就绪队列操作 =========================== */
 
 void ready_enqueue(task_t *t)
@@ -237,7 +278,22 @@ task_t *pick_next_task(void)
 
 void schedule(void)
 {
-    task_t *next = pick_next_task();
+    task_t *next;
+
+    /*
+     * 调度器还没启动 (current_task == NULL) 时不调度。
+     *
+     * 这个保护很关键: sched_start 之前 timer 中断也会进来,
+     * 此时任务可能还没创建完 (task_create 尚未 return),
+     * 如果这里直接 context_switch(NULL, next) 就会"提前启动"新任务,
+     * 把 task_create 的剩余流程 (含 task_create_user 的 stack_init_user)
+     * 整个跳过, 导致用户栈没建、trampoline 没生效。
+     */
+    if (current_task == NULL) {
+        return;
+    }
+
+    next = pick_next_task();
 
     if (next != current_task) {
         task_t *old = current_task;
@@ -281,7 +337,12 @@ void task_yield(void)
 {
     ENTER_CRITICAL();
 
-    /* 把当前任务放回就绪队列队尾 */
+    /*
+     * MOS 模型: RUNNING 任务也在就绪队列里。
+     * 所以必须先 dequeue 再 enqueue, 把当前任务移到队尾,
+     * 否则会重复插入导致环形链表损坏 (当前任务自环)。
+     */
+    ready_dequeue(current_task);
     ready_enqueue(current_task);
 
     EXIT_CRITICAL();
@@ -504,4 +565,54 @@ task_t *task_create(void (*entry)(void), const char *name,
     EXIT_CRITICAL();
 
     return t;
+}
+
+/* =========================== 用户态任务 (v0.6 阶段2) =========================== */
+
+task_t *task_create_user(void (*entry)(void), const char *name,
+                         u32 priority, u32 kstack_size, u32 ustack_size)
+{
+    task_t *t;
+    u32 *ustack;
+    u32 *ustack_top;
+    u32 *kstack_top;
+
+    if (!entry) return NULL;
+
+    /* 1. 复用 task_create 分配内核栈 + TCB 并注册到就绪队列。
+     *    它内部已用 stack_init 伪造了"内核态入口"帧, 下面会覆盖。 */
+    t = task_create(entry, name, priority, kstack_size);
+    if (!t) return NULL;
+
+    /* 2. 分配用户栈 (USR 模式使用) */
+    ustack = stack_alloc(ustack_size);
+    if (!ustack) {
+        /* 栈池耗尽: TCB/内核栈已分配, 这里简单返回 NULL (演示环境栈池充足) */
+        return NULL;
+    }
+    ustack_top = (u32 *)(((u32)(uintptr_t)ustack) & ~0x7u);
+
+    /* 3. 重新伪造内核栈帧: 首次调度时经 trampoline 切到用户态 */
+    kstack_top = (u32 *)(((u32)(uintptr_t)t->stack_base) & ~0x7u);
+    t->sp = stack_init_user(kstack_top, entry, ustack_top);
+
+    /* 4. 记录用户栈 + 标记为用户态任务 */
+    t->user_sp = (u32)(uintptr_t)ustack_top;
+    t->is_user = 1;
+
+    return t;
+}
+
+/* =========================== 系统调用分发 (v0.6 阶段2) =========================== */
+
+void svc_dispatch(u32 svc_num)
+{
+    switch (svc_num) {
+    case SYS_YIELD:
+        task_yield();
+        break;
+    default:
+        /* 未实现的系统调用号: 忽略 (阶段3 会补完整 syscall 表) */
+        break;
+    }
 }

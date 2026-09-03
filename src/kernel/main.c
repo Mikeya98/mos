@@ -53,11 +53,8 @@ static void buddy_demo(void)
            heap_size);
     printf("========================================\n\n");
 
-    /* 1. 初始化 */
-    buddy_init(&_heap_start, heap_size);
+    /* 1. 堆已在 kernel_main 初始化 (task_init 的 SLAB 依赖它), 直接看当前状态 */
     buddy_dump();
-    printf("[PASS] buddy_init — 1 free block (order ~%u)\n\n",
-           (u32)(heap_size / 64));
 
     /* 2. 分配: 不同大小 → 触发分裂 */
     p[0] = buddy_alloc(300);   /* → 512B, order 3 */
@@ -333,6 +330,70 @@ static void fs_demo(void)
     printf("\n[DONE] Filesystem demo complete.\n\n");
 }
 
+/* =========================== 用户态任务 demo (v0.6 阶段2) =========================== */
+
+/*
+ * 读 CPSR 低 5 位 (当前 CPU 模式)。
+ * USR = 0x10, SVC = 0x13。用户态任务用它确认自己确实跑在用户态。
+ */
+static u32 read_cpsr(void)
+{
+    u32 cpsr;
+    __asm__ volatile("MRS %0, CPSR" : "=r"(cpsr));
+    return cpsr;
+}
+
+static void user_task_a(void)
+{
+    u32 n = 0;
+    u32 cpsr;
+
+    /* 打印 4 次: 展示自己跑在用户态 (mode 低 5 位: 16=USR, 19=SVC) */
+    while (n < 4) {
+        cpsr = read_cpsr();
+        printf("[A] cpsr=0x%x mode=%u n=%u\n", cpsr, cpsr & 0x1F, n);
+        n++;
+        __asm__ volatile("SVC #0" ::: "memory");   /* 系统调用 0 = yield */
+    }
+
+    /* 演示结束后继续 yield, 保持调度器轮转 (不再刷屏) */
+    while (1) {
+        __asm__ volatile("SVC #0" ::: "memory");
+    }
+}
+
+static void user_task_b(void)
+{
+    u32 n = 0;
+
+    while (n < 4) {
+        printf("[B] mode=%u n=%u\n", read_cpsr() & 0x1F, n);
+        n++;
+        __asm__ volatile("SVC #0" ::: "memory");   /* 系统调用 0 = yield */
+    }
+
+    while (1) {
+        __asm__ volatile("SVC #0" ::: "memory");
+    }
+}
+
+static void user_mode_demo(void)
+{
+    task_t *a, *b;
+
+    /* A、B 同优先级, yield 才能让它们轮流运行 */
+    a = task_create_user(user_task_a, "user_a", 1, STACK_4K, STACK_4K);
+    b = task_create_user(user_task_b, "user_b", 1, STACK_4K, STACK_4K);
+
+    if (!a || !b) {
+        printf("[FAIL] task_create_user\n");
+        return;
+    }
+
+    printf("[DEMO] user tasks: %s %s (both prio=%u)\n",
+           a->name, b->name, a->priority);
+}
+
 /* =========================== 中断分发 =========================== */
 
 void irq_dispatch(void)
@@ -369,6 +430,10 @@ void kernel_main(void)
     gic_init();
     printf("[INIT] GIC initialized\n");
 
+    /* 堆必须在 task_init 之前初始化: task_init 里 slab_create 会调 buddy_alloc */
+    buddy_init(&_heap_start, (u32)(&_heap_end - &_heap_start));
+    printf("[INIT] Buddy allocator ready\n");
+
     task_init();
     printf("[INIT] Task subsystem ready\n");
 
@@ -379,6 +444,9 @@ void kernel_main(void)
     buddy_demo();
     slab_demo();
     fs_demo();
+
+    /* 创建用户态任务 (v0.6 阶段2), 调度器启动后运行 */
+    user_mode_demo();
 
     printf("Starting scheduler...\n");
     printf("--- MOS RTOS is running now ---\n\n");

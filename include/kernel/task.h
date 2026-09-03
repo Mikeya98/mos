@@ -21,6 +21,9 @@
 #define STACK_4K        4096       /* 4KB 栈 */
 #define STACK_8K        8192       /* 8KB 栈 */
 
+/* =========================== 系统调用号 (v0.6 阶段2) =========================== */
+#define SYS_YIELD       0          /* 让出 CPU (用户态主动触发调度) */
+
 /* =========================== 任务状态 =========================== */
 typedef enum {
     TASK_READY      = 0,   /* 就绪: 在就绪队列中等待 CPU */
@@ -64,6 +67,10 @@ typedef struct task_struct {
     /* --- 文件系统 (v0.5) --- */
     file_desc_t     fd_table[MAX_FD_PER_TASK];  /* 每个任务的文件描述符表 */
 
+    /* --- 用户态 (v0.6 阶段2) --- */
+    u32             user_sp;       /* 用户态栈指针 (SP_usr, 首次进入时用) */
+    u8              is_user;       /* 1=用户态任务 (USR), 0=内核态任务 (SVC) */
+
 } task_t;
 
 /* =========================== 公共 API =========================== */
@@ -99,6 +106,25 @@ void task_init(void);
  */
 task_t *task_create(void (*entry)(void), const char *name,
                     u32 priority, u32 stack_size);
+
+/**
+ * @brief  创建一个用户态任务 (v0.6 阶段2)
+ *
+ * @param  entry        任务入口函数 (将在 USR 用户态执行)
+ * @param  name         任务名
+ * @param  priority     优先级 (0=最高)
+ * @param  kstack_size  内核栈大小 (SVC 模式, 保存上下文/处理系统调用)
+ * @param  ustack_size  用户栈大小 (USR 模式, 任务自身代码使用)
+ *
+ * @return 新任务的 task_t 指针, 失败返回 NULL
+ *
+ * 与 task_create 的区别:
+ *   - 额外分配一块用户栈
+ *   - 首次被调度到时, 内核通过 trampoline 切换到 USR 模式再进入入口函数
+ *   - 任务在用户态主动让出 CPU 通过 SVC #SYS_YIELD 陷入内核
+ */
+task_t *task_create_user(void (*entry)(void), const char *name,
+                         u32 priority, u32 kstack_size, u32 ustack_size);
 
 /* === 调度器 === */
 
@@ -210,5 +236,15 @@ void task_change_priority(task_t *t, u32 new_priority);
  * @brief  标记需要重新调度 (供 IPC/中断使用)
  */
 void sched_request(void);
+
+/* === 系统调用分发 (v0.6 阶段2, 由 startup.S 的 svc_handler 调用) === */
+
+/**
+ * @brief  处理一次系统调用
+ * @param  svc_num  SVC 指令携带的立即数 (低 24 位)
+ *
+ * v0.6 阶段2 只实现 SYS_YIELD; 完整 syscall 表在阶段3 扩展。
+ */
+void svc_dispatch(u32 svc_num);
 
 #endif /* _MOS_TASK_H */
