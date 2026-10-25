@@ -64,7 +64,12 @@ DRV_SRCS = $(SRC_DIR)/drivers/uart.c \
 
 # 内核
 KERNEL_SRCS = $(SRC_DIR)/kernel/main.c \
-              $(SRC_DIR)/kernel/task.c
+              $(SRC_DIR)/kernel/task.c \
+              $(SRC_DIR)/kernel/syscall.c \
+              $(SRC_DIR)/kernel/exception.c
+
+# 用户态代码 (编译到 .user_text, 链接到 0x08000000)
+USER_SRCS = $(SRC_DIR)/user/usermain.c
 
 # IPC
 IPC_SRCS = $(SRC_DIR)/ipc/semaphore.c \
@@ -82,7 +87,7 @@ FS_SRCS  = $(SRC_DIR)/fs/block_dev.c \
            $(SRC_DIR)/fs/vfs.c
 
 # 所有 C 源文件
-C_SRCS   = $(LIB_SRCS) $(DRV_SRCS) $(KERNEL_SRCS) $(IPC_SRCS) $(MM_SRCS) $(FS_SRCS)
+C_SRCS   = $(LIB_SRCS) $(DRV_SRCS) $(KERNEL_SRCS) $(IPC_SRCS) $(MM_SRCS) $(FS_SRCS) $(USER_SRCS)
 
 # =========================== 目标文件 ===========================
 C_OBJS   = $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(C_SRCS))
@@ -120,13 +125,15 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.S
 	@$(CC) $(ASFLAGS) -c -o $@ $<
 
 # QEMU 仿真 (带 GDB server)
+# -m 1024: 用户代码段链接在 0x08000000 (128MB 处), QEMU zynq 默认内存
+#          不够大时 ELF 的第二段不会被加载, 必须显式给 1GB。
 qemu: all
 	@echo ""
 	@echo "======================================"
 	@echo "  Starting QEMU (xilinx-zynq-a9)"
 	@echo "======================================"
 	@echo ""
-	qemu-system-arm -M xilinx-zynq-a9 \
+	qemu-system-arm -M xilinx-zynq-a9 -m 1024 \
 		-device loader,file=$(TARGET),cpu-num=0 \
 		-nographic \
 		-serial mon:stdio \
@@ -137,7 +144,7 @@ qemu: all
 
 # 仅编译 + QEMU (直接运行)
 qemu-run: all
-	qemu-system-arm -M xilinx-zynq-a9 \
+	qemu-system-arm -M xilinx-zynq-a9 -m 1024 \
 		-device loader,file=$(TARGET),cpu-num=0 \
 		-nographic \
 		-serial mon:stdio

@@ -2,7 +2,7 @@
 
 [![Platform](https://img.shields.io/badge/platform-ARM%20Cortex--A9-blue)](https://github.com/Mikeya98/mos)
 [![Language](https://img.shields.io/badge/language-C%20%7C%20Assembly-orange)](https://github.com/Mikeya98/mos)
-[![Status](https://img.shields.io/badge/status-v0.6%20--%20MMU%20%2B%20user%20mode-brightgreen)](https://github.com/Mikeya98/mos)
+[![Status](https://img.shields.io/badge/status-v0.6%20--%20MMU%20%2B%20isolation-brightgreen)](https://github.com/Mikeya98/mos)
 [![QEMU](https://img.shields.io/badge/QEMU-verified-lightgrey)](https://github.com/Mikeya98/mos)
 
 MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 上，用 QEMU 仿真验证。每一行代码都是手写的，没有引用任何现成的 RTOS 内核代码。
@@ -18,7 +18,10 @@ MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 �
 - **内存管理**：Buddy 伙伴分配器（二分分裂 + 异或合并）、SLAB 对象缓存（固定大小对象，O(1) 分配/释放）
 - **文件系统**：MOS-FS——VFS 层 + 块设备抽象 + RAM 盘 + 一套极简磁盘格式
 - **MMU**：一级页表（section 映射，1MB 粒度）、identity mapping、DDR 可缓存 / 外设 device 分区、已开启 MMU
-- **用户态**：用户态任务（USR/SVC 模式切换）、双栈、trampoline 首次进用户态、SVC 系统调用（yield）
+- **用户态**：用户态任务（USR/SVC 模式切换）、双栈、trampoline 首次进用户态
+- **权限隔离**：内核区 AP=01 仅特权态可访问，用户区 `0x08000000-0x0A000000` AP=11；DACR 由 manager 改为 client，让页表 AP 位真正生效。用户代码放独立的 `.user_text` 段，字符串放 `.user_rodata`，用户栈由独立的 bump 分配器切分
+- **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST`；`copy_from_user` / `copy_to_user` 做用户指针范围校验
+- **异常恢复**：捕获 Data Abort / Prefetch Abort，打印任务名、故障地址与 DFSR/DFAR，杀掉出错的用户任务后继续调度，系统不宕机
 
 ## 目录结构
 
@@ -28,8 +31,12 @@ mos/
 │   ├── boot/startup.S          # 启动代码 + 异常向量表 + SVC 处理
 │   ├── kernel/
 │   │   ├── main.c              # 内核入口 + 各模块 demo
-│   │   ├── task.c              # TCB + 调度器 + 系统调用分发
+│   │   ├── task.c              # TCB + 调度器 + 任务终止
+│   │   ├── syscall.c           # 系统调用表 + copy_from_user/copy_to_user
+│   │   ├── exception.c         # Data/Prefetch Abort → 杀任务并继续调度
 │   │   └── sched_asm.S         # 上下文切换 + 用户态 trampoline
+│   ├── user/
+│   │   └── usermain.c          # 用户态 demo 任务（.user_text 段）
 │   ├── drivers/
 │   │   ├── uart.c              # UART 驱动（Cadence / 16550）
 │   │   ├── gic.c               # GIC PL390 中断控制器
@@ -79,17 +86,41 @@ make clean      # 清理构建产物
 [INIT] GIC initialized
 [INIT] Buddy allocator ready
 [INIT] Task subsystem ready
+[INIT] Syscall table ready (SYS_WRITE/EXIT/GETPID/SEM_*)
 [INIT] Timer started
 ...（buddy / slab / 文件系统三组 demo）...
-[DEMO] user tasks: user_a user_b (both prio=1)
+[DEMO] 4 user tasks created (all prio=1)
 Starting scheduler...
 --- MOS RTOS is running now ---
-[A] cpsr=0x60000010 mode=16 n=0
-[B] mode=16 n=0
-...
+[user] u_waiter: sem_wait(0) — should block here
+[user] u_worker: getpid() > 0, user stack in 0x08100000-0x0A000000
+[user] u_worker: sem_post(0) done, exiting
+[user] u_fault : now reading kernel address 0x00100000 ...
+
+========================================
+  [ABORT] Data Abort
+  task   : u_fault (pid=3)
+  mode   : USR (0x10)
+  pc     : 8000124
+  addr   : 100000
+  fsr    : D  (permission fault (section))
+========================================
+[ABORT] killing user task, scheduler continues
+
+[user] u_badptr: passing kernel pointer 0x00100000 to sys_write
+[SYS] write: pointer 100000 len=16 rejected → EFAULT
+[user] u_badptr: rejected with negative errno — pointer check OK
+[user] u_waiter: woken by u_worker, exiting
 ```
 
-最后两行 `mode=16` 就是 CPU 处于 USR 用户态（`0x10`）的证明——两个用户任务通过 `SVC #0` 主动让出 CPU 轮流运行。
+这四组输出分别验证了：
+
+1. `u_worker` 的栈地址落在用户区，说明 trampoline 设置的用户栈是对的；
+2. `u_waiter` 阻塞在信号量上，被 `u_worker` post 后唤醒，`sem_wait/sem_post` 系统调用可用；
+3. `u_fault` 读内核地址 `0x00100000` 触发 **Permission Fault**（DFSR=0xD），异常处理杀掉该任务，其余任务继续运行；
+4. `u_badptr` 把内核指针传给 `sys_write`，`copy_from_user` 先做范围检查，直接返回 `-EFAULT`，内核没有替用户去读那块内存。
+
+> QEMU 的 zynq 机器默认内存放不下 `0x08000000` 的第二段，`make qemu-run` 里加了 `-m 1024`。
 
 ## 版本规划
 
@@ -100,16 +131,16 @@ Starting scheduler...
 | v0.3 | Buddy 伙伴内存分配器 | ✅ |
 | v0.4 | SLAB 对象缓存 + TCB 动态分配 | ✅ |
 | v0.5 | MOS-FS 文件系统（VFS + RAM 盘） | ✅ |
-| v0.6 | MMU + 用户态（阶段1 开 MMU、阶段2 用户态/模式切换） | ✅ |
-| 下一步 | 阶段3 系统调用表、阶段4 每任务独立页表（地址空间隔离） | 🔜 |
+| v0.6 | MMU + 用户态 + 权限隔离（阶段1 开 MMU、阶段2 模式切换、阶段3 系统调用/隔离/异常恢复） | ✅ |
+| 下一步 | 阶段4 每任务独立页表（每个任务一套 L1 页表 + 地址空间切换） | 🔜 |
 
 ## 构建细节
 
 - **编译器**：ARM GCC（`arm-none-eabi-gcc`）
 - **目标**：`-mcpu=cortex-a9 -mfpu=vfpv3 -mfloat-abi=soft`
 - **链接**：自定义 `kernel.lds`（OCM + DDR 内存布局）
-- **QEMU**：`qemu-system-arm -M xilinx-zynq-a9`
-- **体积**：text 约 20KB，编译 0 warning
+- **QEMU**：`qemu-system-arm -M xilinx-zynq-a9 -m 1024`
+- **体积**：text 约 24KB（用户态代码单独链接在 `0x08000000`）
 
 ## 关于
 

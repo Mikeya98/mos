@@ -21,9 +21,6 @@
 #define STACK_4K        4096       /* 4KB 栈 */
 #define STACK_8K        8192       /* 8KB 栈 */
 
-/* =========================== 系统调用号 (v0.6 阶段2) =========================== */
-#define SYS_YIELD       0          /* 让出 CPU (用户态主动触发调度) */
-
 /* =========================== 任务状态 =========================== */
 typedef enum {
     TASK_READY      = 0,   /* 就绪: 在就绪队列中等待 CPU */
@@ -119,9 +116,10 @@ task_t *task_create(void (*entry)(void), const char *name,
  * @return 新任务的 task_t 指针, 失败返回 NULL
  *
  * 与 task_create 的区别:
- *   - 额外分配一块用户栈
+ *   - 额外分配一块用户栈 (来自 kernel.lds 的 .user_stacks 区,
+ *     由专用 bump 分配器切分, 地址落在 0x08100000 - 0x0A000000)
  *   - 首次被调度到时, 内核通过 trampoline 切换到 USR 模式再进入入口函数
- *   - 任务在用户态主动让出 CPU 通过 SVC #SYS_YIELD 陷入内核
+ *   - 任务在用户态只能通过 SVC 系统调用 (见 kernel/syscall.h) 请求内核服务
  */
 task_t *task_create_user(void (*entry)(void), const char *name,
                          u32 priority, u32 kstack_size, u32 ustack_size);
@@ -178,6 +176,27 @@ void task_sleep(u32 ms);
  * @brief  主动放弃 CPU (让给同优先级下一个任务)
  */
 void task_yield(void);
+
+/**
+ * @brief  结束当前任务 (SYS_EXIT 的实现)
+ *
+ * 标记 TASK_DEAD, 移出就绪队列和全局 TCB 列表, 然后调度到下一个任务。
+ * 函数永不返回 — 当前任务的内核栈连同这次调用的现场一起被丢弃。
+ *
+ * 注意: TCB 和任务栈不回收。内核栈由 bump 分配器管理, 没有 free;
+ *       TCB 需要等调度切走之后才能安全释放, 留到后续版本处理。
+ */
+void task_exit(void);
+
+/**
+ * @brief  杀死指定任务 (异常处理用)
+ *
+ * 只做状态清理: 从就绪队列 / TCB 列表移除, 状态置 DEAD。
+ * 不触发调度 — 由调用者在合适的时机调用 schedule()。
+ *
+ * @param  t  目标任务 (NULL / IDLE 时直接返回)
+ */
+void task_kill(task_t *t);
 
 /* === 睡眠中断处理 (由 timer_isr 触发) === */
 
@@ -236,15 +255,5 @@ void task_change_priority(task_t *t, u32 new_priority);
  * @brief  标记需要重新调度 (供 IPC/中断使用)
  */
 void sched_request(void);
-
-/* === 系统调用分发 (v0.6 阶段2, 由 startup.S 的 svc_handler 调用) === */
-
-/**
- * @brief  处理一次系统调用
- * @param  svc_num  SVC 指令携带的立即数 (低 24 位)
- *
- * v0.6 阶段2 只实现 SYS_YIELD; 完整 syscall 表在阶段3 扩展。
- */
-void svc_dispatch(u32 svc_num);
 
 #endif /* _MOS_TASK_H */

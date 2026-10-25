@@ -68,6 +68,34 @@ extern u8 _task_stack_pool_end;
 static u8 *stack_alloc_ptr = &_task_stack_pool;
 static u32 stack_pool_remaining = 0;  /* 在 task_init 中计算 */
 
+/* =========================== 用户栈池 (v0.6 阶段3) =========================== */
+/* 由 kernel.lds 的 .user_stacks 区提供: 0x08100000 - 0x0A000000 (31MB)
+ * 这段地址在页表里是 AP=11 + XN, 用户态可以直接读写。
+ * 内核态任务栈仍然从上面的 .task_stacks 池分配。 */
+extern u8 _user_stack_base;
+extern u8 _user_stack_end;
+
+/** 用户栈 bump 分配指针 (同样不回收) */
+static u8 *user_stack_ptr = &_user_stack_base;
+
+/**
+ * @brief  从用户栈池分配一块栈
+ * @param  size  栈大小 (字节)
+ * @return 栈顶指针 (8 字节对齐), 耗尽返回 NULL
+ */
+static u32 *user_stack_alloc(u32 size)
+{
+    u32 base = (u32)(uintptr_t)user_stack_ptr;
+    u32 top  = (base + size + 7u) & ~7u;
+
+    if ((u8 *)(uintptr_t)top > &_user_stack_end) {
+        return NULL;
+    }
+
+    user_stack_ptr = (u8 *)(uintptr_t)top;
+    return (u32 *)(uintptr_t)top;
+}
+
 /* =========================== IDLE 任务 =========================== */
 
 /**
@@ -584,10 +612,10 @@ task_t *task_create_user(void (*entry)(void), const char *name,
     t = task_create(entry, name, priority, kstack_size);
     if (!t) return NULL;
 
-    /* 2. 分配用户栈 (USR 模式使用) */
-    ustack = stack_alloc(ustack_size);
+    /* 2. 分配用户栈 (USR 模式使用, 来自 0x08100000 起的用户区) */
+    ustack = user_stack_alloc(ustack_size);
     if (!ustack) {
-        /* 栈池耗尽: TCB/内核栈已分配, 这里简单返回 NULL (演示环境栈池充足) */
+        /* 用户栈池耗尽: TCB/内核栈已分配, 这里简单返回 NULL (演示环境栈池充足) */
         return NULL;
     }
     ustack_top = (u32 *)(((u32)(uintptr_t)ustack) & ~0x7u);
@@ -603,16 +631,65 @@ task_t *task_create_user(void (*entry)(void), const char *name,
     return t;
 }
 
-/* =========================== 系统调用分发 (v0.6 阶段2) =========================== */
+/* =========================== 任务终止 (v0.6 阶段3) =========================== */
 
-void svc_dispatch(u32 svc_num)
+/**
+ * @brief  杀死指定任务 — 只清理状态, 不触发调度
+ *
+ * "杀死"在这里的意思是把任务从所有调度结构里摘掉:
+ *   1. 从就绪队列移除 (RUNNING 任务也在队列里, 这是 MOS 的设计)
+ *   2. 状态置 TASK_DEAD
+ *   3. 从全局 TCB 列表移除, 避免 sys_tick_handler 再访问它
+ *
+ * 不释放 TCB 和内核栈: 被杀死任务的栈上此刻还躺着调用者的现场
+ * (系统调用/异常处理帧), 必须等调度切走之后才能回收。演示版本先不做
+ * 回收, 后续可以加一个 reaper 任务统一释放。
+ */
+void task_kill(task_t *t)
 {
-    switch (svc_num) {
-    case SYS_YIELD:
-        task_yield();
-        break;
-    default:
-        /* 未实现的系统调用号: 忽略 (阶段3 会补完整 syscall 表) */
-        break;
+    u32 i;
+
+    if (!t || t == &idle_tcb) {
+        return;
+    }
+
+    ENTER_CRITICAL();
+
+    if (t->state == TASK_READY || t->state == TASK_RUNNING) {
+        ready_dequeue(t);
+    }
+    t->state = TASK_DEAD;
+
+    for (i = 0; i < tcb_count; i++) {
+        if (tcb_list[i] == t) {
+            u32 j;
+            for (j = i; j + 1 < tcb_count; j++) {
+                tcb_list[j] = tcb_list[j + 1];
+            }
+            tcb_count--;
+            tcb_list[tcb_count] = NULL;
+            break;
+        }
+    }
+
+    EXIT_CRITICAL();
+}
+
+/**
+ * @brief  结束当前任务 (SYS_EXIT) — 永不返回
+ */
+void task_exit(void)
+{
+    task_kill(current_task);
+
+    /*
+     * 切到下一个任务。current_task 已经被摘出就绪队列,
+     * pick_next_task() 不会选中它, 所以这里不会返回。
+     * 即使意外返回, 也只是在这个已死的栈上空转, 不会再碰用户态。
+     */
+    schedule();
+
+    while (1) {
+        __asm__ volatile("WFI");
     }
 }

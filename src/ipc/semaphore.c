@@ -51,6 +51,14 @@ void sem_wait(sem_t *sem)
         cur->state     = TASK_BLOCKED;
         cur->block_obj = sem;
 
+        /*
+         * 关键: 先从就绪队列移除。
+         * MOS 的 RUNNING 任务仍然挂在就绪链表上 (和 mutex/msgq 一样),
+         * 直接改 cur->next 会把就绪环形链表改坏, pick_next_task()
+         * 还可能再选中这个已经阻塞的任务。
+         */
+        ready_dequeue(cur);
+
         /* 按优先级插入 (更小的优先级值 = 更高优先级, 排在前面) */
         while (*queue && (*queue)->priority <= cur->priority) {
             queue = &(*queue)->next;

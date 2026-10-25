@@ -103,4 +103,40 @@ SECTIONS
 
     /* =========================== 符号 =========================== */
     _kernel_end = .;
+
+    /* =========================== 用户空间 (v0.6 阶段3) ===========================
+     *
+     * 用户代码/数据放在 0x08000000 起的独立 1MB 区, 与内核区 (0x00100000 起)
+     * 相隔很远。这样 L1 页表按 1MB section 就能把两者映射成不同的 AP 权限:
+     *   内核区 AP=01  → 只有特权态 (SVC/IRQ/ABT) 可访问
+     *   用户区 AP=11  → 用户态可读写执行
+     *
+     * 用户任务不能调用任何内核函数 (printf / memcpy 等), 只能通过 SVC 进内核,
+     * 所以用户代码全部放在 .user_text, 用户态用的字符串放 .user_rodata。
+     */
+    .user_text 0x08000000 : ALIGN(4096) {
+        _user_text_start = .;
+        *(.user_text*)
+        _user_text_end = .;
+    } > DDR
+
+    .user_rodata : ALIGN(4) {
+        _user_rodata_start = .;
+        *(.user_rodata*)
+        _user_rodata_end = .;
+    } > DDR
+
+    .user_data : ALIGN(4) {
+        _user_data_start = .;
+        *(.user_data*)
+        _user_data_end = .;
+    } > DDR
+
+    /* 用户栈区: 0x08100000 - 0x0A000000, 共 31MB
+     * 由 task.c 的 bump 分配器切分给各用户任务 (不回收) */
+    .user_stacks 0x08100000 (NOLOAD) : ALIGN(8) {
+        _user_stack_base = .;
+        . += 0x1F00000;
+        _user_stack_end = .;
+    } > DDR
 }

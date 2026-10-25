@@ -28,8 +28,11 @@
 /* =========================== 外部符号 =========================== */
 /* C 入口函数 (main.c) */
 .extern kernel_main
-/* 系统调用分发 (task.c) */
+/* 系统调用分发 (syscall.c) */
 .extern svc_dispatch
+/* 异常处理 (exception.c) */
+.extern data_abort_handler
+.extern prefetch_abort_handler
 
 /* =========================== 链接脚本符号 =========================== */
 /* 数据段边界 (copy data from LMA to VMA) */
@@ -225,10 +228,9 @@ _bss_done:
 _dead:
     B       _dead
 
-/* =========================== 异常处理 stub =========================== */
+/* =========================== 异常处理 =========================== */
 /*
- * v0.1 中这些异常处理只有最小功能: 打印错误信息后死循环。
- * 后续版本会完善 (SVC 用于系统调用, Data Abort 用于缺页处理等)。
+ * 未定义指令: 仍然是死循环。真到了这里说明代码跑飞, 先停住等调试器。
  */
 
 undef_handler:
@@ -236,7 +238,7 @@ undef_handler:
 
 svc_handler:
     /*
-     * SVC 是系统调用入口 (v0.6 阶段2 实现)
+     * SVC 是系统调用入口 (v0.6 阶段2/3)
      *
      * 用户态任务执行 SVC 指令时, CPU 自动:
      *   - 切到 SVC 模式 (SP 自动切到 SP_svc = 任务内核栈)
@@ -245,32 +247,63 @@ svc_handler:
      * 这里要做:
      *   1. 保存用户态 r0-r12 + 返回地址到任务内核栈
      *   2. 读 SVC 指令携带的立即数 (系统调用号)
-     *   3. 调 svc_dispatch 处理
+     *   3. 调 svc_dispatch(svc_num, frame) — frame 让内核能读写参数/返回值
      *   4. 恢复上下文, MOVS pc, lr 异常返回用户态
+     *
+     * 栈帧布局 (PUSH {r0-r12, lr}):
+     *   sp + 0  → r0   ← 参数 1 / 返回值
+     *   sp + 4  → r1   ← 参数 2
+     *   ...
+     *   sp + 48 → r12
+     *   sp + 52 → lr (用户态返回地址)
+     *
+     * 14 个字 = 56 字节, 8 字节对齐, 满足 AAPCS。
      */
 
     @ 1. 保存用户态 r0-r12 + 返回地址 (lr_svc) 到任务内核栈
     PUSH    {r0-r12, lr}
 
-    @ 2. 读 SVC 立即数: SVC 指令编码在返回地址的上一字 (lr - 4)
+    @ 2. frame 指针 = 当前 sp; r0 = SVC 立即数 (系统调用号)
+    MOV     r1, sp
     LDR     r0, [lr, #-4]
     BIC     r0, r0, #0xFF000000   @ 取低 24 位 = 系统调用号
 
-    @ 3. 调用 C 分发函数 svc_dispatch(svc_num)
+    @ 3. 调用 C 分发函数 svc_dispatch(svc_num, frame)
     BL      svc_dispatch
 
-    @ 4. 恢复用户态上下文, 异常返回 (CPSR ← SPSR_svc)
+    @ 4. 恢复用户态上下文 (r0 已由 svc_dispatch 改写为返回值)
     POP     {r0-r12, lr}
     MOVS    pc, lr
 
 prefetch_handler:
+    /*
+     * Prefetch Abort — 取指失败 (PC 指向未映射/无执行权限的地址)
+     *
+     * lr_abt = 故障指令地址 + 4, 先减掉流水线偏移。
+     * SPSR_abt 的低 5 位记录故障发生时的模式 (USR=0x10 / SVC=0x13),
+     * 交给 C 判断是用户任务越权还是内核自己跑飞。
+     *
+     * r0-r3 在异常模式间是共用的, CPS 切到 SVC 后参数仍然有效。
+     */
+    SUB     lr, lr, #4
+    MOV     r0, lr
+    MRS     r1, SPSR
+    CPS     #MODE_SVC
+    BL      prefetch_abort_handler
     B       .
 
 data_handler:
     /*
-     * Data Abort — 通常是访问了非法地址
-     * v0.1: 死循环 (调试时可用 J-Link 读寄存器)
+     * Data Abort — 访问非法地址 (用户态越权访问内核区就是走这里)
+     *
+     * lr_abt = 故障指令地址 + 8。
+     * C 处理函数里读取 DFAR/DFSR, 打印现场, 杀掉出错任务后调度走。
      */
+    SUB     lr, lr, #8
+    MOV     r0, lr
+    MRS     r1, SPSR
+    CPS     #MODE_SVC
+    BL      data_abort_handler
     B       .
 
 irq_handler:
