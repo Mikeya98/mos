@@ -68,6 +68,17 @@ typedef struct task_struct {
     u32             user_sp;       /* 用户态栈指针 (SP_usr, 首次进入时用) */
     u8              is_user;       /* 1=用户态任务 (USR), 0=内核态任务 (SVC) */
 
+    /* --- 地址空间 (v0.6 阶段4) --- */
+    /*
+     * l1_phys 是上下文切换时要写进 TTBR0 的页表物理地址。
+     * 内核态任务统一用内核主页表; 用户态任务各有一张独立页表。
+     * l2/data/stack 只在用户态任务上有意义, 内核任务为 0。
+     */
+    u32             l1_phys;
+    u32             l2_phys;
+    u32             data_phys;
+    u32             stack_phys;
+
 } task_t;
 
 /* =========================== 公共 API =========================== */
@@ -116,9 +127,10 @@ task_t *task_create(void (*entry)(void), const char *name,
  * @return 新任务的 task_t 指针, 失败返回 NULL
  *
  * 与 task_create 的区别:
- *   - 额外分配一块用户栈 (来自 kernel.lds 的 .user_stacks 区,
- *     由专用 bump 分配器切分, 地址落在 0x08100000 - 0x0A000000)
- *   - 首次被调度到时, 内核通过 trampoline 切换到 USR 模式再进入入口函数
+ *   - 分配一套独立的用户地址空间: L1/L2 页表 + 4KB 数据页 + 64KB 栈,
+ *     虚拟地址固定为 0x08000000 (代码) / 0x08100000 (数据) / 0x08101000 (栈)
+ *   - 首次被调度到时, 内核先换 TTBR0 到本任务的页表, 再通过
+ *     trampoline 切换到 USR 模式进入入口函数
  *   - 任务在用户态只能通过 SVC 系统调用 (见 kernel/syscall.h) 请求内核服务
  */
 task_t *task_create_user(void (*entry)(void), const char *name,

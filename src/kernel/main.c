@@ -359,7 +359,7 @@ void kernel_main(void)
     printf("\n");
     printf("========================================\n");
     printf("  MOS RTOS v0.6\n");
-    printf("  MMU + Buddy + SLAB + MOS-FS\n");
+    printf("  MMU + per-task page tables + MOS-FS\n");
     printf("========================================\n\n");
 
     mmu_init();

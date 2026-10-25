@@ -17,6 +17,8 @@
 #include "drivers/timer.h"
 #include "drivers/uart.h"
 #include "mm/slab.h"
+#include "mm/mmu.h"
+#include "mm/addr_space.h"
 
 /* =========================== 外部引用 =========================== */
 /*
@@ -49,6 +51,16 @@ static u32 next_pid = 0;
 /** 是否需要重新调度 (中断返回时检查) */
 static volatile u32 need_resched = 0;
 
+/**
+ * 调度锁: >0 时 schedule() 直接返回。
+ *
+ * task_create_user 需要"分配地址空间 → 建 TCB → 填页表 → 伪造用户栈帧"
+ * 这一串步骤全部完成后, 新任务才能被调度。但 task_create 内部会把任务
+ * 挂进就绪队列并开中断, 这中间如果来一个 tick, 调度器就可能选中一个
+ * 还没初始化完的任务。用调度锁把这段窗口盖住。
+ */
+static volatile u32 sched_lock = 0;
+
 /** IDLE 任务 TCB (静态分配, 因为是最先创建的) */
 static task_t idle_tcb;
 
@@ -68,33 +80,14 @@ extern u8 _task_stack_pool_end;
 static u8 *stack_alloc_ptr = &_task_stack_pool;
 static u32 stack_pool_remaining = 0;  /* 在 task_init 中计算 */
 
-/* =========================== 用户栈池 (v0.6 阶段3) =========================== */
-/* 由 kernel.lds 的 .user_stacks 区提供: 0x08100000 - 0x0A000000 (31MB)
- * 这段地址在页表里是 AP=11 + XN, 用户态可以直接读写。
- * 内核态任务栈仍然从上面的 .task_stacks 池分配。 */
-extern u8 _user_stack_base;
-extern u8 _user_stack_end;
-
-/** 用户栈 bump 分配指针 (同样不回收) */
-static u8 *user_stack_ptr = &_user_stack_base;
-
-/**
- * @brief  从用户栈池分配一块栈
- * @param  size  栈大小 (字节)
- * @return 栈顶指针 (8 字节对齐), 耗尽返回 NULL
+/* =========================== 用户地址空间 (v0.6 阶段4) =========================== */
+/*
+ * 用户栈不再是内核地址空间里的一段共享内存, 而是每个任务私有的一张
+ * 物理页, 映射到固定的虚拟地址 USER_STACK_VADDR。分配逻辑在
+ * mm/addr_space.c, 这里只负责把结果填进 TCB。
+ *
+ * 内核态任务的栈仍然从上面的 .task_stacks 池分配。
  */
-static u32 *user_stack_alloc(u32 size)
-{
-    u32 base = (u32)(uintptr_t)user_stack_ptr;
-    u32 top  = (base + size + 7u) & ~7u;
-
-    if ((u8 *)(uintptr_t)top > &_user_stack_end) {
-        return NULL;
-    }
-
-    user_stack_ptr = (u8 *)(uintptr_t)top;
-    return (u32 *)(uintptr_t)top;
-}
 
 /* =========================== IDLE 任务 =========================== */
 
@@ -321,6 +314,11 @@ void schedule(void)
         return;
     }
 
+    /* 有任务正在初始化 → 先不切, 免得跑到半成品上 */
+    if (sched_lock != 0) {
+        return;
+    }
+
     next = pick_next_task();
 
     if (next != current_task) {
@@ -328,6 +326,13 @@ void schedule(void)
 
         current_task = next;
         next->state = TASK_RUNNING;
+
+        /*
+         * 换地址空间 (v0.6 阶段4)。
+         * 必须在 context_switch 之前: 新任务的内核栈和 TCB 都在内核区,
+         * 每张页表里映射一致, 所以换表过程中当前指令和栈都还有效。
+         */
+        mmu_activate(next->l1_phys);
 
         context_switch(old, next);
     }
@@ -349,6 +354,7 @@ void sched_start(void)
     current_task = first;
     first->state = TASK_RUNNING;
 
+    mmu_activate(first->l1_phys);
     context_switch(NULL, first);
 
     /* 不会到达这里 */
@@ -483,6 +489,12 @@ void task_init(void)
     idle_tcb.block_obj   = NULL;
     idle_tcb.original_priority = PRIO_IDLE;
     idle_tcb.held_mutex  = NULL;
+    idle_tcb.is_user     = 0;
+    idle_tcb.user_sp     = 0;
+    idle_tcb.l1_phys     = mmu_kernel_l1();
+    idle_tcb.l2_phys     = 0;
+    idle_tcb.data_phys   = 0;
+    idle_tcb.stack_phys  = 0;
 
     /* IDLE 使用自己的静态栈 (512B, 8 字节对齐) */
     static u8 idle_stack[512] __attribute__((aligned(8)));
@@ -563,6 +575,14 @@ task_t *task_create(void (*entry)(void), const char *name,
     t->block_obj   = NULL;
     t->original_priority = priority;
     t->held_mutex  = NULL;
+    t->is_user     = 0;
+    t->user_sp     = 0;
+
+    /* v0.6 阶段4: 内核态任务使用内核主页表, 没有私有地址空间 */
+    t->l1_phys     = mmu_kernel_l1();
+    t->l2_phys     = 0;
+    t->data_phys   = 0;
+    t->stack_phys  = 0;
 
     /* v0.5: 初始化文件描述符表 */
     {
@@ -601,32 +621,51 @@ task_t *task_create_user(void (*entry)(void), const char *name,
                          u32 priority, u32 kstack_size, u32 ustack_size)
 {
     task_t *t;
-    u32 *ustack;
-    u32 *ustack_top;
+    user_space_t as;
     u32 *kstack_top;
 
     if (!entry) return NULL;
 
-    /* 1. 复用 task_create 分配内核栈 + TCB 并注册到就绪队列。
-     *    它内部已用 stack_init 伪造了"内核态入口"帧, 下面会覆盖。 */
-    t = task_create(entry, name, priority, kstack_size);
-    if (!t) return NULL;
+    sched_lock++;               /* 初始化完成前不允许调度 */
 
-    /* 2. 分配用户栈 (USR 模式使用, 来自 0x08100000 起的用户区) */
-    ustack = user_stack_alloc(ustack_size);
-    if (!ustack) {
-        /* 用户栈池耗尽: TCB/内核栈已分配, 这里简单返回 NULL (演示环境栈池充足) */
+    /* 1. 分配独立地址空间 (L1/L2 页表 + 数据页 + 64KB 栈) */
+    if (user_space_create(&as) != 0) {
+        sched_lock--;
         return NULL;
     }
-    ustack_top = (u32 *)(((u32)(uintptr_t)ustack) & ~0x7u);
 
-    /* 3. 重新伪造内核栈帧: 首次调度时经 trampoline 切到用户态 */
+    /* 2. 复用 task_create 分配内核栈 + TCB 并挂进就绪队列。
+     *    它伪造的是"内核态入口"帧, 下面会覆盖成用户态跳板帧。 */
+    t = task_create(entry, name, priority, kstack_size);
+    if (!t) {
+        sched_lock--;
+        return NULL;
+    }
+
+    /*
+     * 3. 绑定地址空间。
+     *    用户栈大小目前固定 64KB (16 个 4KB 页), ustack_size 参数
+     *    保留是为了接口稳定, 以后做按需分页时会用到。
+     */
+    (void)ustack_size;
+
+    t->l1_phys    = as.l1_phys;
+    t->l2_phys    = as.l2_phys;
+    t->data_phys  = as.data_phys;
+    t->stack_phys = as.stack_phys;
+    t->user_sp    = USER_STACK_TOP;
+    t->is_user    = 1;
+
+    /* 4. 重新伪造内核栈帧: 首次调度时经 trampoline 切到用户态。
+     *    用户栈顶用固定虚拟地址, 物理页由本任务的页表决定。 */
     kstack_top = (u32 *)(((u32)(uintptr_t)t->stack_base) & ~0x7u);
-    t->sp = stack_init_user(kstack_top, entry, ustack_top);
+    t->sp = stack_init_user(kstack_top, entry, (u32 *)(uintptr_t)USER_STACK_TOP);
 
-    /* 4. 记录用户栈 + 标记为用户态任务 */
-    t->user_sp = (u32)(uintptr_t)ustack_top;
-    t->is_user = 1;
+    /* 5. 解除调度锁, 此时任务已经完整, 可以安全调度 */
+    sched_lock--;
+    if (sched_lock == 0 && need_resched) {
+        schedule();
+    }
 
     return t;
 }

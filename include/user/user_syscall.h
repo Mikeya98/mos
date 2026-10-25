@@ -46,6 +46,9 @@
 #if SYS_SEM_POST != 6
 #error "SVC immediate for SYS_SEM_POST is stale"
 #endif
+#if SYS_GET_TTBR0 != 7
+#error "SVC immediate for SYS_GET_TTBR0 is stale"
+#endif
 
 #define USYS_INLINE  static inline __attribute__((always_inline))
 
@@ -107,6 +110,14 @@ USYS_INLINE s32 usys_sem_post(u32 id)
     register u32 r0 __asm__("r0") = id;
     __asm__ volatile ("SVC #6" : "+r"(r0) : : "memory");
     return (s32)r0;
+}
+
+/** 读取当前任务的 TTBR0 (页表基址), 调试/验证地址空间切换用 */
+USYS_INLINE u32 usys_ttbr0(void)
+{
+    register u32 r0 __asm__("r0") = 0;
+    __asm__ volatile ("SVC #7" : "+r"(r0) : : "memory");
+    return r0;
 }
 
 #endif /* _MOS_USER_SYSCALL_H */

@@ -14,7 +14,9 @@
  *   u_waiter — 阻塞在信号量上, 被唤醒后退出
  *   u_worker — 正常调用 getpid/write/sem_post 后退出
  *   u_fault  — 直接读内核地址, 触发 Data Abort 被杀死
- *   u_badptr — 把内核指针传给 sys_write, 被 copy_from_user 拒绝
+ *   u_badptr — 把内核指针 / 未映射地址传给 sys_write, 被指针检查拒绝
+ *   u_iso_a  — 写私有数据页, 等 u_iso_b 跑完再读回, 验证地址空间隔离
+ *   u_iso_b  — 写同一虚拟地址, 两边互不影响
  */
 void user_demo_init(void);
 

@@ -2,7 +2,7 @@
 
 [![Platform](https://img.shields.io/badge/platform-ARM%20Cortex--A9-blue)](https://github.com/Mikeya98/mos)
 [![Language](https://img.shields.io/badge/language-C%20%7C%20Assembly-orange)](https://github.com/Mikeya98/mos)
-[![Status](https://img.shields.io/badge/status-v0.6%20--%20MMU%20%2B%20isolation-brightgreen)](https://github.com/Mikeya98/mos)
+[![Status](https://img.shields.io/badge/status-v0.6%20--%20per--task%20page%20tables-brightgreen)](https://github.com/Mikeya98/mos)
 [![QEMU](https://img.shields.io/badge/QEMU-verified-lightgrey)](https://github.com/Mikeya98/mos)
 
 MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 上，用 QEMU 仿真验证。每一行代码都是手写的，没有引用任何现成的 RTOS 内核代码。
@@ -17,10 +17,11 @@ MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 �
 - **同步原语**：计数信号量、互斥量（带优先级继承）、消息队列（环形缓冲 + 双等待队列）
 - **内存管理**：Buddy 伙伴分配器（二分分裂 + 异或合并）、SLAB 对象缓存（固定大小对象，O(1) 分配/释放）
 - **文件系统**：MOS-FS——VFS 层 + 块设备抽象 + RAM 盘 + 一套极简磁盘格式
-- **MMU**：一级页表（section 映射，1MB 粒度）、identity mapping、DDR 可缓存 / 外设 device 分区、已开启 MMU
+- **MMU**：两级页表（L1 section 1MB + L2 small page 4KB）、identity mapping、DDR 可缓存 / 外设 device 分区、已开启 MMU
 - **用户态**：用户态任务（USR/SVC 模式切换）、双栈、trampoline 首次进用户态
-- **权限隔离**：内核区 AP=01 仅特权态可访问，用户区 `0x08000000-0x0A000000` AP=11；DACR 由 manager 改为 client，让页表 AP 位真正生效。用户代码放独立的 `.user_text` 段，字符串放 `.user_rodata`，用户栈由独立的 bump 分配器切分
-- **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST`；`copy_from_user` / `copy_to_user` 做用户指针范围校验
+- **权限隔离**：内核区 AP=01 仅特权态可访问；用户代码段 AP=10（用户只读、可执行）；DACR 由 manager 改为 client，让页表 AP 位真正生效
+- **独立地址空间**：每个用户任务一张 L1 页表 + 一张 L2 表，固定虚拟布局（代码 `0x08000000`、私有数据页 `0x08100000`、栈 `0x08101000-0x08110FFF`），上下文切换时换 TTBR0 并清 TLB，任务之间互相看不到对方的物理页
+- **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST / GET_TTBR0`；`copy_from_user` / `copy_to_user` 先走当前任务的页表检查用户指针（区分读/写权限）
 - **异常恢复**：捕获 Data Abort / Prefetch Abort，打印任务名、故障地址与 DFSR/DFAR，杀掉出错的用户任务后继续调度，系统不宕机
 
 ## 目录结构
@@ -48,7 +49,8 @@ mos/
 │   ├── mm/
 │   │   ├── buddy.c             # Buddy 伙伴分配器
 │   │   ├── slab.c              # SLAB 对象缓存
-│   │   └── mmu.c               # MMU 一级页表 + identity mapping
+│   │   ├── mmu.c               # MMU 页表 + TTBR0 切换 + 用户指针检查
+│   │   └── addr_space.c        # 每任务地址空间的物理资源分配
 │   ├── fs/
 │   │   ├── block_dev.c         # 块设备抽象 + RAM 盘
 │   │   ├── mos_fs.c            # MOS-FS 磁盘格式
@@ -89,11 +91,13 @@ make clean      # 清理构建产物
 [INIT] Syscall table ready (SYS_WRITE/EXIT/GETPID/SEM_*)
 [INIT] Timer started
 ...（buddy / slab / 文件系统三组 demo）...
-[DEMO] 4 user tasks created (all prio=1)
+[AS] u_iso_a L1=234000 L2=245000 data=28A000 stack=28B000
+[AS] u_iso_b L1=238000 L2=245400 data=29B000 stack=29C000
+[DEMO] 6 user tasks created, each with its own L1 page table
 Starting scheduler...
 --- MOS RTOS is running now ---
 [user] u_waiter: sem_wait(0) — should block here
-[user] u_worker: getpid() > 0, user stack in 0x08100000-0x0A000000
+[user] u_worker: getpid() > 0, private stack at 0x08101000-0x08110FFF
 [user] u_worker: sem_post(0) done, exiting
 [user] u_fault : now reading kernel address 0x00100000 ...
 
@@ -101,7 +105,7 @@ Starting scheduler...
   [ABORT] Data Abort
   task   : u_fault (pid=3)
   mode   : USR (0x10)
-  pc     : 8000124
+  pc     : 8000210
   addr   : 100000
   fsr    : D  (permission fault (section))
 ========================================
@@ -110,15 +114,25 @@ Starting scheduler...
 [user] u_badptr: passing kernel pointer 0x00100000 to sys_write
 [SYS] write: pointer 100000 len=16 rejected → EFAULT
 [user] u_badptr: rejected with negative errno — pointer check OK
+[user] u_badptr: passing unmapped 0x08200000 to sys_write
+[SYS] write: pointer 8200000 len=16 rejected → EFAULT
+[user] u_badptr: unmapped page rejected by page-table walk
+[user] u_iso_a : wrote A to my 0x08100000, waiting for B
+[user] u_iso_a : my TTBR0 = 0x00234000
+[user] u_iso_b : wrote B to the same virtual address
+[user] u_iso_b : my TTBR0 = 0x00238000
+[user] u_iso_b : read back B — my own page
 [user] u_waiter: woken by u_worker, exiting
+[user] u_iso_a : read back A — address spaces are separate
 ```
 
-这四组输出分别验证了：
+这些输出分别验证了：
 
-1. `u_worker` 的栈地址落在用户区，说明 trampoline 设置的用户栈是对的；
+1. `u_worker` 的栈地址落在自己的栈页里，读写正常；
 2. `u_waiter` 阻塞在信号量上，被 `u_worker` post 后唤醒，`sem_wait/sem_post` 系统调用可用；
 3. `u_fault` 读内核地址 `0x00100000` 触发 **Permission Fault**（DFSR=0xD），异常处理杀掉该任务，其余任务继续运行；
-4. `u_badptr` 把内核指针传给 `sys_write`，`copy_from_user` 先做范围检查，直接返回 `-EFAULT`，内核没有替用户去读那块内存。
+4. `u_badptr` 两种非法指针都被拒绝：内核地址过不了范围检查，用户范围里未映射的 `0x08200000` 过不了页表遍历；
+5. `u_iso_a` / `u_iso_b` 往同一个虚拟地址 `0x08100000` 写不同标记，各自读回自己的值，且两次读到的 TTBR0 不同（`0x234000` / `0x238000`），说明地址空间确实分开了。
 
 > QEMU 的 zynq 机器默认内存放不下 `0x08000000` 的第二段，`make qemu-run` 里加了 `-m 1024`。
 
@@ -131,8 +145,8 @@ Starting scheduler...
 | v0.3 | Buddy 伙伴内存分配器 | ✅ |
 | v0.4 | SLAB 对象缓存 + TCB 动态分配 | ✅ |
 | v0.5 | MOS-FS 文件系统（VFS + RAM 盘） | ✅ |
-| v0.6 | MMU + 用户态 + 权限隔离（阶段1 开 MMU、阶段2 模式切换、阶段3 系统调用/隔离/异常恢复） | ✅ |
-| 下一步 | 阶段4 每任务独立页表（每个任务一套 L1 页表 + 地址空间切换） | 🔜 |
+| v0.6 | MMU + 用户态 + 权限隔离 + 每任务独立页表（阶段1 开 MMU、阶段2 模式切换、阶段3 隔离/异常恢复、阶段4 TTBR0 切换） | ✅ |
+| 下一步 | ASID 免 TLB 刷新、按需分页、任务退出后的地址空间回收 | 🔜 |
 
 ## 构建细节
 

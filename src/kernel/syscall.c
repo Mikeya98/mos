@@ -16,7 +16,7 @@
  *   r0 = 返回值 ←────────────── POP {r0-r12, lr}; MOVS pc, lr
  *
  * 指针安全:
- *   用户态传给内核的每个指针都要先检查是否落在 0x08000000-0x0A000000。
+ *   用户态传给内核的每个指针都要先按当前任务的页表检查。
  *   内核不能直接解引用用户指针 —— 用户可能传一个内核地址, 甚至传
  *   NULL/越界地址。copy_from_user/copy_to_user 是唯一的跨域数据通道。
  */
@@ -24,6 +24,7 @@
 #include "kernel/syscall.h"
 #include "kernel/task.h"
 #include "ipc/semaphore.h"
+#include "mm/mmu.h"
 #include "lib/printf.h"
 
 /* =========================== 临界区宏 =========================== */
@@ -49,28 +50,15 @@ static u8    user_sem_used[SYS_SEM_MAX];
 
 /* =========================== 指针校验 =========================== */
 
-/**
- * @brief  检查 [start, start+len) 是否完全落在用户区
+/*
+ * 阶段4 之后每个任务有自己的页表, 用户区里不是每一页都映射过
+ * (0x08111000 以上就是 fault)。所以不能只查地址范围, 必须走一遍
+ * 当前任务的页表: mmu_user_access_ok 会逐页检查 L1/L2 描述符,
+ * 同时按读/写区分 AP 权限。
  *
- * 只检查范围和溢出。用户区是 identity mapping 的连续普通内存,
- * 范围合法就一定能访问, 不会触发缺页 —— 这也是当前不做 demand paging
- * 的好处, 内核里不需要处理"拷贝过程中缺页"的复杂情况。
+ * 这样查过就一定可访问, 拷贝过程中不会在内核态触发 Data Abort。
+ * 以后做按需分页, 这里还得处理"查的时候映射了, 拷的时候被换出"的情况。
  */
-static int user_range_ok(u32 start, u32 len)
-{
-    u32 end = start + len;
-
-    if (end < start) {                      /* 32 位加回绕 */
-        return 0;
-    }
-    if (start < USER_SPACE_BASE) {
-        return 0;
-    }
-    if (end > USER_SPACE_LIMIT) {
-        return 0;
-    }
-    return 1;
-}
 
 int copy_from_user(void *dst, const void *usrc, u32 len)
 {
@@ -78,7 +66,7 @@ int copy_from_user(void *dst, const void *usrc, u32 len)
     const volatile u8 *s = (const volatile u8 *)usrc;
     u32 i;
 
-    if (!user_range_ok((u32)(uintptr_t)usrc, len)) {
+    if (!mmu_user_access_ok((u32)(uintptr_t)usrc, len, 0)) {
         return -EFAULT;
     }
 
@@ -94,7 +82,7 @@ int copy_to_user(void *udst, const void *ksrc, u32 len)
     const u8 *s = (const u8 *)ksrc;
     u32 i;
 
-    if (!user_range_ok((u32)(uintptr_t)udst, len)) {
+    if (!mmu_user_access_ok((u32)(uintptr_t)udst, len, 1)) {
         return -EFAULT;
     }
 
@@ -118,7 +106,7 @@ static int sys_write(const char *ubuf, u32 len)
     char kbuf[64];
     u32 done = 0;
 
-    if (!user_range_ok((u32)(uintptr_t)ubuf, len)) {
+    if (!mmu_user_access_ok((u32)(uintptr_t)ubuf, len, 0)) {
         printf("[SYS] write: pointer %X len=%u rejected → EFAULT\n",
                (u32)(uintptr_t)ubuf, len);
         return -EFAULT;
@@ -203,6 +191,11 @@ void svc_dispatch(u32 svc_num, u32 *frame)
         ret = sys_sem_post(frame[FRAME_R0]);
         break;
 
+    case SYS_GET_TTBR0:
+        /* 调试用: 用户任务读自己的页表基址, 切任务后值会变 */
+        ret = (int)mmu_current_l1();
+        break;
+
     default: {
         task_t *cur = get_current();
         printf("[SYS] unknown syscall %u from task %s\n",
@@ -228,9 +221,13 @@ void syscall_init(void)
     }
 
     /*
-     * id 0: demo 用的同步信号量, 初始计数 0。
+     * id 0: watcher/worker 的同步信号量, 初始计数 0。
      * 等待方先阻塞, 生产者 post 后唤醒 —— 正好演示用户态任务
      * 阻塞在信号量上、由内核调度切走的完整路径。
+     *
+     * id 1 / 2 (v0.6 阶段4): u_iso_a 和 u_iso_b 的先后顺序控制。
      */
     user_sem_used[0] = 1;
+    user_sem_used[1] = 1;
+    user_sem_used[2] = 1;
 }

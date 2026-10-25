@@ -18,6 +18,7 @@
 #define _MOS_SYSCALL_H
 
 #include "lib/types.h"
+#include "mm/mmu.h"         /* USER_SPACE_BASE / USER_SPACE_LIMIT */
 
 /* =========================== 系统调用号 =========================== */
 #define SYS_YIELD       0       /* 让出 CPU */
@@ -27,7 +28,8 @@
 #define SYS_GETPID      4       /* 返回当前任务 pid */
 #define SYS_SEM_WAIT    5       /* sem_wait(sem_id) */
 #define SYS_SEM_POST    6       /* sem_post(sem_id) */
-#define SYS_MAX         7
+#define SYS_GET_TTBR0   7       /* 返回当前任务的 TTBR0 (调试/验证用) */
+#define SYS_MAX         8
 
 /* =========================== 错误码 =========================== */
 /* 采用 Linux 风格的负值返回, 用户态看到的是 -errno */
@@ -36,9 +38,7 @@
 #define EPERM           1       /* 权限不足 */
 
 /* =========================== 用户地址范围 =========================== */
-/* 与 kernel.lds / mmu.h 保持一致: 0x08000000 - 0x0A000000 */
-#define USER_SPACE_BASE     0x08000000u
-#define USER_SPACE_LIMIT    0x0A000000u
+/* 定义在 mm/mmu.h: 0x08000000 - 0x08111000 */
 
 /**
  * @brief  初始化系统调用子系统 (注册内核态信号量等)
