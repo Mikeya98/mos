@@ -154,7 +154,7 @@ Starting scheduler...
 - **目标**：`-mcpu=cortex-a9 -mfpu=vfpv3 -mfloat-abi=soft`
 - **链接**：自定义 `kernel.lds`（OCM + DDR 内存布局）
 - **QEMU**：`qemu-system-arm -M xilinx-zynq-a9 -m 1024`
-- **体积**：text 约 24KB（用户态代码单独链接在 `0x08000000`）
+- **体积**：text 约 27.6KB（用户态代码单独链接在 `0x08000000`）
 
 ## 关于
 
