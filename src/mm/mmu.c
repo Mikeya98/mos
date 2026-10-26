@@ -233,6 +233,8 @@ static int user_page_ok(const u32 *l1, u32 va, int write)
 
     switch (desc & 0x3u) {
     case 0x2:   /* section (1MB) */
+        /* section 的 AP[2] 在 bit16, AP[2]=1 是保留编码 (仅特权) */
+        if ((desc & (1u << 16)) != 0) return 0;
         ap = (desc >> 10) & 0x3u;
         if (ap < 2) return 0;               /* 仅特权 */
         if (write && ap != 3) return 0;     /* 用户只读 */
@@ -245,7 +247,7 @@ static int user_page_ok(const u32 *l1, u32 va, int write)
         if ((entry & 0x2u) == 0) return 0;  /* fault 或 large page (未使用) */
 
         /* small page 的 AP[2] 在 bit9, AP[1:0] 在 bit[5:4] */
-        if ((entry & (1u << 9)) != 0) return 0;     /* 保留编码, 不给访问 */
+        if ((entry & (1u << 9)) != 0) return 0;     /* AP[2]=1, 保留编码 */
         ap = (entry >> 4) & 0x3u;
         if (ap < 2) return 0;
         if (write && ap != 3) return 0;
