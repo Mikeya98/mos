@@ -192,8 +192,8 @@ void svc_dispatch(u32 svc_num, u32 *frame)
         break;
 
     case SYS_GET_TTBR0:
-        /* 调试用: 用户任务读自己的页表基址, 切任务后值会变 */
-        ret = (int)mmu_current_l1();
+        /* 调试用: 用户任务读自己的 TTBR0 (页表基址 | ASID) */
+        ret = (int)(mmu_current_l1() | mmu_current_asid());
         break;
 
     default: {

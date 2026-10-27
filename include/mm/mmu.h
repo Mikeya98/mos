@@ -6,6 +6,8 @@
  * v0.6 阶段3: DACR 域 0 改为 client, 用 section 的 AP 位做权限隔离。
  * v0.6 阶段4: 每个用户任务一张 L1 页表 + 一张 L2 表,
  *             上下文切换时换 TTBR0, 任务之间地址空间互不可见。
+ * v0.6 阶段5: TTBR0 低 8 位带 ASID, 私有页打 nG 位 —— 切换地址空间
+ *             不再刷整个 TLB, 只换 ASID。
  *
  * 所有用户任务使用同一套虚拟地址布局, 但页表指向不同的物理页:
  *
@@ -54,11 +56,16 @@
  * 按 section 的写法填二级页表会得到 AP=000 (谁都不可访问),
  * 症状是用户任务一碰自己的栈就 permission fault。
  *
- * 0x03F = AP=011 用户读写 + C/B=11 + XN=1
- * 0x02E = AP=010 用户只读 + C/B=11 + 可执行
+ * 0x83F = 上面的 0x03F + nG(bit11)=1, 非全局
+ * 0x82E = 上面的 0x02E + nG(bit11)=1, 非全局
+ *
+ * nG 位是阶段5 的 ASID 方案成立的前提: 只有打了 nG 的页才会按照
+ * TTBR0 里的 ASID 打标签, 全局页 (nG=0) 被所有 ASID 共享 —— 内核
+ * 映射正是靠这一点在换地址空间时继续有效。
  */
-#define L2_USER_RW_XN       0x03Fu
-#define L2_USER_RO          0x02Eu
+#define L2_USER_RW_XN       0x83Fu
+#define L2_USER_RO          0x82Eu
+#define L2_NG_BIT           0x800u
 
 /* 粗页表 L1 描述符: 低两位 01, [31:10] = L2 表物理地址 */
 #define L1_COARSE_TABLE     0x1u
@@ -109,17 +116,34 @@ void mmu_build_user_l1(u32 *l1, u32 l2_phys);
 void mmu_build_user_l2(u32 *l2, u32 data_phys, u32 stack_phys);
 
 /**
- * @brief  切换 TTBR0 到指定页表 (上下文切换时调用)
+ * @brief  切换 TTBR0 到指定页表 + ASID (上下文切换时调用)
  *
- * 与当前页表相同时直接返回。切换后无效化整个 TLB。
- * 内核区在所有页表里映射一致, 所以切换过程中当前 PC/SP 始终有效。
+ * TTBR0 = l1_phys | asid。内核区和用户代码区的映射是全局的
+ * (nG=0), 所有 ASID 共用; 只有数据页/栈这些私有页打 nG 位,
+ * 按 ASID 分开缓存。所以切换时不需要刷 TLB。
+ *
+ * @param  l1_phys  L1 页表物理地址 (16KB 对齐)
+ * @param  asid     地址空间编号 (0 保留给内核, 1..255 给用户任务)
  */
-void mmu_activate(u32 l1_phys);
+void mmu_activate(u32 l1_phys, u32 asid);
 
 /**
- * @brief  读当前 TTBR0 (调试用)
+ * @brief  无效化某个 ASID 的全部 TLB 项
+ *
+ * ASID 被回收再分配给新任务之前必须调用, 否则 TLB 里可能还留着
+ * 上一个任务在同一个 ASID 下的翻译。
+ */
+void mmu_flush_asid(u32 asid);
+
+/**
+ * @brief  读当前 TTBR0 的页表基址 (调试用, 已去掉 ASID)
  */
 u32 mmu_current_l1(void);
+
+/**
+ * @brief  读当前 ASID (调试用)
+ */
+u32 mmu_current_asid(void);
 
 /**
  * @brief  检查用户指针 [start, start+len) 是否可访问 (走页表)

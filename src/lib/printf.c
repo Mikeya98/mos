@@ -200,12 +200,28 @@ static void buf_putc_cb(char c, void *ctx)
 
 /* =========================== 公开 API =========================== */
 
+/*
+ * printf 必须整段原子。
+ *
+ * 输出是一个字符一个字符写 UART 的, 如果写到一半被 tick 打断, 中断里
+ * 又调度到另一个任务打印, 两行内容就会混在一起。调试时看到 "release
+ * u_[user] u_iso_a..." 这种半截日志, 就是它。
+ *
+ * 关中断的代价是整段输出的时间, 115200 波特率下大约 87us/字符。
+ * 调试输出本来就不该出现在实时路径上, 这里优先保证日志可读。
+ */
 int printf(const char *fmt, ...)
 {
+    u32 cpsr;
     __builtin_va_list args;
+
+    __asm__ volatile ("MRS %0, CPSR\n\tCPSID i" : "=r"(cpsr) :: "memory", "cc");
+
     __builtin_va_start(args, fmt);
     int ret = vsnprintf(uart_putc_cb, NULL, fmt, args);
     __builtin_va_end(args);
+
+    __asm__ volatile ("MSR CPSR_c, %0" :: "r"(cpsr) : "memory", "cc");
     return ret;
 }
 

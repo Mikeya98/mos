@@ -89,7 +89,7 @@ SECTIONS
     . = ALIGN(8);
     .task_stacks (NOLOAD) : {
         _task_stack_pool = .;
-        . += 0x10000;           /* 64KB 任务栈池 (约 16 个 4KB 任务) */
+        . += 0x18000;           /* 96KB 任务栈池 (约 24 个 4KB 任务) */
         _task_stack_pool_end = .;
     } > DDR
 

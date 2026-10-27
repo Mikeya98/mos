@@ -61,6 +61,9 @@ static volatile u32 need_resched = 0;
  */
 static volatile u32 sched_lock = 0;
 
+/** 调度流程重入保护: schedule() 执行期间不允许被中断里的 schedule() 打断 */
+static volatile u32 sched_active = 0;
+
 /** IDLE 任务 TCB (静态分配, 因为是最先创建的) */
 static task_t idle_tcb;
 
@@ -71,14 +74,45 @@ static slab_cache_t *task_cache = NULL;
 static task_t *tcb_list[32];  /* 动态增长上限 */
 static u32 tcb_count = 0;
 
+/* 延迟回收 (实现在本文件后半部分, schedule 里要提前调用) */
+static void reclaim_drain(void);
+
 /* =========================== 任务栈池 =========================== */
 /* 由 kernel.lds 提供的外部符号 */
 extern u8 _task_stack_pool;
 extern u8 _task_stack_pool_end;
 
-/** 栈分配指针 (简单递增分配, 不回收) */
+/** 栈分配指针 (没有合适空闲块时从这里切) */
 static u8 *stack_alloc_ptr = &_task_stack_pool;
 static u32 stack_pool_remaining = 0;  /* 在 task_init 中计算 */
+
+/* =========================== 内核栈空闲表 (v0.6 阶段5) =========================== */
+/*
+ * 任务退出后把栈还回来, 下次 task_create 优先复用。first fit,
+ * 不做相邻块合并 —— 任务栈大小是 4KB 的整数倍, 反复申请/释放同样
+ * 大小的块时 first fit 就够了, 碎片只在混用 4K/8K 时才会出现。
+ */
+#define STACK_FREE_MAX  16
+
+typedef struct {
+    u8 *base;
+    u32 size;
+} stack_block_t;
+
+static stack_block_t stack_free_list[STACK_FREE_MAX];
+static u32 stack_free_n = 0;
+
+/* =========================== 延迟回收队列 (v0.6 阶段5) =========================== */
+/*
+ * 当前任务是在自己的内核栈上调用 task_kill / task_exit 的, TCB、
+ * 内核栈、地址空间此刻都还在用。所以先挂进这个队列, 等调度挑中了
+ * 别的任务 (running == 不是它) 再释放。
+ */
+#define RECLAIM_MAX     16
+
+static task_t *reclaim_list[RECLAIM_MAX];
+static u32 reclaim_n = 0;
+
 
 /* =========================== 用户地址空间 (v0.6 阶段4) =========================== */
 /*
@@ -117,13 +151,34 @@ static void idle_entry(void)
  * @param  size  栈大小 (字节)
  * @return 栈顶指针 (栈向下增长, 返回的是分配区域的顶端)
  *
- * v0.1 使用最简单的递增分配, 不回收。
- * 任务数受栈池大小限制 (当前 64KB, 约 16 个 4KB 任务)。
+ * v0.6 阶段5 起先查空闲表 (first fit), 找不到再从 bump 指针切。
+ * 返回的是栈顶 (栈向下增长)。
  */
 static u32 *stack_alloc(u32 size)
 {
-    u8 *stack = stack_alloc_ptr;
+    u8 *stack;
+    u32 i;
 
+    size = (size + 7u) & ~7u;
+
+    /* 1. 复用已经归还的块; 块比请求大就切掉前半部分 */
+    for (i = 0; i < stack_free_n; i++) {
+        if (stack_free_list[i].size >= size) {
+            u8 *base = stack_free_list[i].base;
+
+            stack_free_list[i].base += size;
+            stack_free_list[i].size -= size;
+
+            if (stack_free_list[i].size == 0) {
+                stack_free_n--;
+                stack_free_list[i] = stack_free_list[stack_free_n];
+            }
+            return (u32 *)(uintptr_t)(base + size);
+        }
+    }
+
+    /* 2. 没有合适的空闲块 → 从 bump 指针切 */
+    stack = stack_alloc_ptr;
     if (stack + size > &_task_stack_pool_end) {
         /* 栈池耗尽 — 这是严重错误 */
         return NULL;
@@ -131,7 +186,43 @@ static u32 *stack_alloc(u32 size)
 
     stack_alloc_ptr += size;
     stack_pool_remaining -= size;
-    return (u32 *)(uintptr_t)(stack + size);  /* 返回栈顶 (栈向下增长) */
+    return (u32 *)(uintptr_t)(stack + size);
+}
+
+/**
+ * @brief  归还一块内核栈
+ *
+ * @param  top   栈顶 (stack_alloc 的返回值)
+ * @param  size  栈大小
+ *
+ * 当前任务的栈不能马上还: task_kill 之后调用者还站在这块栈上。
+ * 由延迟回收队列保证调用时序。
+ */
+static void stack_free(u8 *top, u32 size)
+{
+    u8 *base;
+    u32 i;
+
+    if (!top || size == 0) {
+        return;
+    }
+
+    size = (size + 7u) & ~7u;
+    base = top - size;
+
+    /* 已经在空闲表里就不重复添加 (防御性检查) */
+    for (i = 0; i < stack_free_n; i++) {
+        if (stack_free_list[i].base == base &&
+            stack_free_list[i].size == size) {
+            return;
+        }
+    }
+
+    if (stack_free_n < STACK_FREE_MAX) {
+        stack_free_list[stack_free_n].base = base;
+        stack_free_list[stack_free_n].size = size;
+        stack_free_n++;
+    }
 }
 
 /* =========================== 任务栈帧初始化 =========================== */
@@ -319,6 +410,31 @@ void schedule(void)
         return;
     }
 
+    /*
+     * 不允许嵌套调度。
+     *
+     * schedule() 这一段跑在"当前任务"的栈上。如果里面开中断时来了
+     * 一个 tick, 中断里的 schedule() 会在这里再切一次, 把外层这次
+     * 调度整个丢掉 —— 外层的 current_task 已经改过了, 后面的回收
+     * 代码再也不会执行。
+     *
+     * 症状很隐蔽: 任务退出时地址空间偶尔回收不回来 (6 个任务只收回
+     * 5 个), 而且每次跑的结果都不一样。
+     *
+     * 中断想调度的话, 把 need_resched 留着, 等这次切完自然会处理。
+     */
+    if (sched_active) {
+        return;
+    }
+    sched_active = 1;
+
+    /*
+     * 回收上一轮被杀掉的任务。
+     * 这里已经不在它们的栈上了 (current_task 不是它们), 所以
+     * 地址空间、内核栈、TCB 可以一起还回去。
+     */
+    reclaim_drain();
+
     next = pick_next_task();
 
     if (next != current_task) {
@@ -328,13 +444,19 @@ void schedule(void)
         next->state = TASK_RUNNING;
 
         /*
-         * 换地址空间 (v0.6 阶段4)。
+         * 换地址空间 (v0.6 阶段4/5)。
          * 必须在 context_switch 之前: 新任务的内核栈和 TCB 都在内核区,
          * 每张页表里映射一致, 所以换表过程中当前指令和栈都还有效。
+         *
+         * 阶段5 带 ASID: 只写 TTBR0, 不刷 TLB。
          */
-        mmu_activate(next->l1_phys);
+        mmu_activate(next->l1_phys, next->asid);
 
+        /* 切换前解除, 新任务看到的应该是可以正常调度的状态 */
+        sched_active = 0;
         context_switch(old, next);
+    } else {
+        sched_active = 0;
     }
 }
 
@@ -354,7 +476,7 @@ void sched_start(void)
     current_task = first;
     first->state = TASK_RUNNING;
 
-    mmu_activate(first->l1_phys);
+    mmu_activate(first->l1_phys, first->asid);
     context_switch(NULL, first);
 
     /* 不会到达这里 */
@@ -578,11 +700,14 @@ task_t *task_create(void (*entry)(void), const char *name,
     t->is_user     = 0;
     t->user_sp     = 0;
 
-    /* v0.6 阶段4: 内核态任务使用内核主页表, 没有私有地址空间 */
+    /* v0.6 阶段4/5: 内核态任务使用内核主页表 (ASID 0), 没有私有地址空间 */
     t->l1_phys     = mmu_kernel_l1();
     t->l2_phys     = 0;
     t->data_phys   = 0;
     t->stack_phys  = 0;
+    t->asid        = 0;
+    t->as_slot     = 0;
+    t->as_valid    = 0;
 
     /* v0.5: 初始化文件描述符表 */
     {
@@ -638,6 +763,8 @@ task_t *task_create_user(void (*entry)(void), const char *name,
      *    它伪造的是"内核态入口"帧, 下面会覆盖成用户态跳板帧。 */
     t = task_create(entry, name, priority, kstack_size);
     if (!t) {
+        /* TCB/内核栈没拿到, 地址空间要还回去 */
+        user_space_destroy(&as);
         sched_lock--;
         return NULL;
     }
@@ -653,6 +780,9 @@ task_t *task_create_user(void (*entry)(void), const char *name,
     t->l2_phys    = as.l2_phys;
     t->data_phys  = as.data_phys;
     t->stack_phys = as.stack_phys;
+    t->asid       = as.asid;
+    t->as_slot    = as.slot;
+    t->as_valid   = 1;
     t->user_sp    = USER_STACK_TOP;
     t->is_user    = 1;
 
@@ -684,13 +814,115 @@ task_t *task_create_user(void (*entry)(void), const char *name,
  * (系统调用/异常处理帧), 必须等调度切走之后才能回收。演示版本先不做
  * 回收, 后续可以加一个 reaper 任务统一释放。
  */
-void task_kill(task_t *t)
+/**
+ * @brief  真正释放任务的资源 (地址空间 / 内核栈 / TCB)
+ *
+ * 只在"这个任务不在 CPU 上, 也不在自己栈上"的时候调用。
+ */
+static void task_release(task_t *t)
 {
-    u32 i;
+    user_space_t us;
+    u32 valid;
 
     if (!t || t == &idle_tcb) {
         return;
     }
+
+    /*
+     * 先把地址空间"认领"下来再释放。
+     *
+     * 释放过程要开关中断、还要刷 TLB, 中途被打断是正常的。如果
+     * 读完 as_valid 才去做释放, 中间任何一次重入都会看到"还有
+     * 地址空间", 同一份槽位就被释放两次。这里先原子地清零,
+     * 谁读到 0 谁就不管。
+     */
+    ENTER_CRITICAL();
+    valid = t->as_valid;
+    t->as_valid = 0;
+    us.l1_phys    = t->l1_phys;
+    us.l2_phys    = t->l2_phys;
+    us.data_phys  = t->data_phys;
+    us.stack_phys = t->stack_phys;
+    us.asid       = t->asid;
+    us.slot       = t->as_slot;
+    EXIT_CRITICAL();
+
+    /* 1. 用户地址空间: 页表 + 数据页 + 用户栈 */
+    if (valid) {
+        user_space_destroy(&us);
+    }
+
+    /* 2. 内核栈 */
+    if (t->stack_base) {
+        stack_free((u8 *)(uintptr_t)t->stack_base, t->stack_size);
+        t->stack_base = NULL;
+    }
+
+    /* 3. TCB 本身 (从 slab 来的) */
+    slab_free(t);
+}
+
+/**
+ * @brief  把任务挂进延迟回收队列
+ */
+static void reclaim_push(task_t *t)
+{
+    if (reclaim_n < RECLAIM_MAX) {
+        reclaim_list[reclaim_n++] = t;
+    }
+}
+
+/**
+ * @brief  回收所有"已经不是当前任务"的死任务
+ *
+ * 在 schedule() 开头调用。被杀的任务永远不可能再被选中, 所以只要
+ * current_task 不是它, 就说明 CPU 已经不在它的栈上, 可以安全释放。
+ */
+static void reclaim_drain(void)
+{
+    task_t *todo[RECLAIM_MAX];
+    u32 n = 0;
+    u32 i;
+
+    /*
+     * 分两步: 先在关中断的情况下把待回收的任务从队列里摘下来,
+     * 再开中断做真正的释放。
+     *
+     * task_release 要刷 TLB、动栈池和 slab, 时间不短。如果一边释放
+     * 一边让 tick 进来, 中断里的 schedule() 会再次调用本函数,
+     * 同一个任务就会被释放两次, 或者从队列里被静默丢掉。
+     */
+    ENTER_CRITICAL();
+
+    i = 0;
+    while (i < reclaim_n) {
+        if (reclaim_list[i] == current_task) {
+            i++;                    /* 就是自己, 还站在人家栈上, 下次再说 */
+            continue;
+        }
+
+        todo[n++] = reclaim_list[i];
+        reclaim_list[i] = reclaim_list[reclaim_n - 1];
+        reclaim_n--;
+    }
+
+    EXIT_CRITICAL();
+
+    for (i = 0; i < n; i++) {
+        task_release(todo[i]);
+    }
+}
+
+void task_kill(task_t *t)
+{
+    u32 i;
+    int self;
+
+    if (!t || t == &idle_tcb || t->state == TASK_DEAD) {
+        return;
+    }
+
+    self = (t == current_task);
 
     ENTER_CRITICAL();
 
@@ -711,7 +943,24 @@ void task_kill(task_t *t)
         }
     }
 
+    /*
+     * 自己杀自己: 现场还在自己的内核栈上, 不能当场回收。
+     * 别的任务杀它: 它已经不在 CPU 上, 直接释放。
+     *
+     * 挂队列这一步必须留在临界区里。任务状态已经改成 DEAD, 也从
+     * 就绪队列摘掉了, 如果这里开中断, 一个 tick 就可能把 CPU 切走,
+     * 而它还没进回收队列 —— 它就再也不会被调度, 资源永久泄漏。
+     * (这个窗口是实际踩出来的: 6 个任务退出, 偶尔只回收 5 个。)
+     */
+    if (self) {
+        reclaim_push(t);
+    }
+
     EXIT_CRITICAL();
+
+    if (!self) {
+        task_release(t);
+    }
 }
 
 /**

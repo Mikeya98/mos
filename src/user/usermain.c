@@ -28,6 +28,7 @@
 #include "user/user.h"
 #include "user/user_syscall.h"
 #include "mm/mmu.h"
+#include "mm/addr_space.h"
 
 /* =========================== 段属性 =========================== */
 #define USER_TEXT   __attribute__((section(".user_text")))
@@ -56,8 +57,8 @@ static const char msg_bad5[]   USER_RODATA = "[user] u_badptr: unmapped page rej
 static const char msg_bad6[]   USER_RODATA = "[user] u_badptr: unmapped page accepted — walk FAILED!\n";
 
 static const char msg_nl[]     USER_RODATA = "\n";
-static const char msg_isa_ttbr[] USER_RODATA = "[user] u_iso_a : my TTBR0 = ";
-static const char msg_isb_ttbr[] USER_RODATA = "[user] u_iso_b : my TTBR0 = ";
+static const char msg_isa_ttbr[] USER_RODATA = "[user] u_iso_a : my TTBR0|ASID = ";
+static const char msg_isb_ttbr[] USER_RODATA = "[user] u_iso_b : my TTBR0|ASID = ";
 
 static const char msg_isa1[]   USER_RODATA = "[user] u_iso_a : wrote A to my 0x08100000, waiting for B\n";
 static const char msg_isa2[]   USER_RODATA = "[user] u_iso_a : read back A — address spaces are separate\n";
@@ -255,15 +256,111 @@ static task_t *create_user(const char *name, void (*entry)(void), u32 prio)
         return NULL;
     }
 
-    printf("[AS] %s L1=%X L2=%X data=%X stack=%X\n",
-           name, t->l1_phys, t->l2_phys, t->data_phys, t->stack_phys);
+    printf("[AS] %s slot=%u asid=%u L1=%X L2=%X data=%X stack=%X\n",
+           name, t->as_slot, t->asid,
+           t->l1_phys, t->l2_phys, t->data_phys, t->stack_phys);
     return t;
+}
+
+/* =========================== 地址空间回收演示 (v0.6 阶段5) =========================== */
+
+#define POOL_WAVE_TASKS 8
+
+static const char msg_spawn[] USER_RODATA =
+    "[user] u_spawn : running in a recycled address space\n";
+
+/** 一个用完就退出的短命用户任务, 用来反复占用/释放地址空间槽位 */
+static void USER_TEXT u_spawn(void)
+{
+    usys_write(msg_spawn, (u32)(sizeof(msg_spawn) - 1));
+    usys_exit();
+}
+
+/**
+ * 回收演示的驱动任务 (内核态, 最低优先级)。
+ *
+ * 前面的 6 个用户任务都是优先级 1, 这个任务是 30, 所以它一开始
+ * 根本轮不到 —— 等那 6 个都退出了才开始跑, 这时候 8 个槽位理论上
+ * 全都空着。
+ *
+ * 每一轮创建 8 个 u_spawn (正好占满所有槽位), 然后 yield 让它们跑完。
+ * 只有槽位真的被归还了, 第二轮才能再创建 8 个 —— 阶段4 的顺序切分
+ * 分配器到第一轮结束就用光 8 个槽位, 第二轮必然失败。
+ */
+static void pool_manager(void)
+{
+    u32 wave;
+    u32 i;
+    u32 made;
+    u32 free_before;
+
+    /*
+     * 先让一次。最后一个退出的 demo 任务在退出那一刻还是
+     * current_task, 延迟回收队列会跳过它; 这次 yield 进 schedule()
+     * 时已经换成本任务, 它占的槽位才真正还回来。
+     */
+    task_yield();
+
+    printf("\n[POOL] address-space recycling demo\n");
+    printf("[POOL] free slots: %u / %u\n",
+           user_space_free_count(), USER_SPACE_SLOTS);
+
+    for (wave = 0; wave < 3; wave++) {
+        free_before = user_space_free_count();
+        if (free_before < POOL_WAVE_TASKS) {
+            printf("[POOL] wave %u: only %u slots free, stop\n",
+                   wave, free_before);
+            break;
+        }
+
+        /*
+         * 优先级用 30, 和本任务相同。task_create 只在"新任务优先级更高"
+         * 时立刻调度, 同优先级不会插队, 8 个任务才能同时挂着。
+         */
+        made = 0;
+        for (i = 0; i < POOL_WAVE_TASKS; i++) {
+            if (!task_create_user(u_spawn, "u_spawn", 30, STACK_4K, STACK_4K)) {
+                break;
+            }
+            made++;
+        }
+        printf("[POOL] wave %u: created %u tasks, free slots now %u\n",
+               wave, made, user_space_free_count());
+
+        /*
+         * 让出 CPU。本任务被移到同优先级队尾, 前面 8 个 u_spawn
+         * 依次跑完并退出, 全部死掉之后调度器才会重新选中本任务。
+         */
+        task_yield();
+
+        /*
+         * 再让一次。最后一个 u_spawn 退出时, 它是 current_task,
+         * 回收队列会跳过它; 这次 yield 进入 schedule() 时已经
+         * 不是它了, 资源才真正还回来。
+         */
+        task_yield();
+
+        printf("[POOL] wave %u: spawn tasks gone, free slots = %u\n",
+               wave, user_space_free_count());
+    }
+
+    printf("[POOL] done — %u of %u slots free\n",
+           user_space_free_count(), USER_SPACE_SLOTS);
+
+    /*
+     * 任务入口函数不能 return。
+     * context_switch 里 lr 被填成入口地址, return 等于又跳回函数开头,
+     * 再返回一次就飞到栈上的随机值去了。
+     */
+    while (1) {
+        __asm__ volatile("WFI");
+    }
 }
 
 void user_demo_init(void)
 {
     printf("========================================\n");
-    printf("  User Mode Demo (v0.6 阶段4)\n");
+    printf("  User Mode Demo (v0.6 阶段5: ASID + reclaim)\n");
     printf("  user code : %X - %X (shared, read-only)\n",
            (u32)(uintptr_t)&_user_text_start,
            (u32)(uintptr_t)&_user_text_end);
@@ -288,4 +385,10 @@ void user_demo_init(void)
     if (!create_user("u_iso_b",   u_iso_b,   1)) return;
 
     printf("\n[DEMO] 6 user tasks created, each with its own L1 page table\n");
+
+    /*
+     * 回收演示的驱动任务: 内核态, 优先级 30 (只比 IDLE 高)。
+     * 前面 6 个用户任务是优先级 1, 所以它要等它们全部退出才开始跑。
+     */
+    task_create(pool_manager, "pool_mgr", 30, STACK_4K);
 }

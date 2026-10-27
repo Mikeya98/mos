@@ -8,6 +8,7 @@
  * 阶段3 用 section 的 AP 位做内核/用户权限隔离 (所有任务仍共用一张页表)。
  * 阶段4 给每个用户任务建独立的 L1 + L2 页表, 上下文切换时换 TTBR0,
  *        任务看到相同的虚拟地址, 但物理页各不相同。
+ * 阶段5 给每个地址空间分配 ASID, 私有页打 nG 位, 切换时不再刷 TLB。
  *
  * 页表结构 (ARMv7-A 短描述符):
  *   L1: 4096 项 × 1MB, 16KB, 16KB 对齐
@@ -44,8 +45,8 @@ extern u32 _mmu_table_base;
 /* 栈页数: 64KB / 4KB */
 #define USER_STACK_PAGES     (USER_STACK_SIZE / 4096u)
 
-/* 当前生效的页表物理地址 (避免无意义的 TLB 刷新) */
-static u32 active_l1 = 0;
+/* 当前生效的 TTBR0 (页表物理地址 | ASID), 相同就不重复写 */
+static u32 active_ttbr = 0;
 
 /* =========================== 协处理器操作 =========================== */
 
@@ -66,10 +67,37 @@ static inline void cp15_write_dacr(u32 val)
     __asm__ volatile ("MCR p15, 0, %0, c3, c0, 0" : : "r"(val) : "memory");
 }
 
+/*
+ * CONTEXTIDR: 低 8 位也是 ASID。
+ *
+ * ARMv7 的规范写的是 TLB 按 TTBR0.ASID 打标签, CONTEXTIDR 里的
+ * 这一份是 ARMv6 时代的遗留 (进程 ID)。但 QEMU 的 ARMv7 模型
+ * 给 TLB 标记时读的是 CONTEXTIDR, 只写 TTBR0 的话两个任务的
+ * 私有页会被当成同一个地址空间, 关掉全量刷 TLB 之后立刻串页。
+ * 两处都写, 真机和 QEMU 都能对上。
+ */
+static inline void cp15_write_contextidr(u32 val)
+{
+    __asm__ volatile ("MCR p15, 0, %0, c13, c0, 1" : : "r"(val) : "memory");
+}
+
+static inline u32 cp15_read_contextidr(void)
+{
+    u32 val;
+    __asm__ volatile ("MRC p15, 0, %0, c13, c0, 1" : "=r"(val));
+    return val;
+}
+
 static inline void cp15_invalidate_tlb(void)
 {
     u32 zero = 0;
     __asm__ volatile ("MCR p15, 0, %0, c8, c7, 0" : : "r"(zero) : "memory");
+}
+
+/* TLBIASID: 只清掉属于某个 ASID 的 TLB 项 */
+static inline void cp15_invalidate_tlb_asid(u32 asid)
+{
+    __asm__ volatile ("MCR p15, 0, %0, c8, c7, 2" : : "r"(asid) : "memory");
 }
 
 static inline u32 cp15_read_sctlr(void)
@@ -115,6 +143,17 @@ void mmu_init(void)
      *    内核作为模板复制到每张用户页表, 所以物理地址 = 虚拟地址。 */
     l1[USER_CODE_SEC] = USER_CODE_PHYS | L1_USER_RO_ATTR;
 
+    /*
+     * 3.5 私有区在内核页表里保持 fault。
+     *
+     * 内核页表的映射是全局的 (nG=0), 而 TLB 里的全局项对所有 ASID
+     * 都算命中。如果内核在这里也放一个 identity section, 一旦内核
+     * 碰过 0x08100000, 这条全局翻译就会盖住用户任务自己的页表项,
+     * 用户读到的就是物理内存里那一页。私有区只允许由用户页表的
+     * L2 项 (nG=1) 映射, 内核页表这一项必须是 fault。
+     */
+    l1[USER_PRIV_SEC] = 0;
+
     /* 4. 外设区 (512MB): device, 不可缓存, XN */
     for (i = DEV_BASE_SEC; i < DEV_END_SEC; i++) {
         l1[i] = (i << 20) | L1_DEV_PRIV_ATTR;
@@ -122,9 +161,11 @@ void mmu_init(void)
 
     mmu_dsb();
 
-    /* 5. DACR 域 0 = client, 页表 AP 位生效 */
+    /* 5. DACR 域 0 = client, 页表 AP 位生效
+     *    TTBR0 低 8 位是 ASID, 内核用 0 (0 是保留值, 专给内核) */
     cp15_write_dacr(DACR_DOMAIN0_CLIENT);
     cp15_write_ttbr0((u32)(uintptr_t)&_mmu_table_base);
+    cp15_write_contextidr(0);
     mmu_dsb();
 
     /* 6. 无效化 TLB, 开 MMU */
@@ -134,7 +175,7 @@ void mmu_init(void)
     cp15_write_sctlr(cp15_read_sctlr() | 0x1u);
     mmu_isb();
 
-    active_l1 = (u32)(uintptr_t)&_mmu_table_base;
+    active_ttbr = (u32)(uintptr_t)&_mmu_table_base;   /* ASID 0 */
 }
 
 u32 mmu_kernel_l1(void)
@@ -189,33 +230,57 @@ void mmu_build_user_l2(u32 *l2, u32 data_phys, u32 stack_phys)
 
 /* =========================== TTBR0 切换 =========================== */
 
-void mmu_activate(u32 l1_phys)
+void mmu_activate(u32 l1_phys, u32 asid)
 {
-    if (l1_phys == active_l1) {
-        return;             /* 同一个地址空间, 不用动 TLB */
+    u32 ttbr = (l1_phys & 0xFFFFC000u) | (asid & 0xFFu);
+
+    if (ttbr == active_ttbr) {
+        return;             /* 同一个地址空间, TTBR0 都不用写 */
     }
 
-    cp15_write_ttbr0(l1_phys);
-    mmu_dsb();
-
-    /*
-     * 换页表必须清 TLB, 否则新任务可能命中旧任务留下的
-     * 地址翻译 (同一虚拟地址 → 旧任务的物理页)。
-     *
-     * 这里用最保守的全量无效化。ARMv7 的 ASID 机制可以做到
-     * 不刷 TLB, 需要在页表项里打 nG 位并给每个任务分配 ASID,
-     * 留给后面优化。
-     */
-    cp15_invalidate_tlb();
+    cp15_write_ttbr0(ttbr);
+    cp15_write_contextidr(asid & 0xFFu);
     mmu_dsb();
     mmu_isb();
 
-    active_l1 = l1_phys;
+    /*
+     * 这里不刷 TLB。
+     *
+     * 私有页的数据页/栈在 L2 项里打了 nG 位 (bit11), 它们的翻译
+     * 按 TTBR0 里的 ASID 打标签, 换 ASID 之后旧任务的项不会被命中；
+     * 内核区和用户代码区的映射是全局的 (nG=0), 本来就该被所有
+     * 地址空间共享。两条路都不需要无效化。
+     *
+     * 唯一的要求是: ASID 不能带着旧翻译被下一个任务复用,
+     * 所以 user_space_destroy() 在归还 ASID 之前会调 mmu_flush_asid()。
+     */
+    active_ttbr = ttbr;
+}
+
+void mmu_flush_asid(u32 asid)
+{
+    /*
+     * TLBIASID 按 ASID 匹配。QEMU 的 TLB 标记读的是 CONTEXTIDR,
+     * 所以临时把它切成目标 ASID, 刷完再恢复 —— 恢复这一步不能省,
+     * 否则当前任务接下来的用户态访问会被贴到别人的 ASID 上。
+     */
+    u32 saved = cp15_read_contextidr();
+
+    cp15_write_contextidr(asid & 0xFFu);
+    cp15_invalidate_tlb_asid(asid & 0xFFu);
+    mmu_dsb();
+    cp15_write_contextidr(saved);
+    mmu_isb();
 }
 
 u32 mmu_current_l1(void)
 {
-    return cp15_read_ttbr0();
+    return cp15_read_ttbr0() & 0xFFFFC000u;
+}
+
+u32 mmu_current_asid(void)
+{
+    return cp15_read_ttbr0() & 0xFFu;
 }
 
 /* =========================== 用户指针检查 =========================== */

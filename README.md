@@ -2,7 +2,7 @@
 
 [![Platform](https://img.shields.io/badge/platform-ARM%20Cortex--A9-blue)](https://github.com/Mikeya98/mos)
 [![Language](https://img.shields.io/badge/language-C%20%7C%20Assembly-orange)](https://github.com/Mikeya98/mos)
-[![Status](https://img.shields.io/badge/status-v0.6%20--%20per--task%20page%20tables-brightgreen)](https://github.com/Mikeya98/mos)
+[![Status](https://img.shields.io/badge/status-v0.6%20--%20ASID%20%2B%20reclaim-brightgreen)](https://github.com/Mikeya98/mos)
 [![QEMU](https://img.shields.io/badge/QEMU-verified-lightgrey)](https://github.com/Mikeya98/mos)
 
 MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 上，用 QEMU 仿真验证。每一行代码都是手写的，没有引用任何现成的 RTOS 内核代码。
@@ -20,7 +20,9 @@ MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 �
 - **MMU**：两级页表（L1 section 1MB + L2 small page 4KB）、identity mapping、DDR 可缓存 / 外设 device 分区、已开启 MMU
 - **用户态**：用户态任务（USR/SVC 模式切换）、双栈、trampoline 首次进用户态
 - **权限隔离**：内核区 AP=01 仅特权态可访问；用户代码段 AP=10（用户只读、可执行）；DACR 由 manager 改为 client，让页表 AP 位真正生效
-- **独立地址空间**：每个用户任务一张 L1 页表 + 一张 L2 表，固定虚拟布局（代码 `0x08000000`、私有数据页 `0x08100000`、栈 `0x08101000-0x08110FFF`），上下文切换时换 TTBR0 并清 TLB，任务之间互相看不到对方的物理页
+- **独立地址空间**：每个用户任务一张 L1 页表 + 一张 L2 表，固定虚拟布局（代码 `0x08000000`、私有数据页 `0x08100000`、栈 `0x08101000-0x08110FFF`），任务之间互相看不到对方的物理页
+- **ASID 免刷 TLB**：TTBR0 低 8 位带地址空间编号，私有页打 `nG` 位，切换地址空间只写 TTBR0/CONTEXTIDR，不再全量无效化 TLB
+- **资源回收**：任务退出后归还地址空间槽位（L1/L2/数据页/用户栈）、内核栈和 TCB；当前任务踩在自己的栈上，所以走延迟回收队列
 - **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST / GET_TTBR0`；`copy_from_user` / `copy_to_user` 先走当前任务的页表检查用户指针（区分读/写权限）
 - **异常恢复**：捕获 Data Abort / Prefetch Abort，打印任务名、故障地址与 DFSR/DFAR，杀掉出错的用户任务后继续调度，系统不宕机
 
@@ -49,8 +51,8 @@ mos/
 │   ├── mm/
 │   │   ├── buddy.c             # Buddy 伙伴分配器
 │   │   ├── slab.c              # SLAB 对象缓存
-│   │   ├── mmu.c               # MMU 页表 + TTBR0 切换 + 用户指针检查
-│   │   └── addr_space.c        # 每任务地址空间的物理资源分配
+│   │   ├── mmu.c               # MMU 页表 + TTBR0/ASID 切换 + 用户指针检查
+│   │   └── addr_space.c        # 每任务地址空间槽位：分配、ASID、回收
 │   ├── fs/
 │   │   ├── block_dev.c         # 块设备抽象 + RAM 盘
 │   │   ├── mos_fs.c            # MOS-FS 磁盘格式
@@ -118,12 +120,19 @@ Starting scheduler...
 [SYS] write: pointer 8200000 len=16 rejected → EFAULT
 [user] u_badptr: unmapped page rejected by page-table walk
 [user] u_iso_a : wrote A to my 0x08100000, waiting for B
-[user] u_iso_a : my TTBR0 = 0x00234000
+[user] u_iso_a : my TTBR0|ASID = 0x0023C005
 [user] u_iso_b : wrote B to the same virtual address
-[user] u_iso_b : my TTBR0 = 0x00238000
+[user] u_iso_b : my TTBR0|ASID = 0x00240006
 [user] u_iso_b : read back B — my own page
 [user] u_waiter: woken by u_worker, exiting
 [user] u_iso_a : read back A — address spaces are separate
+
+[POOL] address-space recycling demo
+[POOL] free slots: 8 / 8
+[POOL] wave 0: created 8 tasks, free slots now 0
+[POOL] wave 0: spawn tasks gone, free slots = 8
+    （wave 1 / 2 重复两轮）
+[POOL] done — 8 of 8 slots free
 ```
 
 这些输出分别验证了：
@@ -132,7 +141,8 @@ Starting scheduler...
 2. `u_waiter` 阻塞在信号量上，被 `u_worker` post 后唤醒，`sem_wait/sem_post` 系统调用可用；
 3. `u_fault` 读内核地址 `0x00100000` 触发 **Permission Fault**（DFSR=0xD），异常处理杀掉该任务，其余任务继续运行；
 4. `u_badptr` 两种非法指针都被拒绝：内核地址过不了范围检查，用户范围里未映射的 `0x08200000` 过不了页表遍历；
-5. `u_iso_a` / `u_iso_b` 往同一个虚拟地址 `0x08100000` 写不同标记，各自读回自己的值，且两次读到的 TTBR0 不同（`0x234000` / `0x238000`），说明地址空间确实分开了。
+5. `u_iso_a` / `u_iso_b` 往同一个虚拟地址 `0x08100000` 写不同标记，各自读回自己的值，且两次读到的 TTBR0 不同（低 8 位是 ASID：5 / 6），说明地址空间确实分开了；
+6. `pool_mgr` 连续三轮各创建 8 个短命任务（正好占满 8 个地址空间槽位），每轮结束后 8 个槽位全部归还。如果资源不回收，第二轮就会因为"没有空闲槽位"创建失败。
 
 > QEMU 的 zynq 机器默认内存放不下 `0x08000000` 的第二段，`make qemu-run` 里加了 `-m 1024`。
 
@@ -145,8 +155,8 @@ Starting scheduler...
 | v0.3 | Buddy 伙伴内存分配器 | ✅ |
 | v0.4 | SLAB 对象缓存 + TCB 动态分配 | ✅ |
 | v0.5 | MOS-FS 文件系统（VFS + RAM 盘） | ✅ |
-| v0.6 | MMU + 用户态 + 权限隔离 + 每任务独立页表（阶段1 开 MMU、阶段2 模式切换、阶段3 隔离/异常恢复、阶段4 TTBR0 切换） | ✅ |
-| 下一步 | ASID 免 TLB 刷新、按需分页、任务退出后的地址空间回收 | 🔜 |
+| v0.6 | MMU + 用户态 + 权限隔离 + 每任务独立页表 + ASID + 资源回收（阶段1 开 MMU、阶段2 模式切换、阶段3 隔离/异常恢复、阶段4 TTBR0 切换、阶段5 ASID/reclaim） | ✅ |
+| 下一步 | 按需分页（缺页异常 + 按需分配物理页） | 🔜 |
 
 ## 构建细节
 
@@ -154,7 +164,7 @@ Starting scheduler...
 - **目标**：`-mcpu=cortex-a9 -mfpu=vfpv3 -mfloat-abi=soft`
 - **链接**：自定义 `kernel.lds`（OCM + DDR 内存布局）
 - **QEMU**：`qemu-system-arm -M xilinx-zynq-a9 -m 1024`
-- **体积**：text 约 27.6KB（用户态代码单独链接在 `0x08000000`）
+- **体积**：text 约 29.6KB（用户态代码单独链接在 `0x08000000`）
 
 ## 关于
 
