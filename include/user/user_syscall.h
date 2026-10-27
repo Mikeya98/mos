@@ -49,6 +49,9 @@
 #if SYS_GET_TTBR0 != 7
 #error "SVC immediate for SYS_GET_TTBR0 is stale"
 #endif
+#if SYS_VM_STATS != 8
+#error "SVC immediate for SYS_VM_STATS is stale"
+#endif
 
 #define USYS_INLINE  static inline __attribute__((always_inline))
 
@@ -118,6 +121,19 @@ USYS_INLINE u32 usys_ttbr0(void)
     register u32 r0 __asm__("r0") = 0;
     __asm__ volatile ("SVC #7" : "+r"(r0) : : "memory");
     return r0;
+}
+
+/**
+ * 取缺页/页框统计, 结果写进用户缓冲区 (out 指向 mm/vm.h 的 vm_stats_t)。
+ *
+ * 内核用 copy_to_user 写这块内存 —— 如果 out 指向一页还没碰过的栈,
+ * 这次调用本身就会触发一次"内核代用户补页", 正好演示 vm_touch。
+ */
+USYS_INLINE s32 usys_vm_stats(void *out)
+{
+    register u32 r0 __asm__("r0") = (u32)(uintptr_t)out;
+    __asm__ volatile ("SVC #8" : "+r"(r0) : : "memory");
+    return (s32)r0;
 }
 
 #endif /* _MOS_USER_SYSCALL_H */

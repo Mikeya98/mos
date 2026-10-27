@@ -80,6 +80,8 @@ IPC_SRCS = $(SRC_DIR)/ipc/semaphore.c \
 MM_SRCS  = $(SRC_DIR)/mm/buddy.c \
            $(SRC_DIR)/mm/slab.c \
            $(SRC_DIR)/mm/mmu.c \
+           $(SRC_DIR)/mm/frame.c \
+           $(SRC_DIR)/mm/vm.c \
            $(SRC_DIR)/mm/addr_space.c
 
 # 文件系统 (v0.5)

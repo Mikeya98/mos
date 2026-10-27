@@ -23,6 +23,7 @@
 #include "mm/buddy.h"
 #include "mm/slab.h"
 #include "mm/mmu.h"
+#include "mm/frame.h"
 #include "fs/block_dev.h"
 #include "fs/mos_fs.h"
 #include "fs/vfs.h"
@@ -359,11 +360,15 @@ void kernel_main(void)
     printf("\n");
     printf("========================================\n");
     printf("  MOS RTOS v0.6\n");
-    printf("  MMU + per-task page tables + ASID + MOS-FS\n");
+    printf("  MMU + per-task page tables + ASID + demand paging\n");
     printf("========================================\n\n");
 
     mmu_init();
     printf("[INIT] MMU enabled (identity map)\n");
+
+    frame_init();
+    printf("[INIT] Frame allocator ready (%u frames = %u KB)\n",
+           frame_total(), frame_total() * 4u);
 
     gic_init();
     printf("[INIT] GIC initialized\n");

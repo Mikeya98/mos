@@ -25,6 +25,7 @@
 #include "kernel/task.h"
 #include "ipc/semaphore.h"
 #include "mm/mmu.h"
+#include "mm/vm.h"
 #include "lib/printf.h"
 
 /* =========================== 临界区宏 =========================== */
@@ -51,14 +52,28 @@ static u8    user_sem_used[SYS_SEM_MAX];
 /* =========================== 指针校验 =========================== */
 
 /*
- * 阶段4 之后每个任务有自己的页表, 用户区里不是每一页都映射过
- * (0x08111000 以上就是 fault)。所以不能只查地址范围, 必须走一遍
- * 当前任务的页表: mmu_user_access_ok 会逐页检查 L1/L2 描述符,
- * 同时按读/写区分 AP 权限。
+ * 阶段4 之后每个任务有自己的页表, 用户区里不是每一页都映射过。
+ * 所以不能只查地址范围, 必须走一遍当前任务的页表: mmu_user_access_ok
+ * 会逐页检查 L1/L2 描述符, 同时按读/写区分 AP 权限。
  *
- * 这样查过就一定可访问, 拷贝过程中不会在内核态触发 Data Abort。
- * 以后做按需分页, 这里还得处理"查的时候映射了, 拷的时候被换出"的情况。
+ * 阶段6 之后多了"合法但还没分配"的页。内核替用户读写内存时不会走
+ * Data Abort (内核态踩 fault 是直接停机), 所以要先调 vm_touch 把这些
+ * 页补上, 再做权限检查。顺序不能反:
+ *   - 先 vm_touch 再查权限: 刚补的页是 AP=11, 一定能过;
+ *   - 要是先查权限, 合法但未映射的页会被判成 EFAULT。
+ *
+ * vm_touch 只碰私有区里的合法页, 内核地址和用户代码区它一概不管,
+ * 这些地址仍然由 mmu_user_access_ok 拒绝 —— u_badptr 那两个用例
+ * 依赖的就是这一点。
  */
+
+static int user_range_ok(u32 start, u32 len, int write)
+{
+    if (vm_touch(start, len, write) != VM_OK) {
+        return 0;
+    }
+    return mmu_user_access_ok(start, len, write);
+}
 
 int copy_from_user(void *dst, const void *usrc, u32 len)
 {
@@ -66,7 +81,7 @@ int copy_from_user(void *dst, const void *usrc, u32 len)
     const volatile u8 *s = (const volatile u8 *)usrc;
     u32 i;
 
-    if (!mmu_user_access_ok((u32)(uintptr_t)usrc, len, 0)) {
+    if (!user_range_ok((u32)(uintptr_t)usrc, len, 0)) {
         return -EFAULT;
     }
 
@@ -82,7 +97,7 @@ int copy_to_user(void *udst, const void *ksrc, u32 len)
     const u8 *s = (const u8 *)ksrc;
     u32 i;
 
-    if (!mmu_user_access_ok((u32)(uintptr_t)udst, len, 1)) {
+    if (!user_range_ok((u32)(uintptr_t)udst, len, 1)) {
         return -EFAULT;
     }
 
@@ -106,7 +121,7 @@ static int sys_write(const char *ubuf, u32 len)
     char kbuf[64];
     u32 done = 0;
 
-    if (!mmu_user_access_ok((u32)(uintptr_t)ubuf, len, 0)) {
+    if (!user_range_ok((u32)(uintptr_t)ubuf, len, 0)) {
         printf("[SYS] write: pointer %X len=%u rejected → EFAULT\n",
                (u32)(uintptr_t)ubuf, len);
         return -EFAULT;
@@ -148,6 +163,35 @@ static int sys_sem_post(u32 id)
         return -EINVAL;
     }
     sem_post(&user_sems[id]);
+    return 0;
+}
+
+/**
+ * 缺页/页框统计。
+ *
+ * 数据是内核态填的, 但要写进用户缓冲区 —— 这条路径本身就是
+ * "内核替用户补页"的演示: 用户传一页从没碰过的栈地址进来,
+ * copy_to_user 里的 vm_touch 会把页框补上, 然后才拷贝。
+ */
+static int sys_vm_stats(void *uout)
+{
+    vm_stats_t ks;
+
+    /*
+     * 先补页再取数, 顺序不能反。
+     * 反过来的话, 补页本身产生的那次缺页不会被算进 faults, 用户
+     * 看到的数字永远比实际少一 (第一版就是这么错的)。
+     */
+    if (vm_touch((u32)(uintptr_t)uout, (u32)sizeof(ks), 1) != VM_OK) {
+        printf("[SYS] vm_stats: bad user pointer %X\n", (u32)(uintptr_t)uout);
+        return -EFAULT;
+    }
+
+    vm_fill_stats(&ks);
+    if (copy_to_user(uout, &ks, (u32)sizeof(ks)) < 0) {
+        printf("[SYS] vm_stats: bad user pointer %X\n", (u32)(uintptr_t)uout);
+        return -EFAULT;
+    }
     return 0;
 }
 
@@ -194,6 +238,10 @@ void svc_dispatch(u32 svc_num, u32 *frame)
     case SYS_GET_TTBR0:
         /* 调试用: 用户任务读自己的 TTBR0 (页表基址 | ASID) */
         ret = (int)(mmu_current_l1() | mmu_current_asid());
+        break;
+
+    case SYS_VM_STATS:
+        ret = sys_vm_stats((void *)(uintptr_t)frame[FRAME_R0]);
         break;
 
     default: {

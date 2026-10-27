@@ -42,9 +42,6 @@ extern u32 _mmu_table_base;
 /* DACR: 域 0 设为 client (0b01), 页表 AP 位才生效 */
 #define DACR_DOMAIN0_CLIENT  0x1u
 
-/* 栈页数: 64KB / 4KB */
-#define USER_STACK_PAGES     (USER_STACK_SIZE / 4096u)
-
 /* 当前生效的 TTBR0 (页表物理地址 | ASID), 相同就不重复写 */
 static u32 active_ttbr = 0;
 
@@ -208,21 +205,19 @@ void mmu_build_user_l1(u32 *l1, u32 l2_phys)
     mmu_dsb();
 }
 
-void mmu_build_user_l2(u32 *l2, u32 data_phys, u32 stack_phys)
+void mmu_build_user_l2(u32 *l2)
 {
     u32 i;
 
-    /* 全部 fault: 私有区里没映射的页, 用户访问直接 Data Abort */
+    /*
+     * 全部 fault。
+     *
+     * 阶段4/5 在这里把数据页和 64KB 栈一次性填好, 每个任务不管用不用
+     * 都要占 17 帧。阶段6 改成按需分配: 表建好之后一项都不映射,
+     * 用户第一次碰 0x08100000 或栈上的某一页时才由 vm_fault 填进来。
+     */
     for (i = 0; i < L2_ENTRIES; i++) {
         l2[i] = 0;
-    }
-
-    /* L2[0] → VA 0x08100000, 私有数据页 */
-    l2[0] = (data_phys & 0xFFFFF000u) | L2_USER_RW_XN;
-
-    /* L2[1..16] → VA 0x08101000 - 0x08110FFF, 用户栈 */
-    for (i = 0; i < USER_STACK_PAGES; i++) {
-        l2[1 + i] = ((stack_phys + i * 4096u) & 0xFFFFF000u) | L2_USER_RW_XN;
     }
 
     mmu_dsb();

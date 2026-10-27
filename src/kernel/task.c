@@ -615,8 +615,7 @@ void task_init(void)
     idle_tcb.user_sp     = 0;
     idle_tcb.l1_phys     = mmu_kernel_l1();
     idle_tcb.l2_phys     = 0;
-    idle_tcb.data_phys   = 0;
-    idle_tcb.stack_phys  = 0;
+    idle_tcb.pf_count    = 0;
 
     /* IDLE 使用自己的静态栈 (512B, 8 字节对齐) */
     static u8 idle_stack[512] __attribute__((aligned(8)));
@@ -703,8 +702,7 @@ task_t *task_create(void (*entry)(void), const char *name,
     /* v0.6 阶段4/5: 内核态任务使用内核主页表 (ASID 0), 没有私有地址空间 */
     t->l1_phys     = mmu_kernel_l1();
     t->l2_phys     = 0;
-    t->data_phys   = 0;
-    t->stack_phys  = 0;
+    t->pf_count    = 0;
     t->asid        = 0;
     t->as_slot     = 0;
     t->as_valid    = 0;
@@ -771,15 +769,15 @@ task_t *task_create_user(void (*entry)(void), const char *name,
 
     /*
      * 3. 绑定地址空间。
-     *    用户栈大小目前固定 64KB (16 个 4KB 页), ustack_size 参数
-     *    保留是为了接口稳定, 以后做按需分页时会用到。
+     *    阶段6 之后栈上限是虚拟地址决定的 (0x08102000 - 0x081FFFFF,
+     *    最多 1016KB), 物理页在访问时才分配。ustack_size 参数保留
+     *    是为了接口稳定, 目前不参与映射。
      */
     (void)ustack_size;
 
     t->l1_phys    = as.l1_phys;
     t->l2_phys    = as.l2_phys;
-    t->data_phys  = as.data_phys;
-    t->stack_phys = as.stack_phys;
+    t->pf_count   = 0;
     t->asid       = as.asid;
     t->as_slot    = as.slot;
     t->as_valid   = 1;
@@ -841,13 +839,11 @@ static void task_release(task_t *t)
     t->as_valid = 0;
     us.l1_phys    = t->l1_phys;
     us.l2_phys    = t->l2_phys;
-    us.data_phys  = t->data_phys;
-    us.stack_phys = t->stack_phys;
     us.asid       = t->asid;
     us.slot       = t->as_slot;
     EXIT_CRITICAL();
 
-    /* 1. 用户地址空间: 页表 + 数据页 + 用户栈 */
+    /* 1. 用户地址空间: 页表槽位 + L2 表里映射过的页框 */
     if (valid) {
         user_space_destroy(&us);
     }

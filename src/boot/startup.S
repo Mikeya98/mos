@@ -294,17 +294,36 @@ prefetch_handler:
 
 data_handler:
     /*
-     * Data Abort — 访问非法地址 (用户态越权访问内核区就是走这里)
+     * Data Abort — 访问非法地址或未映射的页
+     *
+     * 阶段6 之后这条路径有两种结局:
+     *   1. 缺页: C 处理函数把页框填进页表后返回, 这里 RFE 回到
+     *      出错的那条指令重新执行 —— 页已经映射好了, 这次能过;
+     *   2. 非法访问: 处理函数杀掉任务并切换走, 永远不返回。
      *
      * lr_abt = 故障指令地址 + 8。
-     * C 处理函数里读取 DFAR/DFSR, 打印现场, 杀掉出错任务后调度走。
+     *
+     * 栈帧安排 (和 irq_handler 同一种写法):
+     *   SRSFD 把 lr_abt / spsr_abt 压到 SVC 栈 (每个 4 字节)
+     *   PUSH {r0-r3, r12, lr} 再压 24 字节, 所以
+     *     [sp + 24] = 故障指令地址
+     *     [sp + 28] = 故障时的 CPSR
+     *   返回时 POP 恢复寄存器, RFEFD 同时恢复 PC 和 CPSR。
+     *
+     * 出错指令的 r0-r12 一个都不能丢: 缺页返回之后这条指令要原样
+     * 重放, 寄存器被改掉就变成了"执行到一半再执行一次"。
      */
     SUB     lr, lr, #8
-    MOV     r0, lr
-    MRS     r1, SPSR
+    SRSFD   sp!, #MODE_SVC
     CPS     #MODE_SVC
+
+    PUSH    {r0-r3, r12, lr}
+    LDR     r0, [sp, #24]           @ fault_pc
+    LDR     r1, [sp, #28]           @ spsr_abt
     BL      data_abort_handler
-    B       .
+    POP     {r0-r3, r12, lr}
+
+    RFEFD   sp!                     @ PC = 故障指令, CPSR 恢复用户态
 
 irq_handler:
     /*

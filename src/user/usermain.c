@@ -9,16 +9,19 @@
  *
  * 每个任务有自己的页表, 相同的虚拟地址指向不同的物理页:
  *   0x08000000  用户代码 (共享, 用户只读)
- *   0x08100000  私有数据页 (4KB, 每任务一块)
- *   0x08101000  私有栈 (64KB, 每任务一块)
+ *   0x08100000  私有数据页 (1 页, 首次访问时分配)
+ *   0x08101000  栈保护页 (永远 fault)
+ *   0x08102000  栈底, 栈从 0x08200000 向下长, 最多 1016KB
  *
- * 演示六个场景:
- *   u_waiter — 调 sem_wait 阻塞, 被 u_worker 唤醒
- *   u_worker — 正常系统调用: getpid / write / sem_post
- *   u_fault  — 直接读内核地址 → Data Abort → 任务被杀, 系统继续跑
- *   u_badptr — 把内核指针/未映射地址传给 sys_write → copy_from_user 返回 EFAULT
- *   u_iso_a  — 独立地址空间: 写自己的 0x08100000, 等 u_iso_b 跑完再读回
- *   u_iso_b  — 独立地址空间: 写同一虚拟地址, 两边互不影响
+ * 演示八个场景:
+ *   u_waiter   — 调 sem_wait 阻塞, 被 u_worker 唤醒
+ *   u_worker   — 正常系统调用: getpid / write / sem_post
+ *   u_fault    — 直接读内核地址 → Data Abort → 任务被杀, 系统继续跑
+ *   u_badptr   — 把内核指针/未映射地址传给 sys_write → copy_from_user 返回 EFAULT
+ *   u_iso_a    — 独立地址空间: 写自己的 0x08100000, 等 u_iso_b 跑完再读回
+ *   u_iso_b    — 独立地址空间: 写同一虚拟地址, 两边互不影响
+ *   u_demand   — 按需分页: 数据页/栈页都是第一次访问才分配
+ *   u_overflow — 写栈保护页 → 内核判定栈溢出, 杀掉任务
  */
 
 #include "lib/types.h"
@@ -29,6 +32,8 @@
 #include "user/user_syscall.h"
 #include "mm/mmu.h"
 #include "mm/addr_space.h"
+#include "mm/vm.h"
+#include "mm/frame.h"
 
 /* =========================== 段属性 =========================== */
 #define USER_TEXT   __attribute__((section(".user_text")))
@@ -42,7 +47,7 @@
 static const char msg_wait[]   USER_RODATA = "[user] u_waiter: sem_wait(0) — should block here\n";
 static const char msg_woken[]  USER_RODATA = "[user] u_waiter: woken by u_worker, exiting\n";
 
-static const char msg_work1[]  USER_RODATA = "[user] u_worker: getpid() > 0, private stack at 0x08101000-0x08110FFF\n";
+static const char msg_work1[]  USER_RODATA = "[user] u_worker: getpid() > 0, stack top at 0x08200000 (on-demand pages)\n";
 static const char msg_work2[]  USER_RODATA = "[user] u_worker: sem_post(0) done, exiting\n";
 static const char msg_stackbad[] USER_RODATA = "[user] u_worker: private stack check FAILED\n";
 
@@ -67,6 +72,18 @@ static const char msg_isa3[]   USER_RODATA = "[user] u_iso_a : read back B — S
 static const char msg_isb1[]   USER_RODATA = "[user] u_iso_b : wrote B to the same virtual address\n";
 static const char msg_isb2[]   USER_RODATA = "[user] u_iso_b : read back B — my own page\n";
 static const char msg_isb3[]   USER_RODATA = "[user] u_iso_b : read back A — SHARED MEMORY, isolation FAILED!\n";
+
+static const char msg_dm1[]    USER_RODATA = "[user] u_demand : first write to data page 0x08100000 ...\n";
+static const char msg_dm2[]    USER_RODATA = "[user] u_demand : data page OK, now recursing 8 levels (touching stack pages)\n";
+static const char msg_dm3[]    USER_RODATA = "[user] u_demand : asking kernel for vm stats (buffer on an untouched page)\n";
+static const char msg_dm_f[]   USER_RODATA = "[user] u_demand : faults        = ";
+static const char msg_dm_p[]   USER_RODATA = "[user] u_demand : mapped pages  = ";
+static const char msg_dm_ff[]  USER_RODATA = "[user] u_demand : frames free   = ";
+static const char msg_dm_ft[]  USER_RODATA = "[user] u_demand : frames total  = ";
+static const char msg_dm_er[]  USER_RODATA = "[user] u_demand : vm_stats syscall FAILED\n";
+
+static const char msg_of1[]    USER_RODATA = "[user] u_overflow: writing the guard page 0x08101000 ...\n";
+static const char msg_of2[]    USER_RODATA = "[user] u_overflow: still alive — guard page FAILED!\n";
 
 #define SAY(s)  usys_write((s), (u32)(sizeof(s) - 1))
 
@@ -239,6 +256,84 @@ static void USER_TEXT u_iso_b(void)
     usys_exit();
 }
 
+/**
+ * 递归函数, 每层在栈上占约 2KB。
+ *
+ * 用来演示"栈页是按需分配的": 调 4 层只碰几页, 内核就只给这几页
+ * 分配页框, 剩下的 1000 多 KB 虚拟栈一个物理页都不占。
+ */
+static u32 USER_TEXT touch_stack(u32 depth)
+{
+    volatile u8 page[1900];
+    u32 i;
+
+    page[0] = (u8)depth;
+    for (i = 0; i < sizeof(page); i += 64) {
+        page[i] = (u8)(depth + i);
+    }
+
+    if (depth > 0) {
+        return touch_stack(depth - 1) + page[0];
+    }
+    return page[sizeof(page) - 1];
+}
+
+/**
+ * 按需分页演示。
+ *
+ * 三条路径:
+ *   1. 用户自己写未映射的数据页 → Data Abort → vm_fault → 重试指令
+ *   2. 递归压栈 → 每跨一页触发一次缺页
+ *   3. 把统计缓冲区放在一页从没碰过的栈上, 由内核 copy_to_user
+ *      代为补页 (vm_touch), 这条路径不经过 Data Abort
+ */
+static void USER_TEXT u_demand(void)
+{
+    volatile u32 *slot = (volatile u32 *)(uintptr_t)USER_DATA_VADDR;
+    vm_stats_t *out = (vm_stats_t *)(uintptr_t)0x08180000u;   /* 高处栈页, 从没碰过 */
+    u32 sum;
+    s32 ret;
+
+    SAY(msg_dm1);
+    *slot = 0x1234ABCDu;        /* ← 第一次访问, 缺页 */
+    sum = *slot;
+
+    SAY(msg_dm2);
+    sum += touch_stack(8);      /* ← 每跨一页缺一次 (8 层约 16KB) */
+    if (sum == 0xFFFFFFFFu) {   /* 防止优化掉上面的读 */
+        SAY(msg_dm_er);
+    }
+
+    SAY(msg_dm3);
+    ret = usys_vm_stats(out);   /* 内核往未映射页写 → vm_touch 补页 */
+    if (ret == 0) {
+        say_hex(msg_dm_f,  out->faults,       msg_nl);
+        say_hex(msg_dm_p,  out->pages,        msg_nl);
+        say_hex(msg_dm_ff, out->frames_free,  msg_nl);
+        say_hex(msg_dm_ft, out->frames_total, msg_nl);
+    } else {
+        SAY(msg_dm_er);
+    }
+
+    usys_exit();
+}
+
+/**
+ * 栈溢出: 直接写保护页。
+ *
+ * 保护页 (L2[1]) 永远不映射, vm_fault 会明确拒绝, 内核打印
+ * "stack overflow" 后杀掉本任务 —— 数据页不会被栈悄悄覆盖。
+ */
+static void USER_TEXT u_overflow(void)
+{
+    volatile u32 *guard = (volatile u32 *)(uintptr_t)USER_GUARD_VADDR;
+
+    SAY(msg_of1);
+    *guard = 0xDEADBEEFu;       /* ← Data Abort, 保护页拒绝映射 */
+    SAY(msg_of2);
+    usys_exit();
+}
+
 /* =========================== 内核侧初始化 =========================== */
 
 extern u8 _user_text_start;
@@ -256,9 +351,8 @@ static task_t *create_user(const char *name, void (*entry)(void), u32 prio)
         return NULL;
     }
 
-    printf("[AS] %s slot=%u asid=%u L1=%X L2=%X data=%X stack=%X\n",
-           name, t->as_slot, t->asid,
-           t->l1_phys, t->l2_phys, t->data_phys, t->stack_phys);
+    printf("[AS] %s slot=%u asid=%u L1=%X L2=%X (data/stack on demand)\n",
+           name, t->as_slot, t->asid, t->l1_phys, t->l2_phys);
     return t;
 }
 
@@ -302,8 +396,9 @@ static void pool_manager(void)
     task_yield();
 
     printf("\n[POOL] address-space recycling demo\n");
-    printf("[POOL] free slots: %u / %u\n",
-           user_space_free_count(), USER_SPACE_SLOTS);
+    printf("[POOL] free slots: %u / %u, free frames: %u / %u\n",
+           user_space_free_count(), USER_SPACE_SLOTS,
+           frame_free_count(), frame_total());
 
     for (wave = 0; wave < 3; wave++) {
         free_before = user_space_free_count();
@@ -324,8 +419,8 @@ static void pool_manager(void)
             }
             made++;
         }
-        printf("[POOL] wave %u: created %u tasks, free slots now %u\n",
-               wave, made, user_space_free_count());
+        printf("[POOL] wave %u: created %u tasks, free slots now %u, free frames %u\n",
+               wave, made, user_space_free_count(), frame_free_count());
 
         /*
          * 让出 CPU。本任务被移到同优先级队尾, 前面 8 个 u_spawn
@@ -340,12 +435,13 @@ static void pool_manager(void)
          */
         task_yield();
 
-        printf("[POOL] wave %u: spawn tasks gone, free slots = %u\n",
-               wave, user_space_free_count());
+        printf("[POOL] wave %u: spawn tasks gone, free slots = %u, free frames = %u\n",
+               wave, user_space_free_count(), frame_free_count());
     }
 
-    printf("[POOL] done — %u of %u slots free\n",
-           user_space_free_count(), USER_SPACE_SLOTS);
+    printf("[POOL] done — %u of %u slots free, %u of %u frames free\n",
+           user_space_free_count(), USER_SPACE_SLOTS,
+           frame_free_count(), frame_total());
 
     /*
      * 任务入口函数不能 return。
@@ -360,13 +456,14 @@ static void pool_manager(void)
 void user_demo_init(void)
 {
     printf("========================================\n");
-    printf("  User Mode Demo (v0.6 阶段5: ASID + reclaim)\n");
+    printf("  User Mode Demo (v0.6 阶段6: demand paging)\n");
     printf("  user code : %X - %X (shared, read-only)\n",
            (u32)(uintptr_t)&_user_text_start,
            (u32)(uintptr_t)&_user_text_end);
-    printf("  user data : %X (4KB per task)\n", USER_DATA_VADDR);
-    printf("  user stack: %X - %X (64KB per task)\n",
-           USER_STACK_VADDR, USER_STACK_TOP);
+    printf("  user data : %X (1 page, allocated on first touch)\n", USER_DATA_VADDR);
+    printf("  guard     : %X (never mapped)\n", USER_GUARD_VADDR);
+    printf("  user stack: %X - %X (up to %u KB, grows on demand)\n",
+           USER_STACK_VADDR, USER_STACK_TOP, USER_STACK_MAX / 1024u);
     printf("  L1 pool   : %X - %X (16KB each)\n",
            (u32)(uintptr_t)&_l1_pool_start,
            (u32)(uintptr_t)&_l1_pool_end);
@@ -383,8 +480,10 @@ void user_demo_init(void)
     if (!create_user("u_badptr",  u_badptr,  1)) return;
     if (!create_user("u_iso_a",   u_iso_a,   1)) return;
     if (!create_user("u_iso_b",   u_iso_b,   1)) return;
+    if (!create_user("u_demand",  u_demand,  1)) return;
+    if (!create_user("u_overflow", u_overflow, 1)) return;
 
-    printf("\n[DEMO] 6 user tasks created, each with its own L1 page table\n");
+    printf("\n[DEMO] 8 user tasks created, each with its own L1 page table\n");
 
     /*
      * 回收演示的驱动任务: 内核态, 优先级 30 (只比 IDLE 高)。

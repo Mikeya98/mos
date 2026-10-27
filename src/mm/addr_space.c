@@ -1,18 +1,22 @@
 /**
  * @file    addr_space.c
- * @brief   用户地址空间的物理资源分配 (v0.6 阶段4/5)
+ * @brief   用户地址空间的物理资源分配 (v0.6 阶段4/5/6)
  *
- * 三个静态池 (kernel.lds):
+ * 两个静态池 (kernel.lds):
  *   _l1_pool     8 × 16KB   L1 页表
  *   _l2_pool     8 × 1KB    L2 页表
- *   _user_phys   8 × 68KB   每任务 4KB 数据页 + 64KB 栈
  *
- * 三份池子用同一个槽位号索引, 分配时找一个空闲槽位, 释放时把
+ * 两份池子用同一个槽位号索引, 分配时找一个空闲槽位, 释放时把
  * 槽位还回去。槽位号同时用来生成 ASID (slot + 1), ASID 0 留给内核。
+ *
+ * 阶段6: 数据页/栈页不在池子里了。create 只建两张空页表,
+ *        destroy 遍历 L2 表把映射过的帧还给 frame 池。
  */
 
 #include "mm/addr_space.h"
 #include "mm/mmu.h"
+#include "mm/frame.h"
+#include "kernel/task.h"
 #include "lib/printf.h"
 
 /* =========================== 链接脚本符号 =========================== */
@@ -20,8 +24,6 @@ extern u8 _l1_pool_start;
 extern u8 _l1_pool_end;
 extern u8 _l2_pool_start;
 extern u8 _l2_pool_end;
-extern u8 _user_phys_pool_start;
-extern u8 _user_phys_pool_end;
 
 /* =========================== 槽位位图 =========================== */
 /* bit i = 1 表示槽位 i 已被占用 */
@@ -59,11 +61,6 @@ static u8 *l2_of(u32 slot)
     return &_l2_pool_start + slot * 0x400u;
 }
 
-static u8 *phys_of(u32 slot)
-{
-    return &_user_phys_pool_start + slot * (4096u + USER_STACK_SIZE);
-}
-
 static u32 free_count(void)
 {
     u32 i;
@@ -85,8 +82,6 @@ int user_space_create(user_space_t *us)
     u32 cpsr;
     u8 *l1;
     u8 *l2;
-    u8 *data;
-    u8 *stack;
 
     if (!us) return -1;
 
@@ -107,8 +102,7 @@ int user_space_create(user_space_t *us)
 
     /* 顺手确认池子的大小和槽位数对得上, 链接脚本改错了能早点发现 */
     if (l1_of(slot) + 0x4000u > &_l1_pool_end ||
-        l2_of(slot) + 0x400u  > &_l2_pool_end ||
-        phys_of(slot) + 4096u + USER_STACK_SIZE > &_user_phys_pool_end) {
+        l2_of(slot) + 0x400u  > &_l2_pool_end) {
         cpsr = irq_lock();          /* 占住的位要还回去 */
         slot_used &= ~(1u << slot);
         irq_unlock(cpsr);
@@ -116,18 +110,14 @@ int user_space_create(user_space_t *us)
         return -1;
     }
 
-    l1    = l1_of(slot);
-    l2    = l2_of(slot);
-    data  = phys_of(slot);
-    stack = data + 4096u;
+    l1 = l1_of(slot);
+    l2 = l2_of(slot);
 
     /* 2. ASID = 槽位号 + 1 */
-    us->slot       = slot;
-    us->asid       = slot + 1u;
-    us->l1_phys    = (u32)(uintptr_t)l1;
-    us->l2_phys    = (u32)(uintptr_t)l2;
-    us->data_phys  = (u32)(uintptr_t)data;
-    us->stack_phys = (u32)(uintptr_t)stack;
+    us->slot    = slot;
+    us->asid    = slot + 1u;
+    us->l1_phys = (u32)(uintptr_t)l1;
+    us->l2_phys = (u32)(uintptr_t)l2;
 
     /*
      * 3. 清掉这个 ASID 可能残留的 TLB 项。
@@ -138,18 +128,9 @@ int user_space_create(user_space_t *us)
      */
     mmu_flush_asid(us->asid);
 
-    /* 4. 填页表 */
+    /* 4. 填页表: L1 复制内核模板 + 指向本任务的 L2, L2 全 fault */
     mmu_build_user_l1((u32 *)(uintptr_t)l1, us->l2_phys);
-    mmu_build_user_l2((u32 *)(uintptr_t)l2, us->data_phys, us->stack_phys);
-
-    /* 5. 数据页清零: 不能把上一个任务的残留内容带出去 */
-    {
-        volatile u32 *p = (volatile u32 *)(uintptr_t)us->data_phys;
-        u32 i;
-        for (i = 0; i < 1024; i++) {
-            p[i] = 0;
-        }
-    }
+    mmu_build_user_l2((u32 *)(uintptr_t)l2);
 
     return 0;
 }
@@ -161,6 +142,10 @@ void user_space_destroy(user_space_t *us)
     u32 cpsr;
     u32 slot;
     u32 asid;
+    u32 l2_phys;
+    const u32 *l2;
+    u32 i;
+    u32 freed = 0;
 
     if (!us || us->slot >= USER_SPACE_SLOTS) {
         return;
@@ -168,8 +153,9 @@ void user_space_destroy(user_space_t *us)
 
     /* 检查 + 清位必须在一个原子区间里, 否则和 create 的 |= 打架 */
     cpsr = irq_lock();
-    slot = us->slot;
-    asid = us->asid;
+    slot    = us->slot;
+    asid    = us->asid;
+    l2_phys = us->l2_phys;
     if ((slot_used & (1u << slot)) == 0) {
         irq_unlock(cpsr);
         return;                     /* 已经还过了 */
@@ -184,12 +170,54 @@ void user_space_destroy(user_space_t *us)
      */
     mmu_flush_asid(asid);
 
+    /*
+     * 遍历 L2 表, 把映射过的页框还给全局池。
+     *
+     * 页表就是账本: 每一页是谁的、映射在哪, 都写在描述符里。
+     * 不用另开一个"该任务分配了哪些帧"的数组, 也就不会出现
+     * 账本和页表对不上的情况。
+     *
+     * 必须在刷完 TLB 之后再还帧: 池里的帧马上会被别的任务拿走,
+     * 万一旧翻译还在, 那个任务就能读到别人的数据。
+     */
+    l2 = (const u32 *)(uintptr_t)l2_phys;
+    for (i = 0; i < 256u; i++) {
+        if ((l2[i] & 0x2u) != 0) {
+            /* owner 参数只用于错误日志, 真正的所有者记在 frame 池里 */
+            frame_free(l2[i] & 0xFFFFF000u, 0);
+            freed++;
+        }
+    }
+
+    if (freed > 0) {
+        printf("[AS] slot %u (asid %u): reclaimed %u page frames\n",
+               slot, asid, freed);
+    }
+
     us->slot = 0xFFFFFFFFu;         /* 防止重复释放 */
 }
 
 u32 user_space_free_count(void)
 {
     return free_count();
+}
+
+u32 user_space_page_count(const user_space_t *us)
+{
+    const u32 *l2;
+    u32 i;
+    u32 n = 0;
+
+    if (!us) {
+        return 0;
+    }
+    l2 = (const u32 *)(uintptr_t)us->l2_phys;
+    for (i = 0; i < 256u; i++) {
+        if ((l2[i] & 0x2u) != 0) {
+            n++;
+        }
+    }
+    return n;
 }
 
 void user_space_dump(const user_space_t *us, const char *name)
@@ -201,9 +229,9 @@ void user_space_dump(const user_space_t *us, const char *name)
     printf("     L1 @ %X  L2 @ %X\n", us->l1_phys, us->l2_phys);
     printf("     L1[%u] (0x08100000) -> %X (coarse table)\n",
            (u32)(USER_PRIV_VADDR >> 20), l1[USER_PRIV_VADDR >> 20]);
-    printf("     L2[0] (data ) -> %X   phys %X\n",
-           l2[0], us->data_phys);
-    printf("     L2[1] (stack) -> %X   phys %X\n",
-           l2[1], us->stack_phys);
+    printf("     L2[0] (data ) -> %X\n", l2[0]);
+    printf("     L2[1] (guard) -> %X (must stay 0)\n", l2[1]);
+    printf("     L2[2] (stack) -> %X\n", l2[2]);
+    printf("     mapped pages: %u\n", user_space_page_count(us));
     printf("     free slots: %u / %u\n", free_count(), USER_SPACE_SLOTS);
 }

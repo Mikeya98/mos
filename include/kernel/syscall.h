@@ -29,7 +29,8 @@
 #define SYS_SEM_WAIT    5       /* sem_wait(sem_id) */
 #define SYS_SEM_POST    6       /* sem_post(sem_id) */
 #define SYS_GET_TTBR0   7       /* 返回当前任务的 TTBR0 (调试/验证用) */
-#define SYS_MAX         8
+#define SYS_VM_STATS    8       /* vm_stats(stat*) 取缺页/页框统计 */
+#define SYS_MAX         9
 
 /* =========================== 错误码 =========================== */
 /* 采用 Linux 风格的负值返回, 用户态看到的是 -errno */

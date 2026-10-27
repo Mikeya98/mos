@@ -12,10 +12,12 @@
  * 所有用户任务使用同一套虚拟地址布局, 但页表指向不同的物理页:
  *
  *   0x08000000 - 0x080FFFFF  用户代码 + 只读数据 (共享物理页, AP=10 用户只读)
- *   0x08100000 - 0x08100FFF  用户私有数据页   (每任务 4KB, AP=11)
- *   0x08101000 - 0x08110FFF  用户栈           (每任务 64KB, AP=11, XN)
+ *   0x08100000 - 0x08100FFF  用户私有数据页   (1 页, 首次访问时分配)
+ *   0x08101000 - 0x08101FFF  栈溢出保护页     (永远 fault)
+ *   0x08102000 - 0x081FFFFF  用户栈           (最多 1016KB, 按需增长)
  *
  * 0x08100000 起的 1MB 由 L2 表按 4KB 粒度映射, 其余用户地址一律 fault。
+ * 阶段6 之后 L2 表初始是全 fault 的, 页框在第一次访问时才分配。
  */
 
 #ifndef _MOS_MMU_H
@@ -31,10 +33,11 @@
 /* 每个用户任务看到的地址布局完全相同, 物理页不同 —— 这就是"地址空间" */
 #define USER_CODE_VADDR     0x08000000u     /* 代码 + .user_rodata, 1MB section */
 #define USER_PRIV_VADDR     0x08100000u     /* L2 表覆盖的 1MB 私有区 */
-#define USER_DATA_VADDR     0x08100000u     /* 私有数据页 (4KB) */
-#define USER_STACK_VADDR    0x08101000u     /* 用户栈起始 (64KB = 16 页) */
-#define USER_STACK_SIZE     (64u * 1024u)
-#define USER_STACK_TOP      (USER_STACK_VADDR + USER_STACK_SIZE)
+#define USER_DATA_VADDR     0x08100000u     /* 私有数据页 (L2[0], 4KB) */
+#define USER_GUARD_VADDR    0x08101000u     /* 栈溢出保护页 (L2[1], 永远不映射) */
+#define USER_STACK_VADDR    0x08102000u     /* 栈可以长到的最低地址 (L2[2]) */
+#define USER_STACK_TOP      0x08200000u     /* 栈顶 = 私有区之外的第一页 */
+#define USER_STACK_MAX      (USER_STACK_TOP - USER_STACK_VADDR)  /* 1016KB */
 
 #define USER_SPACE_BASE     USER_CODE_VADDR
 #define USER_SPACE_LIMIT    USER_STACK_TOP  /* 不含 */
@@ -103,17 +106,15 @@ u32 mmu_kernel_l1(void);
 void mmu_build_user_l1(u32 *l1, u32 l2_phys);
 
 /**
- * @brief  填充用户 L2 表: 数据页 + 栈页
+ * @brief  初始化用户 L2 表: 全部 fault
  *
- * L2[0]      → data_phys   (VA 0x08100000, 4KB)
- * L2[1..16]  → stack_phys + (i-1)*4KB (VA 0x08101000 - 0x08110FFF)
- * 其余条目 fault。
+ * 阶段6 之后页框是第一次访问时分配的 (mm/vm.c 的 vm_fault),
+ * 所以建表时一项都不填。L2[0]=数据页、L2[1]=保护页、L2[2..255]=栈,
+ * 具体哪一页能映射由 vm.c 的地址分类决定。
  *
- * @param  l2           L2 表 (1KB 对齐, 256 项)
- * @param  data_phys    数据页物理地址 (4KB 对齐)
- * @param  stack_phys   栈起始物理地址 (4KB 对齐, 64KB 连续)
+ * @param  l2  L2 表 (1KB 对齐, 256 项)
  */
-void mmu_build_user_l2(u32 *l2, u32 data_phys, u32 stack_phys);
+void mmu_build_user_l2(u32 *l2);
 
 /**
  * @brief  切换 TTBR0 到指定页表 + ASID (上下文切换时调用)
