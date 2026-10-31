@@ -2,7 +2,7 @@
 
 [![Platform](https://img.shields.io/badge/platform-ARM%20Cortex--A9-blue)](https://github.com/Mikeya98/mos)
 [![Language](https://img.shields.io/badge/language-C%20%7C%20Assembly-orange)](https://github.com/Mikeya98/mos)
-[![Status](https://img.shields.io/badge/status-v0.6%20--%20demand%20paging-brightgreen)](https://github.com/Mikeya98/mos)
+[![Status](https://img.shields.io/badge/status-v0.6%20--%20swap-brightgreen)](https://github.com/Mikeya98/mos)
 [![QEMU](https://img.shields.io/badge/QEMU-verified-lightgrey)](https://github.com/Mikeya98/mos)
 
 MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 上，用 QEMU 仿真验证。每一行代码都是手写的，没有引用任何现成的 RTOS 内核代码。
@@ -24,6 +24,7 @@ MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 �
 - **ASID 免刷 TLB**：TTBR0 低 8 位带地址空间编号，私有页打 `nG` 位，切换地址空间只写 TTBR0/CONTEXTIDR，不再全量无效化 TLB
 - **资源回收**：任务退出后归还地址空间槽位（L1/L2）、页表里映射过的物理页框、内核栈和 TCB；当前任务踩在自己的栈上，所以走延迟回收队列
 - **按需分页**：用户私有区的 L2 表初始全是 fault，第一次访问才从物理页框池（64 帧 × 4KB）分配一帧、清零、填表，然后按地址无效化单个 TLB 项、回到故障指令重试；栈最多可以长到 1016KB 而实际只占用到的几页，保护页负责发现栈溢出；系统调用拷贝用户内存前也会先代用户补页
+- **页面换出**：页框池耗尽时，按轮转策略把当前任务的一页写到 swap 区（16 页 × 4KB），L2 表项改写成换出描述符（低两位仍为 00，硬件继续报缺页）；再次访问时从 swap 读回并恢复映射。页表本身就是换出账本，任务退出时扫一遍 L2 把 swap 槽和页框一起回收；演示任务故意多碰 8 页，验证了 8 次换出 + 8 次换入后每个页的内容都没有丢
 - **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST / GET_TTBR0 / VM_STATS`；`copy_from_user` / `copy_to_user` 先代用户补页，再走当前任务的页表检查用户指针（区分读/写权限）
 - **异常恢复**：捕获 Data Abort / Prefetch Abort，打印任务名、故障地址与 DFSR/DFAR，杀掉出错的用户任务后继续调度，系统不宕机
 
@@ -54,7 +55,8 @@ mos/
 │   │   ├── slab.c              # SLAB 对象缓存
 │   │   ├── mmu.c               # MMU 页表 + TTBR0/ASID 切换 + 用户指针检查
 │   │   ├── frame.c             # 物理页框池（位图 + 所有者记录）
-│   │   ├── vm.c                # 按需分页：缺页分类、补页、地址分类、统计
+│   │   ├── swap.c              # 页面换出区（槽位位图 + 4KB 拷贝 + 回收）
+│   │   ├── vm.c                # 按需分页：缺页分类、补页、页面换出、统计
 │   │   └── addr_space.c        # 每任务地址空间槽位：分配、ASID、回收页框
 │   ├── fs/
 │   │   ├── block_dev.c         # 块设备抽象 + RAM 盘

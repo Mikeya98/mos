@@ -121,18 +121,22 @@ static int sys_write(const char *ubuf, u32 len)
     char kbuf[64];
     u32 done = 0;
 
-    if (!user_range_ok((u32)(uintptr_t)ubuf, len, 0)) {
-        printf("[SYS] write: pointer %X len=%u rejected → EFAULT\n",
-               (u32)(uintptr_t)ubuf, len);
-        return -EFAULT;
-    }
-
+    /*
+     * 按块校验、按块拷贝。
+     *
+     * 阶段7 之后页框可以被换出: 如果先把整个 len 范围一次性 vm_touch
+     * 再检查, 范围超过"页框 + swap 槽"容量时, 前面补上的页会在后面
+     * 补页时被换出去, 整段权限检查就过不了。按块处理时每块只有几十
+     * 字节, 最多涉及两页, 不会出现自己把自己换出去的情况。
+     */
     while (done < len) {
         u32 chunk = len - done;
         if (chunk > sizeof(kbuf) - 1) {
             chunk = sizeof(kbuf) - 1;
         }
         if (copy_from_user(kbuf, ubuf + done, chunk) < 0) {
+            printf("[SYS] write: pointer %X len=%u rejected → EFAULT\n",
+                   (u32)(uintptr_t)(ubuf + done), chunk);
             return -EFAULT;
         }
         kbuf[chunk] = '\0';

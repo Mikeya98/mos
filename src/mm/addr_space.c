@@ -16,6 +16,7 @@
 #include "mm/addr_space.h"
 #include "mm/mmu.h"
 #include "mm/frame.h"
+#include "mm/swap.h"
 #include "kernel/task.h"
 #include "lib/printf.h"
 
@@ -181,7 +182,17 @@ void user_space_destroy(user_space_t *us)
      * 万一旧翻译还在, 那个任务就能读到别人的数据。
      */
     l2 = (const u32 *)(uintptr_t)l2_phys;
+
+    /*
+     * 换出页不占页框, 但占着 swap 槽。槽号只记在 L2 表项里,
+     * 不扫一遍就会泄漏 —— 等 swap 区满了, 后面的任务全都没法换页。
+     */
+    swap_release_l2(l2_phys);
+
     for (i = 0; i < 256u; i++) {
+        if (swap_pte_is(l2[i])) {
+            continue;               /* 换出页没有页框, 槽已经在上面还了 */
+        }
         if ((l2[i] & 0x2u) != 0) {
             /* owner 参数只用于错误日志, 真正的所有者记在 frame 池里 */
             frame_free(l2[i] & 0xFFFFF000u, 0);

@@ -26,6 +26,7 @@
 #include "mm/vm.h"
 #include "mm/mmu.h"
 #include "mm/frame.h"
+#include "mm/swap.h"
 #include "kernel/task.h"
 #include "lib/printf.h"
 
@@ -51,6 +52,68 @@ static inline void vm_isb(void)
 static inline void vm_tlb_invalidate_mva(u32 va)
 {
     __asm__ volatile ("MCR p15, 0, %0, c8, c6, 1" : : "r"(va) : "memory");
+}
+
+/** 页表项改动后的固定收尾: DSB → 按地址刷 TLB → DSB → ISB */
+static void vm_flush_page(u32 va)
+{
+    vm_dsb();
+    vm_tlb_invalidate_mva(va);
+    vm_dsb();
+    vm_isb();
+}
+
+/* =========================== 页面换出 =========================== */
+
+/**
+ * @brief  从当前任务的页表里挑一页换出
+ *
+ * 轮转 (clock) 策略: 从上次换出的下一页开始找第一个已映射的页,
+ * 跳过正在缺页的那一页。找到后:
+ *   1. 把物理页内容写进 swap 槽
+ *   2. L2 表项改成换出描述符 (硬件仍然把它当 fault)
+ *   3. 刷掉这一页的 TLB 项
+ *   4. 归还页框
+ *
+ * @return 0 成功, -1 没有可换出的页 / swap 区已满
+ */
+static int vm_evict_one(task_t *t, u32 avoid_idx)
+{
+    u32 *l2 = (u32 *)(uintptr_t)t->l2_phys;
+    u32 n;
+    u32 idx;
+    u32 phys;
+    u32 va;
+    int slot;
+
+    for (n = 0; n < 256u; n++) {
+        idx = (t->vm_clock + n) & 0xFFu;
+        if (idx == avoid_idx) {
+            continue;
+        }
+        if ((l2[idx] & 0x2u) == 0) {
+            continue;               /* 没映射或是换出描述符 */
+        }
+
+        phys = l2[idx] & 0xFFFFF000u;
+        slot = swap_store(phys);
+        if (slot < 0) {
+            return -1;              /* swap 区满了, 这一页换不出去 */
+        }
+
+        l2[idx] = swap_pte_make((u32)slot);
+        va = USER_PRIV_VADDR + idx * 4096u;
+        vm_flush_page(va);
+        frame_free(phys, t->pid);
+
+        t->vm_clock = (idx + 1u) & 0xFFu;
+        t->swap_out++;
+        printf("[SWAP] %s: %X -> slot %u (frame %X freed)\n",
+               t->name, va, (u32)slot, phys);
+        return 0;
+    }
+
+    return -1;
 }
 
 /* =========================== 地址分类 =========================== */
@@ -116,18 +179,59 @@ int vm_fault(u32 va, u32 write)
     idx = (page - USER_PRIV_VADDR) >> 12;
     l2  = (u32 *)(uintptr_t)t->l2_phys;
 
-    /* 已经映射过 (可能是 TLB 里残留了旧的 fault 项), 直接返回 */
-    if ((l2[idx] & 0x2u) != 0) {
-        vm_dsb();
-        vm_tlb_invalidate_mva(page);
-        vm_dsb();
-        vm_isb();
+    /* ------------------------------------------------------------------
+     * 情况 1: 这一页之前被换出去了。
+     * 先找一个页框 (没有就再换出别的页), 把 swap 内容读回来, 然后
+     * 把 L2 表项恢复成正常的页描述符。
+     * ------------------------------------------------------------------ */
+    if (swap_pte_is(l2[idx])) {
+        u32 slot = swap_pte_slot(l2[idx]);
+
+        frame = frame_alloc(t->pid);
+        if (frame == 0) {
+            if (vm_evict_one(t, idx) != 0) {
+                return VM_NOMEM;
+            }
+            frame = frame_alloc(t->pid);
+            if (frame == 0) {
+                return VM_NOMEM;
+            }
+        }
+
+        if (swap_load(slot, frame) != 0) {
+            frame_free(frame, t->pid);
+            return VM_INVALID;
+        }
+
+        l2[idx] = (frame & 0xFFFFF000u) | L2_USER_RW_XN;
+        vm_flush_page(page);
+
+        t->pf_count++;
+        t->swap_in++;
+        printf("[SWAP] %s: slot %u -> %X (frame %X, swap-in #%u)\n",
+               t->name, slot, page, frame, t->swap_in);
         return VM_OK;
     }
 
+    /* 已经映射过 (可能是 TLB 里残留了旧的 fault 项), 直接返回 */
+    if ((l2[idx] & 0x2u) != 0) {
+        vm_flush_page(page);
+        return VM_OK;
+    }
+
+    /* ------------------------------------------------------------------
+     * 情况 2: 真正的第一次访问。
+     * 页框池耗尽时先换出一页, 再重新试一次; swap 也满了才算失败。
+     * ------------------------------------------------------------------ */
     frame = frame_alloc(t->pid);
     if (frame == 0) {
-        return VM_NOMEM;
+        if (vm_evict_one(t, idx) != 0) {
+            return VM_NOMEM;
+        }
+        frame = frame_alloc(t->pid);
+        if (frame == 0) {
+            return VM_NOMEM;
+        }
     }
 
     /*
@@ -147,10 +251,7 @@ int vm_fault(u32 va, u32 write)
      *   2. TLB  — 清掉这一页可能残留的 fault 项
      *   3. ISB  — 保证后面的取指/访存看到新的翻译
      */
-    vm_dsb();
-    vm_tlb_invalidate_mva(page);
-    vm_dsb();
-    vm_isb();
+    vm_flush_page(page);
 
     t->pf_count++;
 
@@ -227,4 +328,8 @@ void vm_fill_stats(vm_stats_t *st)
                        : 0;
     st->frames_free  = frame_free_count();
     st->frames_total = frame_total();
+    st->swap_out     = t ? t->swap_out : 0;
+    st->swap_in      = t ? t->swap_in : 0;
+    st->swap_used    = swap_used();
+    st->swap_total   = swap_total();
 }

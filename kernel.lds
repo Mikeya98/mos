@@ -123,13 +123,13 @@ SECTIONS
      * 链接器会按输入段的对齐 (4 字节) 放, 结果页表没对齐, TTBR0 一换就飞。 */
     .l1_pool (NOLOAD) : ALIGN(16384) {
         _l1_pool_start = .;
-        . += 0x20000;           /* 8 × 16KB L1 页表 */
+        . += 0x30000;           /* 12 × 16KB L1 页表 */
         _l1_pool_end = .;
     } > DDR
 
     .l2_pool (NOLOAD) : ALIGN(1024) {
         _l2_pool_start = .;
-        . += 0x2000;            /* 8 × 1KB L2 页表 */
+        . += 0x3000;            /* 12 × 1KB L2 页表 */
         _l2_pool_end = .;
     } > DDR
 
@@ -147,6 +147,18 @@ SECTIONS
         _frame_pool_start = .;
         . += 0x40000;           /* 64 × 4KB */
         _frame_pool_end = .;
+    } > DDR
+
+    /* 页面换出区 (v0.6 阶段7)
+     *
+     * 相当于一块极小的"磁盘": 页框池 (64 帧) 不够时, 把当前任务
+     * 暂时不用的页写到这里, 腾出页框; 下次访问再从 swap 读回。
+     * 16 × 4KB = 64KB。
+     */
+    .swap_pool (NOLOAD) : ALIGN(4096) {
+        _swap_pool_start = .;
+        . += 0x10000;           /* 16 × 4KB */
+        _swap_pool_end = .;
     } > DDR
 
     /* =========================== 用户空间 (v0.6 阶段4) ===========================

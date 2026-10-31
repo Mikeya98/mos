@@ -24,12 +24,16 @@
 #define VM_GUARD       (-2)     /* 踩到栈保护页 */
 #define VM_NOMEM       (-3)     /* 页框池耗尽 */
 
-/* 用户态通过 SYS_VM_STATS 拿到的统计 (v0.6 阶段6) */
+/* 用户态通过 SYS_VM_STATS 拿到的统计 (v0.6 阶段6/7) */
 typedef struct {
     u32 faults;         /* 本任务累计缺页次数 */
     u32 pages;          /* 本任务当前映射的私有页数 */
     u32 frames_free;    /* 全局空闲页框 */
     u32 frames_total;   /* 全局页框总数 */
+    u32 swap_out;       /* 本任务累计换出页数 */
+    u32 swap_in;        /* 本任务累计换入页数 */
+    u32 swap_used;      /* 全局已占用的 swap 槽 */
+    u32 swap_total;     /* 全局 swap 槽总数 */
 } vm_stats_t;
 
 /**

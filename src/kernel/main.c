@@ -23,6 +23,7 @@
 #include "mm/buddy.h"
 #include "mm/slab.h"
 #include "mm/mmu.h"
+#include "mm/swap.h"
 #include "mm/frame.h"
 #include "fs/block_dev.h"
 #include "fs/mos_fs.h"
@@ -369,6 +370,10 @@ void kernel_main(void)
     frame_init();
     printf("[INIT] Frame allocator ready (%u frames = %u KB)\n",
            frame_total(), frame_total() * 4u);
+
+    swap_init();
+    printf("[INIT] Swap area ready (%u pages = %u KB)\n",
+           swap_total(), swap_total() * 4u);
 
     gic_init();
     printf("[INIT] GIC initialized\n");

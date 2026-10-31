@@ -22,6 +22,7 @@
  *   u_iso_b    — 独立地址空间: 写同一虚拟地址, 两边互不影响
  *   u_demand   — 按需分页: 数据页/栈页都是第一次访问才分配
  *   u_overflow — 写栈保护页 → 内核判定栈溢出, 杀掉任务
+ *   u_swap     — 页框池耗尽 → 把页换出到 swap 区, 再读回来校验
  */
 
 #include "lib/types.h"
@@ -34,6 +35,7 @@
 #include "mm/addr_space.h"
 #include "mm/vm.h"
 #include "mm/frame.h"
+#include "mm/swap.h"
 
 /* =========================== 段属性 =========================== */
 #define USER_TEXT   __attribute__((section(".user_text")))
@@ -84,6 +86,18 @@ static const char msg_dm_er[]  USER_RODATA = "[user] u_demand : vm_stats syscall
 
 static const char msg_of1[]    USER_RODATA = "[user] u_overflow: writing the guard page 0x08101000 ...\n";
 static const char msg_of2[]    USER_RODATA = "[user] u_overflow: still alive — guard page FAILED!\n";
+
+static const char msg_sw1[]    USER_RODATA = "[user] u_swap  : free frames + 8 = pages to touch: ";
+static const char msg_sw2[]    USER_RODATA = "[user] u_swap  : wrote all pages, now reading back (swapped pages fault in) ...\n";
+static const char msg_sw3[]    USER_RODATA = "[user] u_swap  : read back OK — every page kept its pattern\n";
+static const char msg_sw4[]    USER_RODATA = "[user] u_swap  : read back MISMATCH — swap corrupted a page!\n";
+static const char msg_sw5[]    USER_RODATA = "[user] u_swap  : faults          = ";
+static const char msg_sw6[]    USER_RODATA = "[user] u_swap  : mapped pages    = ";
+static const char msg_sw7[]    USER_RODATA = "[user] u_swap  : frames free     = ";
+static const char msg_sw8[]    USER_RODATA = "[user] u_swap  : swap out / in   = ";
+static const char msg_sw9[]    USER_RODATA = "[user] u_swap  : swap used/total = ";
+static const char msg_sw_err[] USER_RODATA = "[user] u_swap  : vm_stats syscall FAILED\n";
+static const char msg_empty[]  USER_RODATA = "";
 
 #define SAY(s)  usys_write((s), (u32)(sizeof(s) - 1))
 
@@ -334,6 +348,81 @@ static void USER_TEXT u_overflow(void)
     usys_exit();
 }
 
+/**
+ * 页面换出演示 (v0.6 阶段7)。
+ *
+ * 先问内核还有多少空闲页框, 然后故意多碰 8 页:
+ *   - 前 N 页直接拿页框;
+ *   - 页框用完之后, 每碰一页就先把本任务的一页换出到 swap 区,
+ *     腾出页框, 再把新页映射进来;
+ *   - 第二遍按顺序读回来, 被换出的页会缺页 → 从 swap 读回,
+ *     同时可能又把别的页换出去。
+ *
+ * 最后读一遍校验和, 确认换出/换入没有丢数据。
+ */
+static void USER_TEXT u_swap(void)
+{
+    volatile u32 *base = (volatile u32 *)(uintptr_t)0x081F0000u;
+    vm_stats_t st;
+    u32 target;
+    u32 i;
+    u32 expect;
+    u32 ok = 1;
+
+    if (usys_vm_stats(&st) != 0) {
+        SAY(msg_sw_err);
+        usys_exit();
+    }
+
+    /*
+     * 空闲页框 + 8: 保证至少触发 8 次换出, 又不超过 swap 区容量。
+     * 上限 72 页, 留在栈区虚拟地址范围内 (0x08102000 以上)。
+     */
+    target = st.frames_free + 8u;
+    if (target > 72u) {
+        target = 72u;
+    }
+    if (target < 32u) {
+        target = 32u;
+    }
+
+    SAY(msg_sw1);
+    say_hex(msg_empty, target, msg_nl);
+
+    /* 第一遍: 每页写一个带页号的标记, 页间相隔 4KB */
+    for (i = 0; i < target; i++) {
+        base[-(i * 1024u)] = 0xA5000000u | (i & 0xFFFFu);
+    }
+
+    SAY(msg_sw2);
+
+    /* 第二遍: 读回来。换出的页在这里触发 swap-in */
+    for (i = 0; i < target; i++) {
+        expect = 0xA5000000u | (i & 0xFFFFu);
+        if (base[-(i * 1024u)] != expect) {
+            ok = 0;
+        }
+    }
+
+    if (ok) {
+        SAY(msg_sw3);
+    } else {
+        SAY(msg_sw4);
+    }
+
+    if (usys_vm_stats(&st) == 0) {
+        say_hex(msg_sw5, st.faults,     msg_nl);
+        say_hex(msg_sw6, st.pages,      msg_nl);
+        say_hex(msg_sw7, st.frames_free, msg_nl);
+        say_hex(msg_sw8, (st.swap_out << 16) | (st.swap_in & 0xFFFFu), msg_nl);
+        say_hex(msg_sw9, (st.swap_used << 16) | (st.swap_total & 0xFFFFu), msg_nl);
+    } else {
+        SAY(msg_sw_err);
+    }
+
+    usys_exit();
+}
+
 /* =========================== 内核侧初始化 =========================== */
 
 extern u8 _user_text_start;
@@ -456,7 +545,7 @@ static void pool_manager(void)
 void user_demo_init(void)
 {
     printf("========================================\n");
-    printf("  User Mode Demo (v0.6 阶段6: demand paging)\n");
+    printf("  User Mode Demo (v0.6 阶段7: demand paging + swap)\n");
     printf("  user code : %X - %X (shared, read-only)\n",
            (u32)(uintptr_t)&_user_text_start,
            (u32)(uintptr_t)&_user_text_end);
@@ -464,6 +553,8 @@ void user_demo_init(void)
     printf("  guard     : %X (never mapped)\n", USER_GUARD_VADDR);
     printf("  user stack: %X - %X (up to %u KB, grows on demand)\n",
            USER_STACK_VADDR, USER_STACK_TOP, USER_STACK_MAX / 1024u);
+    printf("  swap area : %u pages (%u KB), evict on frame exhaustion\n",
+           swap_total(), swap_total() * 4u);
     printf("  L1 pool   : %X - %X (16KB each)\n",
            (u32)(uintptr_t)&_l1_pool_start,
            (u32)(uintptr_t)&_l1_pool_end);
@@ -482,8 +573,9 @@ void user_demo_init(void)
     if (!create_user("u_iso_b",   u_iso_b,   1)) return;
     if (!create_user("u_demand",  u_demand,  1)) return;
     if (!create_user("u_overflow", u_overflow, 1)) return;
+    if (!create_user("u_swap",    u_swap,    1)) return;
 
-    printf("\n[DEMO] 8 user tasks created, each with its own L1 page table\n");
+    printf("\n[DEMO] 9 user tasks created, each with its own L1 page table\n");
 
     /*
      * 回收演示的驱动任务: 内核态, 优先级 30 (只比 IDLE 高)。

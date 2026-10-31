@@ -81,6 +81,12 @@ typedef struct task_struct {
     u32             l2_phys;
     u32             pf_count;
 
+    /* --- 页面换出 (v0.6 阶段7) ---
+     * vm_clock 是轮转置换的起点, swap_out/swap_in 用于统计。 */
+    u32             vm_clock;
+    u32             swap_out;
+    u32             swap_in;
+
     /* --- 地址空间编号 (v0.6 阶段5) ---
      * asid 写进 TTBR0 低 8 位, 私有页按它打标签。内核任务用 0。
      * as_slot 是静态池槽位号, 任务退出时按它归还资源。

@@ -40,7 +40,7 @@ STD_FLAGS   = -ffreestanding -nostdlib -fno-common \
               -fno-builtin -fno-stack-protector
 
 CFLAGS      = $(ARCH_FLAGS) $(WARN_FLAGS) $(OPT_FLAGS) $(STD_FLAGS) \
-              -I$(INC_DIR)
+              -I$(INC_DIR) -MMD -MP
 
 # 汇编文件编译选项
 ASFLAGS     = $(ARCH_FLAGS) -I$(INC_DIR)
@@ -81,6 +81,7 @@ MM_SRCS  = $(SRC_DIR)/mm/buddy.c \
            $(SRC_DIR)/mm/slab.c \
            $(SRC_DIR)/mm/mmu.c \
            $(SRC_DIR)/mm/frame.c \
+           $(SRC_DIR)/mm/swap.c \
            $(SRC_DIR)/mm/vm.c \
            $(SRC_DIR)/mm/addr_space.c
 
@@ -96,6 +97,10 @@ C_SRCS   = $(LIB_SRCS) $(DRV_SRCS) $(KERNEL_SRCS) $(IPC_SRCS) $(MM_SRCS) $(FS_SR
 C_OBJS   = $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(C_SRCS))
 ASM_OBJS = $(patsubst $(SRC_DIR)/%.S, $(OBJ_DIR)/%.o, $(ASM_SRCS))
 ALL_OBJS = $(C_OBJS) $(ASM_OBJS)
+DEPS     = $(C_OBJS:.o=.d)
+
+# 头文件依赖: 改头文件后相关的 .o 会自动重编
+-include $(DEPS)
 
 # =========================== 输出 ===========================
 TARGET   = $(BLD_DIR)/mos.elf

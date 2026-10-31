@@ -25,8 +25,9 @@
 
 #include "lib/types.h"
 
-/* 静态池的槽位数量, 与 kernel.lds 里的池大小一致 */
-#define USER_SPACE_SLOTS    8
+/* 静态池的槽位数量, 与 kernel.lds 里的池大小一致
+ * 阶段7 增加了 u_swap 演示任务, 从 8 扩到 12, 给并发任务留余量。 */
+#define USER_SPACE_SLOTS    12
 
 /* 一个用户地址空间的物理资源 */
 typedef struct {
