@@ -338,7 +338,16 @@ static void fs_demo(void)
 
 void irq_dispatch(void)
 {
-    u32 irq_id = gic_get_ack();
+    u32 irq_id;
+
+    /*
+     * v0.6 阶段8: 中断可能来自用户态, 先把 SP_usr 存进当前 TCB。
+     * 如果这次 tick 触发调度切到别的用户任务, banked SP_usr 会被
+     * 改写; 不先保存, 本任务恢复时就找不到自己的用户栈了。
+     */
+    task_save_user_sp();
+
+    irq_id = gic_get_ack();
     if (irq_id == IRQ_PTIMER) {
         timer_isr();
         sys_tick_handler();
@@ -361,7 +370,7 @@ void kernel_main(void)
     printf("\n");
     printf("========================================\n");
     printf("  MOS RTOS v0.6\n");
-    printf("  MMU + per-task page tables + ASID + demand paging\n");
+    printf("  MMU + ASID + demand paging + swap + fork/COW\n");
     printf("========================================\n\n");
 
     mmu_init();

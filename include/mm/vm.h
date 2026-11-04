@@ -34,6 +34,7 @@ typedef struct {
     u32 swap_in;        /* 本任务累计换入页数 */
     u32 swap_used;      /* 全局已占用的 swap 槽 */
     u32 swap_total;     /* 全局 swap 槽总数 */
+    u32 cow;            /* 本任务累计写时复制页数 (阶段8) */
 } vm_stats_t;
 
 /**

@@ -87,6 +87,12 @@ typedef struct task_struct {
     u32             swap_out;
     u32             swap_in;
 
+    /* --- fork / 写时复制 (v0.6 阶段8) ---
+     * cow_count 是写时复制了多少页; forked_from 记录父进程 pid,
+     * 0 表示不是 fork 出来的。 */
+    u32             cow_count;
+    u32             forked_from;
+
     /* --- 地址空间编号 (v0.6 阶段5) ---
      * asid 写进 TTBR0 低 8 位, 私有页按它打标签。内核任务用 0。
      * as_slot 是静态池槽位号, 任务退出时按它归还资源。
@@ -151,6 +157,26 @@ task_t *task_create(void (*entry)(void), const char *name,
  */
 task_t *task_create_user(void (*entry)(void), const char *name,
                          u32 priority, u32 kstack_size, u32 ustack_size);
+
+/**
+ * @brief  复制当前用户任务 (fork, v0.6 阶段8)
+ *
+ * 子进程获得:
+ *   - 一份新的地址空间, 已映射的页与父进程共享 (只读, 写时复制)
+ *   - 一套新的 TCB / 内核栈
+ *   - 与父进程相同的用户 PC 和用户栈
+ *
+ * 子进程第一次被调度时从 fork_return_trampoline 返回用户态,
+ * fork() 的返回值为 0; 父进程的返回值是子进程 pid。
+ *
+ * @param  parent   父任务 (必须是用户态任务)
+ * @param  user_pc  父进程 SVC 之后要返回的用户 PC (即 frame[13])
+ * @return 子任务, 失败返回 NULL
+ */
+task_t *task_fork(task_t *parent, u32 user_pc);
+
+/** 把当前任务的 SP_usr 保存进 TCB (进入内核时调用) */
+void task_save_user_sp(void);
 
 /* === 调度器 === */
 

@@ -52,6 +52,9 @@
 #if SYS_VM_STATS != 8
 #error "SVC immediate for SYS_VM_STATS is stale"
 #endif
+#if SYS_FORK != 9
+#error "SVC immediate for SYS_FORK is stale"
+#endif
 
 #define USYS_INLINE  static inline __attribute__((always_inline))
 
@@ -133,6 +136,20 @@ USYS_INLINE s32 usys_vm_stats(void *out)
 {
     register u32 r0 __asm__("r0") = (u32)(uintptr_t)out;
     __asm__ volatile ("SVC #8" : "+r"(r0) : : "memory");
+    return (s32)r0;
+}
+
+/**
+ * 复制当前进程 (v0.6 阶段8)。
+ *
+ * 父进程返回子进程 pid, 子进程返回 0, 失败返回负错误码。
+ * 子进程拥有独立地址空间, 但已映射的页与父进程共享物理帧,
+ * 直到任意一方写入才复制 (写时复制)。
+ */
+USYS_INLINE s32 usys_fork(void)
+{
+    register u32 r0 __asm__("r0") = 0;
+    __asm__ volatile ("SVC #9" : "+r"(r0) : : "memory");
     return (s32)r0;
 }
 

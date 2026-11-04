@@ -30,12 +30,14 @@
 #define SYS_SEM_POST    6       /* sem_post(sem_id) */
 #define SYS_GET_TTBR0   7       /* 返回当前任务的 TTBR0 (调试/验证用) */
 #define SYS_VM_STATS    8       /* vm_stats(stat*) 取缺页/页框统计 */
-#define SYS_MAX         9
+#define SYS_FORK        9       /* fork() 复制当前进程 (v0.6 阶段8) */
+#define SYS_MAX         10
 
 /* =========================== 错误码 =========================== */
 /* 采用 Linux 风格的负值返回, 用户态看到的是 -errno */
 #define EINVAL          22      /* 无效参数 (信号量 id 越界等) */
 #define EFAULT          14      /* 用户指针非法 */
+#define ENOMEM          12      /* 内存不足 (fork 地址空间/页框耗尽) */
 #define EPERM           1       /* 权限不足 */
 
 /* =========================== 用户地址范围 =========================== */

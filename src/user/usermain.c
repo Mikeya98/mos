@@ -20,6 +20,7 @@
  *   u_badptr   — 把内核指针/未映射地址传给 sys_write → copy_from_user 返回 EFAULT
  *   u_iso_a    — 独立地址空间: 写自己的 0x08100000, 等 u_iso_b 跑完再读回
  *   u_iso_b    — 独立地址空间: 写同一虚拟地址, 两边互不影响
+ *   u_fork     — fork + 写时复制: 父子共享页, 谁写谁复制
  *   u_demand   — 按需分页: 数据页/栈页都是第一次访问才分配
  *   u_overflow — 写栈保护页 → 内核判定栈溢出, 杀掉任务
  *   u_swap     — 页框池耗尽 → 把页换出到 swap 区, 再读回来校验
@@ -423,6 +424,85 @@ static void USER_TEXT u_swap(void)
     usys_exit();
 }
 
+/* =========================== fork + COW 演示 (v0.6 阶段8) =========================== */
+
+static const char msg_fk1[] USER_RODATA = "[user] u_fork  : before fork, data page = ";
+static const char msg_fk2[] USER_RODATA = "[user] u_fork  : fork() returned child pid = ";
+static const char msg_fk3[] USER_RODATA = "[user] u_fork  : after child wrote, parent reads ";
+static const char msg_fk4[] USER_RODATA = "[user] u_fork  : parent value CHANGED — COW FAILED!\n";
+static const char msg_fk5[] USER_RODATA = "[user] u_fork_c: inherited value = ";
+static const char msg_fk6[] USER_RODATA = "[user] u_fork_c: inherited value WRONG — fork FAILED!\n";
+static const char msg_fk7[] USER_RODATA = "[user] u_fork_c: wrote 0x22222222 to my own copy\n";
+static const char msg_fk8[] USER_RODATA = "[user] u_fork_c: pages copied since fork = ";
+static const char msg_fk9[] USER_RODATA = "[user] u_fork  : pages copied since fork = ";
+static const char msg_fk10[] USER_RODATA = "[user] u_fork  : fork() FAILED\n";
+
+/**
+ * fork + 写时复制演示。
+ *
+ *   父进程: 往数据页写 0x11111111 → fork → 等子进程退出 → 读回
+ *   子进程: 读到 0x11111111 → 改成 0x22222222 → 退出
+ *
+ * 父子页表在 fork 后指向同一个物理帧, 且都是用户只读。子进程写
+ * 数据页和栈页时触发 permission fault, vm_fault 复制一份私有副本。
+ * 父进程最后仍应读到 0x11111111。
+ */
+static void USER_TEXT u_fork(void)
+{
+    volatile u32 *slot = (volatile u32 *)(uintptr_t)USER_DATA_VADDR;
+    vm_stats_t st;
+    const u32 magic = 0x11111111u;
+    s32 child;
+
+    *slot = magic;
+    SAY(msg_fk1);
+    say_hex(msg_empty, magic, msg_nl);
+
+    child = usys_fork();
+
+    if (child == 0) {
+        /* ===== 子进程 ===== */
+        SAY(msg_fk5);
+        say_hex(msg_empty, *slot, msg_nl);
+        if (*slot != magic) {
+            SAY(msg_fk6);
+        }
+
+        *slot = 0x22222222u;        /* ← 第一次写: COW 复制 */
+        SAY(msg_fk7);
+
+        if (usys_vm_stats(&st) == 0) {
+            say_hex(msg_fk8, st.cow, msg_nl);
+        }
+
+        usys_sem_post(3);           /* 告诉父进程: 我改完退出了 */
+        usys_exit();
+    }
+
+    if (child < 0) {
+        SAY(msg_fk10);
+        usys_exit();
+    }
+
+    /* ===== 父进程 ===== */
+    SAY(msg_fk2);
+    say_hex(msg_empty, (u32)child, msg_nl);
+
+    usys_sem_wait(3);               /* 等子进程写完并退出 */
+
+    SAY(msg_fk3);
+    say_hex(msg_empty, *slot, msg_nl);
+    if (*slot != magic) {
+        SAY(msg_fk4);
+    }
+
+    if (usys_vm_stats(&st) == 0) {
+        say_hex(msg_fk9, st.cow, msg_nl);
+    }
+
+    usys_exit();
+}
+
 /* =========================== 内核侧初始化 =========================== */
 
 extern u8 _user_text_start;
@@ -545,7 +625,7 @@ static void pool_manager(void)
 void user_demo_init(void)
 {
     printf("========================================\n");
-    printf("  User Mode Demo (v0.6 阶段7: demand paging + swap)\n");
+    printf("  User Mode Demo (v0.6 阶段8: swap + fork/COW)\n");
     printf("  user code : %X - %X (shared, read-only)\n",
            (u32)(uintptr_t)&_user_text_start,
            (u32)(uintptr_t)&_user_text_end);
@@ -571,11 +651,12 @@ void user_demo_init(void)
     if (!create_user("u_badptr",  u_badptr,  1)) return;
     if (!create_user("u_iso_a",   u_iso_a,   1)) return;
     if (!create_user("u_iso_b",   u_iso_b,   1)) return;
+    if (!create_user("u_fork",    u_fork,    1)) return;
     if (!create_user("u_demand",  u_demand,  1)) return;
     if (!create_user("u_overflow", u_overflow, 1)) return;
     if (!create_user("u_swap",    u_swap,    1)) return;
 
-    printf("\n[DEMO] 9 user tasks created, each with its own L1 page table\n");
+    printf("\n[DEMO] 10 user tasks created, each with its own L1 page table\n");
 
     /*
      * 回收演示的驱动任务: 内核态, 优先级 30 (只比 IDLE 高)。

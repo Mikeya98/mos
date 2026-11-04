@@ -124,6 +124,23 @@ static int is_page_fault(u32 fsr)
 }
 
 /**
+ * @brief  写权限错误 (v0.6 阶段8 的写时复制路径)
+ *
+ * fork 之后父子共享的页是 AP=10 (用户只读), 任何一方写都会触发
+ * permission fault (状态码 0xF 页 / 0xD section), 同时 WnR 位
+ * (FSR bit11) = 1。这一类不是错误, 而是"该复制这一页了"的信号。
+ */
+static int is_write_perm_fault(u32 fsr)
+{
+    u32 status = fsr & 0xFu;
+
+    if (status != 0xFu && status != 0xDu) {
+        return 0;
+    }
+    return (fsr & (1u << 11)) ? 1 : 0;
+}
+
+/**
  * @brief  Data Abort 处理 (startup.S 的 data_handler 调用)
  *
  * @param  fault_pc  触发故障的指令地址 (lr_abt - 8)
@@ -146,36 +163,45 @@ int data_abort_handler(u32 fault_pc, u32 spsr_abt)
         }
     }
 
-    /* ------------------- 用户态: 先看是不是缺页 ------------------- */
-    if (is_page_fault(dfsr)) {
-        int wr = (dfsr & (1u << 11)) ? 1 : 0;
-        int rc = vm_fault(dfar, wr);
+    /* ------------------- 用户态: 缺页 / 写时复制 ------------------- */
+    {
+        int page_fault = is_page_fault(dfsr);
+        int cow_fault  = (!page_fault && is_write_perm_fault(dfsr));
+        int wr         = (dfsr & (1u << 11)) ? 1 : 0;
 
-        if (rc == VM_OK) {
+        if (page_fault || cow_fault) {
             /*
-             * 页表已经补好, TLB 里这一项也刷过了。
-             * 返回 1 给汇编, RFE 之后 CPU 重新执行同一条指令。
+             * cow_fault 一定是写操作; 普通缺页按 FSR 的 WnR 位区分读写。
              */
-            return 1;
-        }
+            int rc = vm_fault(dfar, (u32)(cow_fault ? 1 : wr));
 
-        /*
-         * 补不了: 打出现场, 再补一句失败原因。
-         * 这两类错误在调试时完全是两个方向, 必须分开写:
-         *   保护页 → 栈溢出, 去查递归/大局部变量;
-         *   页框耗尽 → 内存不够, 去查泄漏或者调大池子。
-         */
-        report_fault("Data Abort", fault_pc, spsr_abt, dfar, dfsr);
-        if (rc == VM_GUARD) {
-            printf("[ABORT] stack overflow: %X is the guard page (%X)\n",
-                   dfar, USER_GUARD_VADDR);
-        } else if (rc == VM_NOMEM) {
-            printf("[ABORT] out of page frames while faulting %X\n", dfar);
+            if (rc == VM_OK) {
+                /*
+                 * 页表已经补好/复制好, TLB 里这一项也刷过了。
+                 * 返回 1 给汇编, RFE 之后 CPU 重新执行同一条指令。
+                 */
+                return 1;
+            }
+
+            /*
+             * 补不了: 打出现场, 再补一句失败原因。
+             * 这几类错误在调试时完全不同方向, 必须分开写:
+             *   保护页 → 栈溢出, 去查递归/大局部变量;
+             *   页框耗尽 → 内存不够, 去查泄漏或者调大池子;
+             *   非法写 → 往代码区写, 或者地址越界。
+             */
+            report_fault("Data Abort", fault_pc, spsr_abt, dfar, dfsr);
+            if (rc == VM_GUARD) {
+                printf("[ABORT] stack overflow: %X is the guard page (%X)\n",
+                       dfar, USER_GUARD_VADDR);
+            } else if (rc == VM_NOMEM) {
+                printf("[ABORT] out of page frames while faulting %X\n", dfar);
+            } else {
+                printf("[ABORT] %X is not a demand-paging address\n", dfar);
+            }
         } else {
-            printf("[ABORT] %X is not a demand-paging address\n", dfar);
+            report_fault("Data Abort", fault_pc, spsr_abt, dfar, dfsr);
         }
-    } else {
-        report_fault("Data Abort", fault_pc, spsr_abt, dfar, dfsr);
     }
 
     printf("[ABORT] killing user task, scheduler continues\n\n");

@@ -32,6 +32,16 @@ static u32 frame_used[WORD_COUNT];
 /* 每帧的所有者 pid, 只用于调试 */
 static u32 frame_owner_pid[FRAME_COUNT];
 
+/*
+ * 每帧的引用计数 (v0.6 阶段8)。
+ *
+ * fork 之后父子进程共享物理页, 页表里两个任务指向同一个帧。
+ * 只有最后一个引用消失时才能把帧还给池子, 否则父进程退出会把
+ * 子进程还在用的内存清掉。共享页在父子两侧都被改成只读,
+ * 任何一方写都会先经过 vm_fault 复制一份。
+ */
+static u32 frame_ref[FRAME_COUNT];
+
 static u32 frame_used_count = 0;
 static u32 frame_high_water = 0;      /* 历史最高占用, 演示"惰性分配省了多少" */
 
@@ -94,6 +104,7 @@ void frame_init(void)
     }
     for (i = 0; i < FRAME_COUNT; i++) {
         frame_owner_pid[i] = 0;
+        frame_ref[i] = 0;
     }
     frame_used_count = 0;
     frame_high_water = 0;
@@ -121,6 +132,7 @@ u32 frame_alloc(u32 owner)
     w = idx / BITS_PER_WORD;
     frame_used[w] |= (1u << (idx % BITS_PER_WORD));
     frame_owner_pid[idx] = owner;
+    frame_ref[idx] = 1;             /* 新帧从 1 个引用开始 */
     frame_used_count++;
     if (frame_used_count > frame_high_water) {
         frame_high_water = frame_used_count;
@@ -148,12 +160,66 @@ int frame_free(u32 phys, u32 owner)
         printf("[FRAME] free %X: already free (pid %u)\n", phys, owner);
         return -1;
     }
+
+    /*
+     * 还有别的任务在用这一帧 (fork 共享的 COW 页): 只减引用,
+     * 不还池子。最后一个引用者退出时才真正释放。
+     */
+    if (frame_ref[idx] > 1u) {
+        frame_ref[idx]--;
+        irq_restore(cpsr);
+        return 0;
+    }
+
     frame_set((u32)idx, 0);
     frame_owner_pid[idx] = 0;
+    frame_ref[idx] = 0;
     frame_used_count--;
     irq_restore(cpsr);
 
     return 0;
+}
+
+u32 frame_ref_inc(u32 phys)
+{
+    int idx;
+    u32 cpsr;
+    u32 ref;
+
+    idx = frame_index(phys);
+    if (idx < 0) {
+        printf("[FRAME] ref_inc %X: not a pool frame\n", phys);
+        return 0;
+    }
+
+    cpsr = irq_save();
+    if (!frame_is_used((u32)idx)) {
+        irq_restore(cpsr);
+        printf("[FRAME] ref_inc %X: frame is free\n", phys);
+        return 0;
+    }
+    frame_ref[idx]++;
+    ref = frame_ref[idx];
+    irq_restore(cpsr);
+
+    return ref;
+}
+
+u32 frame_refcount(u32 phys)
+{
+    int idx;
+    u32 cpsr;
+    u32 ref;
+
+    idx = frame_index(phys);
+    if (idx < 0) {
+        return 0;
+    }
+
+    cpsr = irq_save();
+    ref = frame_is_used((u32)idx) ? frame_ref[idx] : 0u;
+    irq_restore(cpsr);
+    return ref;
 }
 
 u32 frame_free_count(void)
@@ -185,7 +251,11 @@ void frame_dump(const char *tag)
     printf("[FRAME] owners:");
     for (i = 0; i < FRAME_COUNT; i++) {
         if (frame_owner_pid[i] != 0) {
-            printf(" %u@%u", i, frame_owner_pid[i]);
+            if (frame_ref[i] > 1u) {
+                printf(" %u@%u(x%u)", i, frame_owner_pid[i], frame_ref[i]);
+            } else {
+                printf(" %u@%u", i, frame_owner_pid[i]);
+            }
         }
     }
     printf("\n");

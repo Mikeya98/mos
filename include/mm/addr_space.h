@@ -49,6 +49,18 @@ typedef struct {
 int user_space_create(user_space_t *us);
 
 /**
+ * @brief  复制一个用户地址空间 (fork 用, v0.6 阶段8)
+ *
+ * 父进程已经映射的页全部改成"父子共享 + 只读", 由缺页处理做
+ * 写时复制; 已经换出的页复制一份新的 swap 槽, 两边互不影响。
+ *
+ * @param  child   输出参数, 新的地址空间
+ * @param  parent  父地址空间
+ * @return 0 成功, -1 槽位/页框耗尽
+ */
+int user_space_fork(user_space_t *child, const user_space_t *parent);
+
+/**
  * @brief  归还一个用户地址空间
  *
  * 顺序:

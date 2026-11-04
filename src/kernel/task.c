@@ -19,6 +19,12 @@
 #include "mm/slab.h"
 #include "mm/mmu.h"
 #include "mm/addr_space.h"
+#include "lib/irq.h"
+
+/* v0.6 阶段8: 汇编实现的 banked SP_usr 读写 + fork 返回跳板 */
+extern u32  read_user_sp(void);
+extern void write_user_sp(u32 sp);
+extern void fork_return_trampoline(void);
 
 /* =========================== 外部引用 =========================== */
 /*
@@ -76,6 +82,9 @@ static u32 tcb_count = 0;
 
 /* 延迟回收 (实现在本文件后半部分, schedule 里要提前调用) */
 static void reclaim_drain(void);
+
+/* 每任务 SP_usr 恢复 (实现在 fork 小节, schedule 里要提前调用) */
+static void task_restore_user_sp(task_t *t);
 
 /* =========================== 任务栈池 =========================== */
 /* 由 kernel.lds 提供的外部符号 */
@@ -444,6 +453,12 @@ void schedule(void)
         next->state = TASK_RUNNING;
 
         /*
+         * 恢复新任务的用户栈指针 (v0.6 阶段8)。
+         * SP_usr 是 banked 寄存器, 不随 TCB 自动切换, 必须显式写回。
+         */
+        task_restore_user_sp(next);
+
+        /*
          * 换地址空间 (v0.6 阶段4/5)。
          * 必须在 context_switch 之前: 新任务的内核栈和 TCB 都在内核区,
          * 每张页表里映射一致, 所以换表过程中当前指令和栈都还有效。
@@ -476,6 +491,7 @@ void sched_start(void)
     current_task = first;
     first->state = TASK_RUNNING;
 
+    task_restore_user_sp(first);
     mmu_activate(first->l1_phys, first->asid);
     context_switch(NULL, first);
 
@@ -796,6 +812,138 @@ task_t *task_create_user(void (*entry)(void), const char *name,
     }
 
     return t;
+}
+
+/* =========================== fork / COW (v0.6 阶段8) =========================== */
+
+void task_save_user_sp(void)
+{
+    task_t *t = current_task;
+
+    if (t && t->is_user) {
+        t->user_sp = read_user_sp();
+    }
+}
+
+/**
+ * @brief  切换到用户任务之前, 把它的 SP_usr 写回 banked 寄存器
+ *
+ * SP_usr 是 CPU 全局的, 不跟着 TCB 走。切换时必须显式恢复, 否则
+ * 一个任务会踩到上一个任务的用户栈。写 SP_usr 要借道 SYS 模式,
+ * 中间不能被中断打断, 所以关一下中断 (调用者可能开着中断)。
+ */
+static void task_restore_user_sp(task_t *t)
+{
+    u32 cpsr;
+
+    if (!t || !t->is_user) {
+        return;
+    }
+
+    cpsr = irq_save();
+    write_user_sp(t->user_sp);
+    irq_restore(cpsr);
+}
+
+task_t *task_fork(task_t *parent, u32 user_pc)
+{
+    task_t *child;
+    user_space_t parent_as;
+    user_space_t as;
+    u32 *sp;
+    u32 *kstack_top;
+    u32 i;
+
+    if (!parent || !parent->is_user || parent->l2_phys == 0) {
+        return NULL;
+    }
+
+    sched_lock++;               /* 子任务完整之前不允许调度 */
+
+    /* 1. 复制地址空间: 已映射页共享并改成只读, swap 页复制槽 */
+    parent_as.l1_phys = parent->l1_phys;
+    parent_as.l2_phys = parent->l2_phys;
+    parent_as.asid    = parent->asid;
+    parent_as.slot    = parent->as_slot;
+
+    if (user_space_fork(&as, &parent_as) != 0) {
+        sched_lock--;
+        return NULL;
+    }
+
+    /* 2. 复用 task_create 分配内核栈 + TCB (它会自动挂进就绪队列) */
+    child = task_create(parent->entry, "fork_child",
+                        parent->priority, STACK_4K);
+    if (!child) {
+        user_space_destroy(&as);
+        sched_lock--;
+        return NULL;
+    }
+
+    /*
+     * 3. 覆盖 task_create 伪造的"首次执行 entry"上下文帧, 换成
+     *    直接返回用户态的 fork 跳板帧:
+     *
+     *      sp[0] = r4 = 子进程用户栈顶
+     *      sp[1] = r5 = 子进程返回用户态后的 PC
+     *      sp[2..7] = r6-r11 (清零, fork 之后未定义)
+     *      sp[8] = lr = fork_return_trampoline
+     *
+     *    context_switch 恢复这 9 个字后 BX 到跳板, 跳板负责设置
+     *    SP_usr / SPSR 并异常返回用户态。
+     */
+    kstack_top = (u32 *)(((u32)(uintptr_t)child->stack_base) & ~0x7u);
+    sp = kstack_top - 9;
+    sp[0] = parent->user_sp;                /* r4 → 用户栈 */
+    sp[1] = user_pc;                        /* r5 → 用户 PC */
+    for (i = 2; i < 8; i++) {
+        sp[i] = 0;                          /* r6-r11 */
+    }
+    sp[8] = (u32)(uintptr_t)fork_return_trampoline;
+    child->sp = (u32)(uintptr_t)sp;
+
+    /* 4. 绑定新的地址空间和用户态状态 */
+    child->is_user  = 1;
+    child->user_sp  = parent->user_sp;
+    child->l1_phys  = as.l1_phys;
+    child->l2_phys  = as.l2_phys;
+    child->asid     = as.asid;
+    child->as_slot  = as.slot;
+    child->as_valid = 1;
+    child->pf_count = 0;
+    child->cow_count    = 0;
+    child->forked_from  = parent->pid;
+    child->vm_clock = 0;
+    child->swap_out = 0;
+    child->swap_in  = 0;
+    child->block_obj = NULL;
+    child->held_mutex = NULL;
+    child->sleep_ticks = 0;
+    child->original_priority = parent->priority;
+
+    /* 文件描述符表按值复制 (演示版: 不做到"共享文件偏移") */
+    for (i = 0; i < MAX_FD_PER_TASK; i++) {
+        child->fd_table[i] = parent->fd_table[i];
+    }
+
+    /* 名字加 _c 后缀, 日志里能分出父子 */
+    for (i = 0; i < TASK_NAME_MAX - 3 && parent->name[i]; i++) {
+        child->name[i] = parent->name[i];
+    }
+    child->name[i++] = '_';
+    child->name[i++] = 'c';
+    child->name[i]   = '\0';
+
+    printf("[FORK] %s(pid %u) -> %s(pid %u), pc=%X sp=%X\n",
+           parent->name, parent->pid, child->name, child->pid,
+           user_pc, parent->user_sp);
+
+    sched_lock--;
+    if (sched_lock == 0 && need_resched) {
+        schedule();
+    }
+
+    return child;
 }
 
 /* =========================== 任务终止 (v0.6 阶段3) =========================== */

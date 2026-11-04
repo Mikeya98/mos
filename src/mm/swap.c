@@ -151,6 +151,31 @@ void swap_free_slot(u32 slot)
     irq_restore(cpsr);
 }
 
+int swap_dup(u32 slot)
+{
+    int new_slot;
+    u32 cpsr;
+
+    if (slot >= SWAP_PAGES) {
+        return -1;
+    }
+
+    cpsr = irq_save();
+    if (!slot_is_used(slot)) {
+        irq_restore(cpsr);
+        return -1;
+    }
+    new_slot = swap_alloc_slot();
+    if (new_slot < 0) {
+        irq_restore(cpsr);
+        return -1;
+    }
+    copy_page(slot_addr((u32)new_slot), slot_addr(slot));
+    irq_restore(cpsr);
+
+    return new_slot;
+}
+
 void swap_release_l2(u32 l2_phys)
 {
     const u32 *l2;

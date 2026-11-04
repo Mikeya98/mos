@@ -101,6 +101,12 @@ static int vm_evict_one(task_t *t, u32 avoid_idx)
             return -1;              /* swap 区满了, 这一页换不出去 */
         }
 
+        /*
+         * 共享页 (fork 的 COW 页) 也可以换出: 内容先写进 swap,
+         * 然后只还掉本任务的引用。另一个进程仍然映射着这一帧,
+         * frame_free 会把 refcount 减到 1 而不是真的释放。
+         */
+
         l2[idx] = swap_pte_make((u32)slot);
         va = USER_PRIV_VADDR + idx * 4096u;
         vm_flush_page(va);
@@ -213,8 +219,61 @@ int vm_fault(u32 va, u32 write)
         return VM_OK;
     }
 
-    /* 已经映射过 (可能是 TLB 里残留了旧的 fault 项), 直接返回 */
+    /* ------------------------------------------------------------------
+     * 情况 1.5: 写一个"已映射但只读"的页 —— fork 之后的写时复制。
+     *
+     * fork 时父子两侧的页表都指向同一个物理帧, AP 改成用户只读。
+     * 谁先写, 谁就在这里复制一份私有副本:
+     *   - refcount > 1: 还有别的任务在用, 必须复制;
+     *   - refcount == 1: 另一方已经退出, 直接把只读改成可写就行。
+     * ------------------------------------------------------------------ */
     if ((l2[idx] & 0x2u) != 0) {
+        u32 pte = l2[idx];
+        u32 ap = (pte >> 4) & 0x3u;
+
+        if (write && ap != 3u) {
+            u32 old_phys = pte & 0xFFFFF000u;
+            u32 old_ref = frame_refcount(old_phys);
+
+            if (old_ref > 1u) {
+                volatile u32 *src;
+                volatile u32 *dst;
+
+                frame = frame_alloc(t->pid);
+                if (frame == 0) {
+                    if (vm_evict_one(t, idx) != 0) {
+                        return VM_NOMEM;
+                    }
+                    frame = frame_alloc(t->pid);
+                    if (frame == 0) {
+                        return VM_NOMEM;
+                    }
+                }
+
+                /* 复制整页, 然后把旧帧的引用还掉 */
+                src = (volatile u32 *)(uintptr_t)old_phys;
+                dst = (volatile u32 *)(uintptr_t)frame;
+                for (i = 0; i < 1024u; i++) {
+                    dst[i] = src[i];
+                }
+                frame_free(old_phys, t->pid);
+
+                l2[idx] = (frame & 0xFFFFF000u) | L2_USER_RW_XN;
+                vm_flush_page(page);
+
+                t->cow_count++;
+                printf("[COW] %s: %X copied frame %X -> %X (ref was %u)\n",
+                       t->name, page, old_phys, frame, old_ref);
+            } else {
+                l2[idx] = old_phys | L2_USER_RW_XN;
+                vm_flush_page(page);
+                printf("[COW] %s: %X last owner, made writable\n",
+                       t->name, page);
+            }
+            return VM_OK;
+        }
+
+        /* 已经映射过 (可能是 TLB 里残留了旧的 fault 项), 直接返回 */
         vm_flush_page(page);
         return VM_OK;
     }
@@ -283,7 +342,7 @@ int vm_touch(u32 start, u32 len, int write)
 
     for (page = start & ~0xFFFu; ; page += 4096u) {
         if (classify(page) != PAGE_ILLEGAL) {
-            int rc = vm_fault(page, write);
+            int rc = vm_fault(page, (u32)write);
             if (rc != VM_OK) {
                 return rc;
             }
@@ -332,4 +391,5 @@ void vm_fill_stats(vm_stats_t *st)
     st->swap_in      = t ? t->swap_in : 0;
     st->swap_used    = swap_used();
     st->swap_total   = swap_total();
+    st->cow          = t ? t->cow_count : 0;
 }

@@ -39,6 +39,7 @@
 #define FRAME_R1        1
 #define FRAME_R2        2
 #define FRAME_R3        3
+#define FRAME_LR        13      /* r0-r12 之后的返回地址 (fork 需要) */
 #define FRAME_COUNT     14      /* r0-r12 + lr */
 
 /* =========================== 用户态信号量表 =========================== */
@@ -205,6 +206,13 @@ void svc_dispatch(u32 svc_num, u32 *frame)
 {
     int ret = 0;
 
+    /*
+     * v0.6 阶段8: 进内核第一件事就是把 SP_usr 存进 TCB。
+     * 系统调用可能阻塞/让出 CPU, 调度器切到别的用户任务时会改写
+     * banked SP_usr, 不先保存的话, 本任务恢复运行后用户栈就错了。
+     */
+    task_save_user_sp();
+
     switch (svc_num) {
     case SYS_YIELD:
         task_yield();
@@ -248,6 +256,16 @@ void svc_dispatch(u32 svc_num, u32 *frame)
         ret = sys_vm_stats((void *)(uintptr_t)frame[FRAME_R0]);
         break;
 
+    case SYS_FORK: {
+        /*
+         * 子进程从 fork_return_trampoline 返回用户态, 走的是
+         * frame[FRAME_LR] 这个返回地址; 父进程在这里拿到子进程 pid。
+         */
+        task_t *child = task_fork(get_current(), frame[FRAME_LR]);
+        ret = child ? (int)child->pid : -ENOMEM;
+        break;
+    }
+
     default: {
         task_t *cur = get_current();
         printf("[SYS] unknown syscall %u from task %s\n",
@@ -282,4 +300,5 @@ void syscall_init(void)
     user_sem_used[0] = 1;
     user_sem_used[1] = 1;
     user_sem_used[2] = 1;
+    user_sem_used[3] = 1;       /* v0.6 阶段8: u_fork 父子同步 */
 }

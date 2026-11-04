@@ -2,7 +2,7 @@
 
 [![Platform](https://img.shields.io/badge/platform-ARM%20Cortex--A9-blue)](https://github.com/Mikeya98/mos)
 [![Language](https://img.shields.io/badge/language-C%20%7C%20Assembly-orange)](https://github.com/Mikeya98/mos)
-[![Status](https://img.shields.io/badge/status-v0.6%20--%20swap-brightgreen)](https://github.com/Mikeya98/mos)
+[![Status](https://img.shields.io/badge/status-v0.6%20--%20fork%2FCOW-brightgreen)](https://github.com/Mikeya98/mos)
 [![QEMU](https://img.shields.io/badge/QEMU-verified-lightgrey)](https://github.com/Mikeya98/mos)
 
 MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 上，用 QEMU 仿真验证。每一行代码都是手写的，没有引用任何现成的 RTOS 内核代码。
@@ -25,7 +25,9 @@ MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 �
 - **资源回收**：任务退出后归还地址空间槽位（L1/L2）、页表里映射过的物理页框、内核栈和 TCB；当前任务踩在自己的栈上，所以走延迟回收队列
 - **按需分页**：用户私有区的 L2 表初始全是 fault，第一次访问才从物理页框池（64 帧 × 4KB）分配一帧、清零、填表，然后按地址无效化单个 TLB 项、回到故障指令重试；栈最多可以长到 1016KB 而实际只占用到的几页，保护页负责发现栈溢出；系统调用拷贝用户内存前也会先代用户补页
 - **页面换出**：页框池耗尽时，按轮转策略把当前任务的一页写到 swap 区（16 页 × 4KB），L2 表项改写成换出描述符（低两位仍为 00，硬件继续报缺页）；再次访问时从 swap 读回并恢复映射。页表本身就是换出账本，任务退出时扫一遍 L2 把 swap 槽和页框一起回收；演示任务故意多碰 8 页，验证了 8 次换出 + 8 次换入后每个页的内容都没有丢
-- **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST / GET_TTBR0 / VM_STATS`；`copy_from_user` / `copy_to_user` 先代用户补页，再走当前任务的页表检查用户指针（区分读/写权限）
+- **fork + 写时复制**：`SYS_FORK` 复制当前用户任务，新建地址空间槽位；已映射的页父子共享同一个物理帧，两侧页表都改成用户只读，谁先写谁在缺页处理里复制一份私有副本（引用计数减到 1 时直接改回可写）。换出页复制独立的 swap 槽，互不影响；物理帧按引用计数回收
+- **每任务用户栈指针**：`SP_usr` 是 CPU 的 banked 寄存器，不随 TCB 自动切换。进入内核时把 `SP_usr` 存进 TCB，调度到某个用户任务之前再写回，避免任务切换后踩到上一个任务的用户栈
+- **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST / GET_TTBR0 / VM_STATS / FORK`；`copy_from_user` / `copy_to_user` 先代用户补页，再走当前任务的页表检查用户指针（区分读/写权限）
 - **异常恢复**：捕获 Data Abort / Prefetch Abort，打印任务名、故障地址与 DFSR/DFAR，杀掉出错的用户任务后继续调度，系统不宕机
 
 ## 目录结构
@@ -140,12 +142,20 @@ Starting scheduler...
 [ABORT] killing user task, scheduler continues
 [AS] slot 6 (asid 7): reclaimed 7 page frames
 
-[POOL] free slots: 8 / 8, free frames: 64 / 64
-[POOL] wave 0: created 8 tasks, free slots now 0, free frames 64
+[user] u_fork  : before fork, data page = 0x11111111
+[FORK] u_fork(pid 7) -> u_fork_c(pid 12), pc=80007E4 sp=81FFFC8
+[user] u_fork  : fork() returned child pid = 0x0000000C
+[user] u_fork_c: inherited value = 0x11111111
+[COW] u_fork_c: 8100000 copied frame 268000 -> 266000 (ref was 2)
+[user] u_fork_c: wrote 0x22222222 to my own copy
+[user] u_fork  : after child wrote, parent reads 0x11111111
+
+[POOL] free slots: 12 / 12, free frames: 64 / 64
+[POOL] wave 0: created 8 tasks, free slots now 4, free frames 64
 [user] u_spawn : running in a recycled address space
-[POOL] wave 0: spawn tasks gone, free slots = 8, free frames = 64
+[POOL] wave 0: spawn tasks gone, free slots = 12, free frames = 64
     （wave 1 / 2 重复两轮）
-[POOL] done — 8 of 8 slots free, 64 of 64 frames free
+[POOL] done — 12 of 12 slots free, 64 of 64 frames free
 ```
 
 这些输出分别验证了：
@@ -156,7 +166,8 @@ Starting scheduler...
 4. `u_iso_a` / `u_iso_b` 往同一个虚拟地址 `0x08100000` 写不同标记，各自读回自己的值，TTBR0 低 8 位是各自的 ASID，说明地址空间确实分开了；
 5. `u_demand` 只用到 7 页就报了 7 次缺页：数据页 1 页、递归压栈 5 页、统计缓冲区 1 页（这一页是内核 `copy_to_user` 里 `vm_touch` 代补的）。虚拟栈上限 1016KB，物理上只占了实际碰到的几页；
 6. `u_overflow` 写保护页 `0x08101000`，内核判定栈溢出并杀掉任务，数据页不会被栈悄悄覆盖；
-7. `pool_mgr` 连续三轮各创建 8 个短命任务（正好占满 8 个地址空间槽位），每轮结束后槽位全部归还；这些任务不碰栈也不碰数据页，所以**一个物理页框都不占**（free frames 始终 64）——同一份 256KB 页框池，按阶段4 的预分配方案连 4 个任务都撑不住。
+7. `u_fork` 先往数据页写 `0x11111111`，fork 之后子进程读到同样的值，改成 `0x22222222` 后退出；父进程读回仍然是 `0x11111111`。日志里的 `[COW]` 行是子进程第一次写共享页时触发的页复制，父进程的数据没有被改动；
+8. `pool_mgr` 连续三轮各创建 8 个短命任务（12 个地址空间槽位里占 8 个），每轮结束后槽位全部归还；这些任务不碰栈也不碰数据页，所以**一个物理页框都不占**（free frames 始终 64）——同一份 256KB 页框池，按阶段4 的预分配方案连 4 个任务都撑不住。
 
 > QEMU 的 zynq 机器默认内存放不下 `0x08000000` 的第二段，`make qemu-run` 里加了 `-m 1024`。
 
@@ -169,8 +180,8 @@ Starting scheduler...
 | v0.3 | Buddy 伙伴内存分配器 | ✅ |
 | v0.4 | SLAB 对象缓存 + TCB 动态分配 | ✅ |
 | v0.5 | MOS-FS 文件系统（VFS + RAM 盘） | ✅ |
-| v0.6 | MMU + 用户态 + 权限隔离 + 每任务独立页表 + ASID + 资源回收 + 按需分页（阶段1 开 MMU、阶段2 模式切换、阶段3 隔离/异常恢复、阶段4 TTBR0 切换、阶段5 ASID/reclaim、阶段6 缺页处理/页框池/保护页） | ✅ |
-| 下一步 | 页框换出（swap）、写时复制 fork、多核调度 | 🔜 |
+| v0.6 | MMU + 用户态 + 权限隔离 + 每任务独立页表 + ASID + 资源回收 + 按需分页 + 页面换出 + fork/COW（阶段1 开 MMU、阶段2 模式切换、阶段3 隔离/异常恢复、阶段4 TTBR0 切换、阶段5 ASID/reclaim、阶段6 缺页处理/页框池/保护页、阶段7 swap、阶段8 fork/写时复制） | ✅ |
+| 下一步 | 多核调度、进程间共享内存、更完整的进程模型 | 🔜 |
 
 ## 构建细节
 

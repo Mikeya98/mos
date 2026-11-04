@@ -136,6 +136,83 @@ int user_space_create(user_space_t *us)
     return 0;
 }
 
+/* =========================== fork 复制 =========================== */
+
+int user_space_fork(user_space_t *child, const user_space_t *parent)
+{
+    user_space_t as;
+    u32 *pl2;
+    u32 *cl2;
+    u32 i;
+    u32 pte;
+    u32 phys;
+    u32 shared = 0;
+    u32 swapped = 0;
+
+    if (!child || !parent || parent->slot >= USER_SPACE_SLOTS) {
+        return -1;
+    }
+
+    /* 先拿一套空的页表 (L1 复制内核模板, L2 全 fault) */
+    if (user_space_create(&as) != 0) {
+        return -1;
+    }
+
+    pl2 = (u32 *)(uintptr_t)parent->l2_phys;
+    cl2 = (u32 *)(uintptr_t)as.l2_phys;
+
+    for (i = 0; i < 256u; i++) {
+        pte = pl2[i];
+
+        /*
+         * 情况 1: 父进程这一页在 swap 区。
+         * 复制一个新的槽, 不能共用 —— 换入会把槽释放掉,
+         * 另一个进程的页表项就成了指向空槽的野指针。
+         */
+        if (swap_pte_is(pte)) {
+            int slot = swap_dup(swap_pte_slot(pte));
+            if (slot < 0) {
+                /* 前面可能已经改过父页表, 同样要刷 TLB */
+                mmu_flush_asid(parent->asid);
+                user_space_destroy(&as);
+                return -1;
+            }
+            cl2[i] = swap_pte_make((u32)slot);
+            swapped++;
+            continue;
+        }
+
+        /* 情况 2: 没映射 (fault) / 保护页, 子进程保持原样 */
+        if ((pte & 0x2u) == 0) {
+            continue;
+        }
+
+        /*
+         * 情况 3: 已映射。共享物理帧, 父子两侧都改成用户只读。
+         *
+         * 注意不能只改子进程: 父进程的 TLB 里还留着"可写"的翻译,
+         * 改完页表后必须按 ASID 刷一遍, 否则父进程继续直接写共享页,
+         * 子进程会看到不该看到的变化。
+         */
+        phys = pte & 0xFFFFF000u;
+        if (frame_ref_inc(phys) == 0) {
+            mmu_flush_asid(parent->asid);
+            user_space_destroy(&as);
+            return -1;
+        }
+        cl2[i] = phys | L2_USER_RO;
+        pl2[i] = phys | L2_USER_RO;
+        shared++;
+    }
+
+    mmu_flush_asid(parent->asid);
+
+    *child = as;
+    printf("[AS] fork: new slot %u/asid %u, shared %u pages, copied %u swap slots\n",
+           as.slot, as.asid, shared, swapped);
+    return 0;
+}
+
 /* =========================== 释放 =========================== */
 
 void user_space_destroy(user_space_t *us)

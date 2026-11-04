@@ -75,6 +75,18 @@ int swap_load(u32 slot, u32 phys);
 void swap_free_slot(u32 slot);
 
 /**
+ * @brief  复制一个已换出的页 (fork 用, v0.6 阶段8)
+ *
+ * 父进程的某一页不在内存里, 只占着一个 swap 槽。子进程不能和
+ * 父进程共用一个槽 —— 任何一方换入都会把槽释放掉, 另一方就
+ * 找不到数据了。这里分配一个新槽并复制内容, 父进程的槽保持不动。
+ *
+ * @param  slot  父进程的槽号
+ * @return 新槽号, 失败返回 -1
+ */
+int swap_dup(u32 slot);
+
+/**
  * @brief  回收一张 L2 表里所有换出页对应的槽
  *
  * user_space_destroy 在任务退出时调用。页表里的换出描述符是这些

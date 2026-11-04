@@ -114,3 +114,66 @@ user_entry_trampoline:
 
     @ 4. 异常返回: pc = lr, CPSR = SPSR(USR) → 进入用户态执行入口
     MOVS    pc, lr
+
+/* ============================================================
+ * 每任务用户栈指针的读取 / 设置 (v0.6 阶段8)
+ *
+ * SP_usr 是 CPU 的 banked 寄存器, 不是每个 task_t 一份。任务 A 在
+ * 用户态被中断、调度器切到任务 B 之后, SP_usr 还停留在 A 的值上;
+ * B 返回用户态时用的就是 A 的栈 —— 两个任务的用户栈虚拟地址相同,
+ * 短期看不出来, 一旦调用深度不同就会踩坏对方的栈。
+ *
+ * 解决办法: 进内核时把 SP_usr 存进当前任务的 TCB, 切到某个用户
+ * 任务之前再写回去。SYS 模式和 USR 模式共用 SP, 所以借道 SYS 模式
+ * 读写 SP_usr 即可。
+ * ============================================================ */
+.global read_user_sp
+read_user_sp:
+    CPS     #T_MOD_SYS
+    MOV     r0, sp
+    CPS     #T_MOD_SVC
+    BX      lr
+
+.global write_user_sp
+write_user_sp:
+    @ r0 = 要设置的 SP_usr
+    CPS     #T_MOD_SYS
+    MOV     sp, r0
+    CPS     #T_MOD_SVC
+    BX      lr
+
+/* ============================================================
+ * fork 子进程的首次返回 (v0.6 阶段8)
+ *
+ * task_fork 伪造的上下文帧里:
+ *   r4 = 子进程的用户栈顶
+ *   r5 = 子进程从 SVC 返回的用户 PC
+ *   lr = 本跳板
+ * context_switch 恢复 r4-r11/lr 后 BX 到这里。
+ *
+ * 这里把 SP_usr 设成子进程自己的栈, 把 SPSR 设成 USR 模式,
+ * r0 = 0 (fork 在子进程里返回 0), 然后异常返回用户态。
+ * ============================================================ */
+.global fork_return_trampoline
+fork_return_trampoline:
+    @ 1. 设置子进程自己的用户栈
+    CPS     #T_MOD_SYS
+    MOV     sp, r4
+    CPS     #T_MOD_SVC
+
+    @ 2. 用户 PC → lr, 准备异常返回
+    MOV     lr, r5
+
+    @ 3. fork 在子进程里的返回值 = 0, 其余参数寄存器无意义
+    MOV     r0, #0
+    MOV     r1, #0
+    MOV     r2, #0
+    MOV     r3, #0
+    MOV     r12, #0
+
+    @ 4. 返回目标模式 = USR
+    MOV     r4, #T_MOD_USR
+    MSR     SPSR_cxsf, r4
+
+    @ 5. 异常返回, 从 SVC 系统调用的下一条指令继续执行
+    MOVS    pc, lr
