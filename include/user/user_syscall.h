@@ -55,6 +55,9 @@
 #if SYS_FORK != 9
 #error "SVC immediate for SYS_FORK is stale"
 #endif
+#if SYS_EXEC != 10
+#error "SVC immediate for SYS_EXEC is stale"
+#endif
 
 #define USYS_INLINE  static inline __attribute__((always_inline))
 
@@ -150,6 +153,20 @@ USYS_INLINE s32 usys_fork(void)
 {
     register u32 r0 __asm__("r0") = 0;
     __asm__ volatile ("SVC #9" : "+r"(r0) : : "memory");
+    return (s32)r0;
+}
+
+/**
+ * 简化版 exec (v0.6 阶段9)。
+ *
+ * entry 必须是用户代码段 (0x08000000-0x080FFFFF) 内的 4 字节对齐地址。
+ * 成功时不返回, 当前任务从 entry 开始执行, 私有数据页和栈清空;
+ * 失败返回负错误码。
+ */
+USYS_INLINE s32 usys_exec(u32 entry)
+{
+    register u32 r0 __asm__("r0") = entry;
+    __asm__ volatile ("SVC #10" : "+r"(r0) : : "memory");
     return (s32)r0;
 }
 

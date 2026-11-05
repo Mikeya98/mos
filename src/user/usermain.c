@@ -21,6 +21,7 @@
  *   u_iso_a    — 独立地址空间: 写自己的 0x08100000, 等 u_iso_b 跑完再读回
  *   u_iso_b    — 独立地址空间: 写同一虚拟地址, 两边互不影响
  *   u_fork     — fork + 写时复制: 父子共享页, 谁写谁复制
+ *   u_exec     — exec: 清空私有地址空间, 从新入口重新开始
  *   u_demand   — 按需分页: 数据页/栈页都是第一次访问才分配
  *   u_overflow — 写栈保护页 → 内核判定栈溢出, 杀掉任务
  *   u_swap     — 页框池耗尽 → 把页换出到 swap 区, 再读回来校验
@@ -503,6 +504,60 @@ static void USER_TEXT u_fork(void)
     usys_exit();
 }
 
+/* =========================== exec 演示 (v0.6 阶段9) =========================== */
+
+static const char msg_ex1[] USER_RODATA = "[user] u_exec  : before exec, data page = ";
+static const char msg_ex2[] USER_RODATA = "[user] u_exec  : exec -> u_exec_new (private pages reset)\n";
+static const char msg_ex3[] USER_RODATA = "[user] u_exec2 : after exec, data page = ";
+static const char msg_ex4[] USER_RODATA = "[user] u_exec2 : value is 0, old address space is gone\n";
+static const char msg_ex5[] USER_RODATA = "[user] u_exec2 : old value survived — exec FAILED\n";
+static const char msg_ex6[] USER_RODATA = "[user] u_exec2 : writing 0x33333333 to the new data page\n";
+static const char msg_ex7[] USER_RODATA = "[user] u_exec  : exec returned error ";
+
+/**
+ * exec 之后的新入口。
+ *
+ * 这个函数和 u_exec 在同一段用户代码里, 但它被调用时地址空间已经
+ * 重置过: 数据页是新的（全 0）, 用户栈也是新的。所以这里读到的
+ * 数据页必须是 0, 不是 u_exec 写进去的 0xAAAAAAAA。
+ */
+static void USER_TEXT u_exec_new(void)
+{
+    volatile u32 *slot = (volatile u32 *)(uintptr_t)USER_DATA_VADDR;
+
+    SAY(msg_ex3);
+    say_hex(msg_empty, *slot, msg_nl);
+
+    if (*slot == 0u) {
+        SAY(msg_ex4);
+    } else {
+        SAY(msg_ex5);
+    }
+
+    SAY(msg_ex6);
+    *slot = 0x33333333u;
+
+    usys_exit();
+}
+
+static void USER_TEXT u_exec(void)
+{
+    volatile u32 *slot = (volatile u32 *)(uintptr_t)USER_DATA_VADDR;
+    s32 rc;
+
+    *slot = 0xAAAAAAAAu;
+    SAY(msg_ex1);
+    say_hex(msg_empty, *slot, msg_nl);
+
+    SAY(msg_ex2);
+    rc = usys_exec((u32)(uintptr_t)u_exec_new);
+
+    /* 成功时不会返回到这里; 返回了就说明 exec 失败 */
+    SAY(msg_ex7);
+    say_hex(msg_empty, (u32)rc, msg_nl);
+    usys_exit();
+}
+
 /* =========================== 内核侧初始化 =========================== */
 
 extern u8 _user_text_start;
@@ -625,7 +680,7 @@ static void pool_manager(void)
 void user_demo_init(void)
 {
     printf("========================================\n");
-    printf("  User Mode Demo (v0.6 阶段8: swap + fork/COW)\n");
+    printf("  User Mode Demo (v0.6 阶段9: swap + fork/COW + exec)\n");
     printf("  user code : %X - %X (shared, read-only)\n",
            (u32)(uintptr_t)&_user_text_start,
            (u32)(uintptr_t)&_user_text_end);
@@ -652,11 +707,12 @@ void user_demo_init(void)
     if (!create_user("u_iso_a",   u_iso_a,   1)) return;
     if (!create_user("u_iso_b",   u_iso_b,   1)) return;
     if (!create_user("u_fork",    u_fork,    1)) return;
+    if (!create_user("u_exec",    u_exec,    1)) return;
     if (!create_user("u_demand",  u_demand,  1)) return;
     if (!create_user("u_overflow", u_overflow, 1)) return;
     if (!create_user("u_swap",    u_swap,    1)) return;
 
-    printf("\n[DEMO] 10 user tasks created, each with its own L1 page table\n");
+    printf("\n[DEMO] 11 user tasks created, each with its own L1 page table\n");
 
     /*
      * 回收演示的驱动任务: 内核态, 优先级 30 (只比 IDLE 高)。

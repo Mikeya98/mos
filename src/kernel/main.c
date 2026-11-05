@@ -370,7 +370,7 @@ void kernel_main(void)
     printf("\n");
     printf("========================================\n");
     printf("  MOS RTOS v0.6\n");
-    printf("  MMU + ASID + demand paging + swap + fork/COW\n");
+    printf("  MMU + ASID + demand paging + swap + fork/COW + exec\n");
     printf("========================================\n\n");
 
     mmu_init();

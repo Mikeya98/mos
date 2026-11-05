@@ -61,6 +61,17 @@ int user_space_create(user_space_t *us);
 int user_space_fork(user_space_t *child, const user_space_t *parent);
 
 /**
+ * @brief  清空一个用户地址空间的内容 (exec 用, v0.6 阶段9)
+ *
+ * 保留 L1/L2 页表和槽位, 把 L2 里映射过的页框、swap 槽全部释放,
+ * 然后按 ASID 刷 TLB。用户代码段 (0x08000000 的共享 section) 不
+ * 在 L2 里, 不受影响。
+ *
+ * @param  us  要重置的地址空间
+ */
+void user_space_reset(user_space_t *us);
+
+/**
  * @brief  归还一个用户地址空间
  *
  * 顺序:

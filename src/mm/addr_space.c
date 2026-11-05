@@ -213,6 +213,40 @@ int user_space_fork(user_space_t *child, const user_space_t *parent)
     return 0;
 }
 
+/* =========================== exec 重置 =========================== */
+
+void user_space_reset(user_space_t *us)
+{
+    u32 *l2;
+    u32 i;
+
+    if (!us || us->slot >= USER_SPACE_SLOTS) {
+        return;
+    }
+
+    l2 = (u32 *)(uintptr_t)us->l2_phys;
+
+    /* 先还 swap 槽, 再逐项还页框 */
+    swap_release_l2(us->l2_phys);
+
+    for (i = 0; i < 256u; i++) {
+        if (swap_pte_is(l2[i])) {
+            l2[i] = 0;
+            continue;
+        }
+        if ((l2[i] & 0x2u) != 0) {
+            frame_free(l2[i] & 0xFFFFF000u, 0);
+        }
+        l2[i] = 0;
+    }
+
+    /*
+     * 页表内容全变了, TLB 里可能还留着旧页的翻译。按 ASID 清一遍,
+     * 否则 exec 之后第一次访问用户栈可能命中旧映射。
+     */
+    mmu_flush_asid(us->asid);
+}
+
 /* =========================== 释放 =========================== */
 
 void user_space_destroy(user_space_t *us)

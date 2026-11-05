@@ -26,7 +26,11 @@
 #include "ipc/semaphore.h"
 #include "mm/mmu.h"
 #include "mm/vm.h"
+#include "mm/addr_space.h"
 #include "lib/printf.h"
+
+/* fork/exec 返回用户态共用的跳板 (sched_asm.S) */
+extern void fork_return_trampoline(void);
 
 /* =========================== 临界区宏 =========================== */
 #define ENTER_CRITICAL()  __asm__ volatile("CPSID i" ::: "memory", "cc")
@@ -39,7 +43,9 @@
 #define FRAME_R1        1
 #define FRAME_R2        2
 #define FRAME_R3        3
-#define FRAME_LR        13      /* r0-r12 之后的返回地址 (fork 需要) */
+#define FRAME_R4        4
+#define FRAME_R5        5
+#define FRAME_LR        13      /* r0-r12 之后的返回地址 (fork/exec 需要) */
 #define FRAME_COUNT     14      /* r0-r12 + lr */
 
 /* =========================== 用户态信号量表 =========================== */
@@ -263,6 +269,73 @@ void svc_dispatch(u32 svc_num, u32 *frame)
          */
         task_t *child = task_fork(get_current(), frame[FRAME_LR]);
         ret = child ? (int)child->pid : -ENOMEM;
+        break;
+    }
+
+    case SYS_EXEC: {
+        /*
+         * 简化版 exec (v0.6 阶段9):
+         *   - 只接受用户代码段内的入口地址 (0x08000000 - 0x080FFFFF)
+         *   - 清空当前任务的私有页表和 swap 槽, 保留地址空间槽位/L1
+         *   - 通过 fork_return_trampoline 回到用户态的新入口
+         *
+         * 地址空间重置后, 旧的数据页/栈页都没了, 新入口第一次访问
+         * 会自动缺页分配 —— 这正是"换了一个新程序"的效果。
+         */
+        task_t *cur = get_current();
+        u32 entry = frame[FRAME_R0];
+
+        if (!cur || !cur->is_user) {
+            ret = -EPERM;
+            break;
+        }
+        if (entry < USER_CODE_VADDR || entry >= USER_PRIV_VADDR ||
+            (entry & 3u) != 0) {
+            ret = -EINVAL;
+            break;
+        }
+
+        {
+            user_space_t us;
+            us.l1_phys = cur->l1_phys;
+            us.l2_phys = cur->l2_phys;
+            us.asid    = cur->asid;
+            us.slot    = cur->as_slot;
+            user_space_reset(&us);
+        }
+
+        cur->user_sp    = USER_STACK_TOP;
+        cur->pf_count   = 0;
+        cur->cow_count  = 0;
+        cur->vm_clock   = 0;
+        cur->swap_out   = 0;
+        cur->swap_in    = 0;
+        cur->entry      = (void (*)(void))(uintptr_t)entry;
+
+        /*
+         * 复用 fork 的返回跳板: POP 恢复 r4/r5/lr 之后,
+         * r4 = 新用户栈顶, r5 = 新入口, lr = 跳板。
+         */
+        frame[FRAME_R4] = USER_STACK_TOP;
+        frame[FRAME_R5] = entry;
+        frame[FRAME_LR] = (u32)(uintptr_t)fork_return_trampoline;
+
+        /*
+         * 关键: svc_handler 返回时执行 MOVS pc, lr, 会同时把 SPSR_svc
+         * 恢复到 CPSR。SPSR_svc 里现在是用户态的 CPSR, 直接返回会以
+         * USR 模式跳到跳板地址, 而跳板在内核区 —— 取指异常。
+         *
+         * 把 SPSR_svc 改成 SVC 模式, 让异常返回先留在 SVC 跑到跳板;
+         * 跳板再把 SPSR 设成 USR, 返回用户态的新入口。
+         */
+        {
+            u32 svc_mode = 0x13u;
+            __asm__ volatile ("MSR SPSR_cxsf, %0" :: "r"(svc_mode) : "memory");
+        }
+
+        printf("[EXEC] %s: new image at %X, private pages reset\n",
+               cur->name, entry);
+        ret = 0;
         break;
     }
 
