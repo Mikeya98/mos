@@ -204,15 +204,10 @@ int data_abort_handler(u32 fault_pc, u32 spsr_abt)
         }
     }
 
-    printf("[ABORT] killing user task, scheduler continues\n\n");
+    printf("[ABORT] terminating user task, scheduler continues\n\n");
 
-    task_kill(get_current());
-    schedule();
-
-    /* 不应该到这里: 被杀任务已经不在就绪队列里 */
-    while (1) {
-        __asm__ volatile ("WFI");
-    }
+    /* 用 SIGSEGV 风格的退出码, 有父进程的话它 wait 时能拿到 -11 */
+    task_exit(-11);
 }
 
 /**
@@ -231,12 +226,7 @@ void prefetch_abort_handler(u32 fault_pc, u32 spsr_abt)
         }
     }
 
-    printf("[ABORT] killing user task, scheduler continues\n\n");
+    printf("[ABORT] terminating user task, scheduler continues\n\n");
 
-    task_kill(get_current());
-    schedule();
-
-    while (1) {
-        __asm__ volatile ("WFI");
-    }
+    task_exit(-4);      /* SIGILL 风格的退出码 */
 }

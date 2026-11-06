@@ -58,6 +58,9 @@
 #if SYS_EXEC != 10
 #error "SVC immediate for SYS_EXEC is stale"
 #endif
+#if SYS_WAIT != 11
+#error "SVC immediate for SYS_WAIT is stale"
+#endif
 
 #define USYS_INLINE  static inline __attribute__((always_inline))
 
@@ -69,10 +72,10 @@ USYS_INLINE s32 usys_yield(void)
     return (s32)r0;
 }
 
-/** 结束当前任务, 永不返回 */
-USYS_INLINE __attribute__((noreturn)) void usys_exit(void)
+/** 结束当前任务 (code 会被父进程 wait 取走), 永不返回 */
+USYS_INLINE __attribute__((noreturn)) void usys_exit(s32 code)
 {
-    register u32 r0 __asm__("r0") = 0;
+    register u32 r0 __asm__("r0") = (u32)code;
     __asm__ volatile ("SVC #1" : "+r"(r0) : : "memory");
     /* 内核不会返回到这里; 万一返回也只是死循环, 不再碰用户态数据 */
     while (1) {
@@ -167,6 +170,20 @@ USYS_INLINE s32 usys_exec(u32 entry)
 {
     register u32 r0 __asm__("r0") = entry;
     __asm__ volatile ("SVC #10" : "+r"(r0) : : "memory");
+    return (s32)r0;
+}
+
+/**
+ * 等待子进程退出 (v0.6 阶段10)。
+ *
+ * pid=0 表示任意子进程。返回被回收的子进程 pid, 退出码写进 *code;
+ * 没有子进程返回 -ECHILD。子进程还活着时阻塞, 退出时被唤醒。
+ */
+USYS_INLINE s32 usys_wait(s32 pid, s32 *code)
+{
+    register u32 r0 __asm__("r0") = (u32)pid;
+    register u32 r1 __asm__("r1") = (u32)(uintptr_t)code;
+    __asm__ volatile ("SVC #11" : "+r"(r0) : "r"(r1) : "memory");
     return (s32)r0;
 }
 

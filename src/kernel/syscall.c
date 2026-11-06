@@ -227,9 +227,9 @@ void svc_dispatch(u32 svc_num, u32 *frame)
     case SYS_EXIT:
         /*
          * 不返回: task_exit 会杀掉当前任务并切到下一个。
-         * 它之后如果意外返回, 也只是在死任务的内核栈上空转。
+         * r0 是退出码, 父进程 wait 时能拿到。
          */
-        task_exit();
+        task_exit((s32)frame[FRAME_R0]);
         break;
 
     case SYS_WRITE:
@@ -269,6 +269,29 @@ void svc_dispatch(u32 svc_num, u32 *frame)
          */
         task_t *child = task_fork(get_current(), frame[FRAME_LR]);
         ret = child ? (int)child->pid : -ENOMEM;
+        break;
+    }
+
+    case SYS_WAIT: {
+        /*
+         * wait(pid, &code): pid=0 表示任意子进程。
+         * 可能阻塞 —— task_wait 内部会把自己移出就绪队列,
+         * 子进程退出时再唤醒重扫。
+         */
+        s32 code = 0;
+        s32 r = task_wait((s32)frame[FRAME_R0], &code);
+
+        if (r > 0) {
+            u32 ustatus = frame[FRAME_R1];
+
+            if (ustatus != 0) {
+                if (copy_to_user((void *)(uintptr_t)ustatus, &code,
+                                 (u32)sizeof(code)) < 0) {
+                    r = -EFAULT;
+                }
+            }
+        }
+        ret = r;
         break;
     }
 

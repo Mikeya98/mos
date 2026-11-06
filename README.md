@@ -28,7 +28,8 @@ MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 �
 - **fork + 写时复制**：`SYS_FORK` 复制当前用户任务，新建地址空间槽位；已映射的页父子共享同一个物理帧，两侧页表都改成用户只读，谁先写谁在缺页处理里复制一份私有副本（引用计数减到 1 时直接改回可写）。换出页复制独立的 swap 槽，互不影响；物理帧按引用计数回收
 - **每任务用户栈指针**：`SP_usr` 是 CPU 的 banked 寄存器，不随 TCB 自动切换。进入内核时把 `SP_usr` 存进 TCB，调度到某个用户任务之前再写回，避免任务切换后踩到上一个任务的用户栈
 - **exec（简化版）**：`SYS_EXEC` 清空当前任务的私有页表和 swap 槽、保留地址空间槽位与共享用户代码段，然后从用户代码段内的新入口重新开始；数据页和栈页在第一次访问时重新按需分配。异常返回前把 `SPSR_svc` 改成 SVC 模式，先在内核跳板里设置好 `SP_usr` 再回用户态
-- **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST / GET_TTBR0 / VM_STATS / FORK / EXEC`；`copy_from_user` / `copy_to_user` 先代用户补页，再走当前任务的页表检查用户指针（区分读/写权限）
+- **僵尸进程与 wait**：`SYS_EXIT` 带退出码，有父进程的任务退出后变成僵尸，TCB 留在任务表里等父进程 `SYS_WAIT` 取走；父进程可以阻塞等任意/指定子进程，子进程退出时被唤醒。僵尸状态的转换放在 `schedule()` 切换前完成，避免父进程在退出任务还踩着自己内核栈时就把它回收
+- **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST / GET_TTBR0 / VM_STATS / FORK / EXEC / WAIT`；`copy_from_user` / `copy_to_user` 先代用户补页，再走当前任务的页表检查用户指针（区分读/写权限）
 - **异常恢复**：捕获 Data Abort / Prefetch Abort，打印任务名、故障地址与 DFSR/DFAR，杀掉出错的用户任务后继续调度，系统不宕机
 
 ## 目录结构

@@ -11,6 +11,7 @@
  */
 
 #include "kernel/task.h"
+#include "kernel/syscall.h"      /* EINVAL / ECHILD, task_wait 用 */
 #include "lib/string.h"
 #include "lib/printf.h"
 #include "drivers/gic.h"        /* ENTER_CRITICAL / EXIT_CRITICAL */
@@ -85,6 +86,12 @@ static void reclaim_drain(void);
 
 /* 每任务 SP_usr 恢复 (实现在 fork 小节, schedule 里要提前调用) */
 static void task_restore_user_sp(task_t *t);
+
+/* v0.6 阶段10: 僵尸进程 / wait */
+static task_t *find_task_by_pid(u32 pid);
+static void task_unlink(task_t *t);
+static void task_release_space(task_t *t);
+static void task_free_zombie(task_t *t);
 
 /* =========================== 任务栈池 =========================== */
 /* 由 kernel.lds 提供的外部符号 */
@@ -438,6 +445,31 @@ void schedule(void)
     sched_active = 1;
 
     /*
+     * 退出中的任务在这里才变成真正的僵尸 (v0.6 阶段10)。
+     *
+     * task_exit 只标 TASK_EXITING: 那时候它还站在自己的内核栈上,
+     * 后面还有代码要跑。到了这一步, 马上就是 context_switch,
+     * 并且 sched_active 挡着所有重入, 父进程不可能提前回收它。
+     * 把唤醒父进程也放在这里, 父进程被选中之后才第一次看到
+     * 这个僵尸。
+     */
+    if (current_task->state == TASK_EXITING) {
+        task_t *parent = NULL;
+
+        if (current_task->forked_from != 0) {
+            parent = find_task_by_pid(current_task->forked_from);
+        }
+
+        current_task->state = TASK_ZOMBIE;
+
+        if (parent && parent->wait_active && parent->state == TASK_BLOCKED &&
+            (parent->wait_pid == 0 || parent->wait_pid == current_task->pid)) {
+            parent->wait_active = 0;
+            ready_enqueue(parent);
+        }
+    }
+
+    /*
      * 回收上一轮被杀掉的任务。
      * 这里已经不在它们的栈上了 (current_task 不是它们), 所以
      * 地址空间、内核栈、TCB 可以一起还回去。
@@ -632,6 +664,10 @@ void task_init(void)
     idle_tcb.l1_phys     = mmu_kernel_l1();
     idle_tcb.l2_phys     = 0;
     idle_tcb.pf_count    = 0;
+    idle_tcb.forked_from = 0;
+    idle_tcb.exit_code   = 0;
+    idle_tcb.wait_pid    = 0;
+    idle_tcb.wait_active = 0;
 
     /* IDLE 使用自己的静态栈 (512B, 8 字节对齐) */
     static u8 idle_stack[512] __attribute__((aligned(8)));
@@ -949,7 +985,7 @@ task_t *task_fork(task_t *parent, u32 user_pc)
 /* =========================== 任务终止 (v0.6 阶段3) =========================== */
 
 /**
- * @brief  杀死指定任务 — 只清理状态, 不触发调度
+ * @brief  杀死指定任务 (被 exception.c / task_exit 的孤儿路径调用)
  *
  * "杀死"在这里的意思是把任务从所有调度结构里摘掉:
  *   1. 从就绪队列移除 (RUNNING 任务也在队列里, 这是 MOS 的设计)
@@ -957,15 +993,21 @@ task_t *task_fork(task_t *parent, u32 user_pc)
  *   3. 从全局 TCB 列表移除, 避免 sys_tick_handler 再访问它
  *
  * 不释放 TCB 和内核栈: 被杀死任务的栈上此刻还躺着调用者的现场
- * (系统调用/异常处理帧), 必须等调度切走之后才能回收。演示版本先不做
- * 回收, 后续可以加一个 reaper 任务统一释放。
+ * (系统调用/异常处理帧), 必须等调度切走之后才能回收。自己杀自己
+ * 时挂进延迟回收队列, 由下一次 schedule() 里的 reclaim_drain 处理。
  */
 /**
- * @brief  真正释放任务的资源 (地址空间 / 内核栈 / TCB)
+ * @brief  释放任务占用的用户地址空间 (页表槽位 + 页框 + swap 槽)
  *
- * 只在"这个任务不在 CPU 上, 也不在自己栈上"的时候调用。
+ * 单独抽出来是因为僵尸进程只需要还地址空间: TCB 和内核栈要留给
+ * 父进程 wait 时取退出码, 取完才能释放。
+ *
+ * 释放过程要开关中断、还要刷 TLB, 中途被打断是正常的。如果
+ * 读完 as_valid 才去做释放, 中间任何一次重入都会看到"还有
+ * 地址空间", 同一份槽位就被释放两次。这里先原子地清零,
+ * 谁读到 0 谁就不管。
  */
-static void task_release(task_t *t)
+static void task_release_space(task_t *t)
 {
     user_space_t us;
     u32 valid;
@@ -974,14 +1016,6 @@ static void task_release(task_t *t)
         return;
     }
 
-    /*
-     * 先把地址空间"认领"下来再释放。
-     *
-     * 释放过程要开关中断、还要刷 TLB, 中途被打断是正常的。如果
-     * 读完 as_valid 才去做释放, 中间任何一次重入都会看到"还有
-     * 地址空间", 同一份槽位就被释放两次。这里先原子地清零,
-     * 谁读到 0 谁就不管。
-     */
     ENTER_CRITICAL();
     valid = t->as_valid;
     t->as_valid = 0;
@@ -991,18 +1025,91 @@ static void task_release(task_t *t)
     us.slot       = t->as_slot;
     EXIT_CRITICAL();
 
-    /* 1. 用户地址空间: 页表槽位 + L2 表里映射过的页框 */
     if (valid) {
         user_space_destroy(&us);
     }
+}
 
-    /* 2. 内核栈 */
+/**
+ * @brief  真正释放任务的资源 (地址空间 / 内核栈 / TCB)
+ *
+ * 只在"这个任务不在 CPU 上, 也不在自己栈上"的时候调用。
+ */
+static void task_release(task_t *t)
+{
+    if (!t || t == &idle_tcb) {
+        return;
+    }
+
+    task_release_space(t);
+
+    /* 内核栈 */
     if (t->stack_base) {
         stack_free((u8 *)(uintptr_t)t->stack_base, t->stack_size);
         t->stack_base = NULL;
     }
 
-    /* 3. TCB 本身 (从 slab 来的) */
+    /* TCB 本身 (从 slab 来的) */
+    slab_free(t);
+}
+
+/* =========================== 僵尸进程 / wait (v0.6 阶段10) =========================== */
+
+/*
+ * 父进程 wait 一个已经退出的子进程, 需要子进程的 exit_code。
+ * 子进程不能在自己的栈上把自己的 TCB 和内核栈 free 掉, 所以退出时
+ * 只标 TASK_EXITING; 真正变成 TASK_ZOMBIE 是 schedule() 切换前
+ * 那一步的事。TCB 留在 tcb_list 里, 由父进程取走退出码后再
+ * task_free_zombie 统一释放地址空间、内核栈和 TCB。
+ */
+
+static task_t *find_task_by_pid(u32 pid)
+{
+    u32 i;
+
+    for (i = 0; i < tcb_count; i++) {
+        if (tcb_list[i] && tcb_list[i]->pid == pid) {
+            return tcb_list[i];
+        }
+    }
+    return NULL;
+}
+
+static void task_unlink(task_t *t)
+{
+    u32 i;
+
+    for (i = 0; i < tcb_count; i++) {
+        if (tcb_list[i] == t) {
+            u32 j;
+            for (j = i; j + 1 < tcb_count; j++) {
+                tcb_list[j] = tcb_list[j + 1];
+            }
+            tcb_count--;
+            tcb_list[tcb_count] = NULL;
+            break;
+        }
+    }
+}
+
+static void task_free_zombie(task_t *t)
+{
+    if (!t || t == &idle_tcb) {
+        return;
+    }
+
+    /*
+     * 地址空间也在这里还, 而不是在 task_exit 里。
+     *
+     * 父进程能跑到这里, 说明僵尸已经被 context_switch 换下去过,
+     * 它那块内核栈不会再被碰。地址空间、栈、TCB 一起释放是安全的。
+     */
+    task_release_space(t);
+
+    if (t->stack_base) {
+        stack_free((u8 *)(uintptr_t)t->stack_base, t->stack_size);
+        t->stack_base = NULL;
+    }
     slab_free(t);
 }
 
@@ -1059,10 +1166,17 @@ static void reclaim_drain(void)
 
 void task_kill(task_t *t)
 {
-    u32 i;
     int self;
 
     if (!t || t == &idle_tcb || t->state == TASK_DEAD) {
+        return;
+    }
+
+    /*
+     * 僵尸的 TCB 归父进程 wait 处理。
+     * 这里再"杀"一次会把父进程手里的退出码抹掉。
+     */
+    if (t->state == TASK_ZOMBIE) {
         return;
     }
 
@@ -1075,17 +1189,7 @@ void task_kill(task_t *t)
     }
     t->state = TASK_DEAD;
 
-    for (i = 0; i < tcb_count; i++) {
-        if (tcb_list[i] == t) {
-            u32 j;
-            for (j = i; j + 1 < tcb_count; j++) {
-                tcb_list[j] = tcb_list[j + 1];
-            }
-            tcb_count--;
-            tcb_list[tcb_count] = NULL;
-            break;
-        }
-    }
+    task_unlink(t);
 
     /*
      * 自己杀自己: 现场还在自己的内核栈上, 不能当场回收。
@@ -1109,10 +1213,93 @@ void task_kill(task_t *t)
 
 /**
  * @brief  结束当前任务 (SYS_EXIT) — 永不返回
+ *
+ * 有父进程时变成僵尸: 地址空间当场还掉, TCB 和内核栈留着,
+ * 等父进程 wait 取走 exit_code 再释放。
+ * 没有父进程 (或父进程先退出了) 就和以前一样走延迟回收。
  */
-void task_exit(void)
+void task_exit(s32 code) __attribute__((noreturn));
+
+void task_exit(s32 code)
 {
-    task_kill(current_task);
+    task_t *self = current_task;
+    task_t *parent = NULL;
+
+    if (!self) {
+        while (1) {
+            __asm__ volatile("WFI");
+        }
+    }
+
+    self->exit_code = code;
+
+    ENTER_CRITICAL();
+
+    if (self->forked_from != 0) {
+        parent = find_task_by_pid(self->forked_from);
+    }
+
+    if (parent && parent != self) {
+        /*
+         * 只标成 TASK_EXITING, 不直接标 ZOMBIE。
+         *
+         * 这里还站在自己的内核栈上, 后面还要调 schedule()。如果现在
+         * 就是 ZOMBIE, 父进程被 tick 切上来 wait 一下就把 TCB 和
+         * 这块栈 free 了, 而本任务还在往里写 —— 实际表现是退出日志
+         * 时有时无、地址空间槽位漏回收。
+         *
+         * 改成 ZOMBIE + 唤醒父进程放在 schedule() 里做, 那一步紧挨着
+         * context_switch, 之前 sched_active 挡着所有重入。
+         */
+        printf("[EXIT] %s(pid %u) code=%d -> zombie, parent pid %u\n",
+               self->name, self->pid, code, self->forked_from);
+
+        if (self->state == TASK_READY || self->state == TASK_RUNNING) {
+            ready_dequeue(self);
+        }
+        self->state = TASK_EXITING;
+
+        EXIT_CRITICAL();
+        schedule();
+
+        while (1) {
+            __asm__ volatile("WFI");
+        }
+    }
+
+    EXIT_CRITICAL();
+
+    /*
+     * 孤儿进程: 先把它的僵尸子进程清掉, 再把还活着的子进程标记成
+     * 孤儿 (forked_from = 0), 它们以后退出时走延迟回收。
+     * 自己不能当场释放自己, 所以最后仍然交给 task_kill 的延迟队列。
+     */
+    for (;;) {
+        task_t *zombie = NULL;
+        u32 i;
+
+        ENTER_CRITICAL();
+        for (i = 0; i < tcb_count; i++) {
+            task_t *t = tcb_list[i];
+            if (!t || t->forked_from != self->pid) {
+                continue;
+            }
+            if (t->state == TASK_ZOMBIE) {
+                task_unlink(t);
+                zombie = t;
+                break;
+            }
+            t->forked_from = 0;
+        }
+        EXIT_CRITICAL();
+
+        if (!zombie) {
+            break;
+        }
+        task_free_zombie(zombie);
+    }
+
+    task_kill(self);
 
     /*
      * 切到下一个任务。current_task 已经被摘出就绪队列,
@@ -1123,5 +1310,92 @@ void task_exit(void)
 
     while (1) {
         __asm__ volatile("WFI");
+    }
+}
+
+/**
+ * @brief  等待子进程退出并取走退出码 (SYS_WAIT)
+ *
+ * 扫描 tcb_list 里 forked_from == 当前 pid 的任务:
+ *   - 有僵尸 → 回收, 返回它的 pid
+ *   - 有活的子进程 → 阻塞, 子进程退出时由 task_exit 唤醒
+ *   - 没有子进程 → -ECHILD
+ */
+s32 task_wait(s32 pid, s32 *code)
+{
+    task_t *cur = current_task;
+    u32 i;
+
+    if (!cur || pid < 0) {
+        return -EINVAL;
+    }
+
+    for (;;) {
+        task_t *zombie = NULL;
+        int any_child = 0;
+        int pid_match = 0;
+
+        ENTER_CRITICAL();
+
+        for (i = 0; i < tcb_count; i++) {
+            task_t *t = tcb_list[i];
+
+            if (!t || t->forked_from != cur->pid) {
+                continue;
+            }
+
+            any_child = 1;
+            if (pid > 0 && (u32)pid == t->pid) {
+                pid_match = 1;
+            }
+
+            if (!zombie && t->state == TASK_ZOMBIE &&
+                (pid == 0 || (u32)pid == t->pid)) {
+                zombie = t;
+            }
+        }
+
+        if (pid > 0 && !pid_match) {
+            cur->wait_active = 0;
+            cur->wait_pid = 0;
+            EXIT_CRITICAL();
+            return -ECHILD;
+        }
+
+        if (zombie) {
+            s32 c = zombie->exit_code;
+            u32 zpid = zombie->pid;
+
+            task_unlink(zombie);
+            zombie->state = TASK_DEAD;
+            cur->wait_active = 0;
+            cur->wait_pid = 0;
+            EXIT_CRITICAL();
+
+            if (code) {
+                *code = c;
+            }
+
+            printf("[WAIT] %s(pid %u) reaped child pid %u, exit code %d\n",
+                   cur->name, cur->pid, zpid, c);
+
+            task_free_zombie(zombie);
+            return (s32)zpid;
+        }
+
+        if (!any_child) {
+            cur->wait_active = 0;
+            cur->wait_pid = 0;
+            EXIT_CRITICAL();
+            return -ECHILD;
+        }
+
+        cur->wait_pid = (u32)pid;
+        cur->wait_active = 1;
+        cur->state = TASK_BLOCKED;
+        ready_dequeue(cur);
+        EXIT_CRITICAL();
+
+        schedule();
     }
 }

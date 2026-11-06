@@ -32,7 +32,8 @@
 #define SYS_VM_STATS    8       /* vm_stats(stat*) 取缺页/页框统计 */
 #define SYS_FORK        9       /* fork() 复制当前进程 (v0.6 阶段8) */
 #define SYS_EXEC        10      /* exec(entry) 重置地址空间并跳到新入口 (阶段9) */
-#define SYS_MAX         11
+#define SYS_WAIT        11      /* wait(pid, &code) 回收子进程 (阶段10) */
+#define SYS_MAX         12
 
 /* =========================== 错误码 =========================== */
 /* 采用 Linux 风格的负值返回, 用户态看到的是 -errno */
@@ -40,6 +41,7 @@
 #define EFAULT          14      /* 用户指针非法 */
 #define ENOMEM          12      /* 内存不足 (fork 地址空间/页框耗尽) */
 #define EPERM           1       /* 权限不足 */
+#define ECHILD          10      /* 没有这个子进程 (wait) */
 
 /* =========================== 用户地址范围 =========================== */
 /* 定义在 mm/mmu.h: 0x08000000 - 0x08111000 */

@@ -22,6 +22,7 @@
  *   u_iso_b    — 独立地址空间: 写同一虚拟地址, 两边互不影响
  *   u_fork     — fork + 写时复制: 父子共享页, 谁写谁复制
  *   u_exec     — exec: 清空私有地址空间, 从新入口重新开始
+ *   u_wait     — wait/僵尸: 子进程退出保留退出码, 父进程回收
  *   u_demand   — 按需分页: 数据页/栈页都是第一次访问才分配
  *   u_overflow — 写栈保护页 → 内核判定栈溢出, 杀掉任务
  *   u_swap     — 页框池耗尽 → 把页换出到 swap 区, 再读回来校验
@@ -142,7 +143,7 @@ static void USER_TEXT u_waiter(void)
     SAY(msg_wait);
     usys_sem_wait(0);       /* 阻塞: 内核把它从就绪队列摘掉 */
     SAY(msg_woken);
-    usys_exit();
+    usys_exit(0);
 }
 
 /**
@@ -174,7 +175,7 @@ static void USER_TEXT u_worker(void)
 
     usys_sem_post(0);       /* 唤醒 u_waiter */
     SAY(msg_work2);
-    usys_exit();
+    usys_exit(0);
 }
 
 /**
@@ -193,7 +194,7 @@ static void USER_TEXT u_fault(void)
     (void)value;
 
     SAY(msg_fault2);
-    usys_exit();
+    usys_exit(0);
 }
 
 /**
@@ -221,7 +222,7 @@ static void USER_TEXT u_badptr(void)
         SAY(msg_bad6);
     }
 
-    usys_exit();
+    usys_exit(0);
 }
 
 /**
@@ -247,7 +248,7 @@ static void USER_TEXT u_iso_a(void)
         SAY(msg_isa3);
     }
 
-    usys_exit();
+    usys_exit(0);
 }
 
 /**
@@ -269,7 +270,7 @@ static void USER_TEXT u_iso_b(void)
         SAY(msg_isb3);
     }
 
-    usys_exit();
+    usys_exit(0);
 }
 
 /**
@@ -331,7 +332,7 @@ static void USER_TEXT u_demand(void)
         SAY(msg_dm_er);
     }
 
-    usys_exit();
+    usys_exit(0);
 }
 
 /**
@@ -347,7 +348,7 @@ static void USER_TEXT u_overflow(void)
     SAY(msg_of1);
     *guard = 0xDEADBEEFu;       /* ← Data Abort, 保护页拒绝映射 */
     SAY(msg_of2);
-    usys_exit();
+    usys_exit(0);
 }
 
 /**
@@ -373,7 +374,7 @@ static void USER_TEXT u_swap(void)
 
     if (usys_vm_stats(&st) != 0) {
         SAY(msg_sw_err);
-        usys_exit();
+        usys_exit(0);
     }
 
     /*
@@ -422,7 +423,7 @@ static void USER_TEXT u_swap(void)
         SAY(msg_sw_err);
     }
 
-    usys_exit();
+    usys_exit(0);
 }
 
 /* =========================== fork + COW 演示 (v0.6 阶段8) =========================== */
@@ -477,12 +478,12 @@ static void USER_TEXT u_fork(void)
         }
 
         usys_sem_post(3);           /* 告诉父进程: 我改完退出了 */
-        usys_exit();
+        usys_exit(0);
     }
 
     if (child < 0) {
         SAY(msg_fk10);
-        usys_exit();
+        usys_exit(0);
     }
 
     /* ===== 父进程 ===== */
@@ -501,7 +502,7 @@ static void USER_TEXT u_fork(void)
         say_hex(msg_fk9, st.cow, msg_nl);
     }
 
-    usys_exit();
+    usys_exit(0);
 }
 
 /* =========================== exec 演示 (v0.6 阶段9) =========================== */
@@ -537,7 +538,7 @@ static void USER_TEXT u_exec_new(void)
     SAY(msg_ex6);
     *slot = 0x33333333u;
 
-    usys_exit();
+    usys_exit(0);
 }
 
 static void USER_TEXT u_exec(void)
@@ -555,7 +556,89 @@ static void USER_TEXT u_exec(void)
     /* 成功时不会返回到这里; 返回了就说明 exec 失败 */
     SAY(msg_ex7);
     say_hex(msg_empty, (u32)rc, msg_nl);
-    usys_exit();
+    usys_exit(0);
+}
+
+/* =========================== wait / 僵尸进程演示 (v0.6 阶段10) =========================== */
+
+static const char msg_wt1[] USER_RODATA = "[user] u_wait  : child A exiting with code 7\n";
+static const char msg_wt2[] USER_RODATA = "[user] u_wait  : parent blocks in wait(A) ...\n";
+static const char msg_wt3[] USER_RODATA = "[user] u_wait  : wait returned pid = ";
+static const char msg_wt4[] USER_RODATA = "[user] u_wait  : exit code = ";
+static const char msg_wt5[] USER_RODATA = "[user] u_wait  : WRONG result — wait/exit status FAILED\n";
+static const char msg_wt6[] USER_RODATA = "[user] u_wait  : child B exiting with code 9\n";
+static const char msg_wt7[] USER_RODATA = "[user] u_wait  : B already exited; wait(0) finds a zombie\n";
+static const char msg_wt8[] USER_RODATA = "[user] u_wait  : reaped pid = ";
+static const char msg_wt9[] USER_RODATA = "[user] u_wait  : fork FAILED\n";
+
+/**
+ * 僵尸进程 + wait 演示。
+ *
+ *   子进程 A: 退出码 7。父进程紧接着 wait, 先阻塞, A 退出时被唤醒,
+ *             此时 TCB 还在 (僵尸), wait 取走退出码后释放。
+ *   子进程 B: 退出码 9。父进程先 yield 让 B 跑完, B 变成僵尸挂在
+ *             那里; 父进程再 wait(0) 直接收尸。
+ *
+ * 两种路径覆盖了 wait 的两个分支: 阻塞等活的子进程, 以及回收已经
+ * 退出的僵尸。
+ */
+static void USER_TEXT u_wait(void)
+{
+    s32 child;
+    s32 r;
+    s32 code;
+
+    /* ---- 子进程 A: 父进程先 wait, 走阻塞唤醒 ---- */
+    child = usys_fork();
+
+    if (child == 0) {
+        SAY(msg_wt1);
+        usys_exit(7);
+    }
+    if (child < 0) {
+        SAY(msg_wt9);
+        usys_exit(0);
+    }
+
+    SAY(msg_wt2);
+    code = -1;
+    r = usys_wait(child, &code);
+
+    SAY(msg_wt3);
+    say_hex(msg_empty, (u32)r, msg_nl);
+    SAY(msg_wt4);
+    say_hex(msg_empty, (u32)code, msg_nl);
+    if (r != child || code != 7) {
+        SAY(msg_wt5);
+    }
+
+    /* ---- 子进程 B: 先退出变僵尸, 父进程再来收 ---- */
+    child = usys_fork();
+
+    if (child == 0) {
+        SAY(msg_wt6);
+        usys_exit(9);
+    }
+    if (child < 0) {
+        SAY(msg_wt9);
+        usys_exit(0);
+    }
+
+    usys_yield();              /* 让 B 先跑完退出 */
+
+    SAY(msg_wt7);
+    code = -1;
+    r = usys_wait(0, &code);   /* 0 = 任意子进程 */
+
+    SAY(msg_wt8);
+    say_hex(msg_empty, (u32)r, msg_nl);
+    SAY(msg_wt4);
+    say_hex(msg_empty, (u32)code, msg_nl);
+    if (code != 9) {
+        SAY(msg_wt5);
+    }
+
+    usys_exit(0);
 }
 
 /* =========================== 内核侧初始化 =========================== */
@@ -575,8 +658,8 @@ static task_t *create_user(const char *name, void (*entry)(void), u32 prio)
         return NULL;
     }
 
-    printf("[AS] %s slot=%u asid=%u L1=%X L2=%X (data/stack on demand)\n",
-           name, t->as_slot, t->asid, t->l1_phys, t->l2_phys);
+    printf("[AS] %s slot=%u asid=%u prio=%u L1=%X L2=%X (data/stack on demand)\n",
+           name, t->as_slot, t->asid, t->priority, t->l1_phys, t->l2_phys);
     return t;
 }
 
@@ -591,7 +674,7 @@ static const char msg_spawn[] USER_RODATA =
 static void USER_TEXT u_spawn(void)
 {
     usys_write(msg_spawn, (u32)(sizeof(msg_spawn) - 1));
-    usys_exit();
+    usys_exit(0);
 }
 
 /**
@@ -708,11 +791,17 @@ void user_demo_init(void)
     if (!create_user("u_iso_b",   u_iso_b,   1)) return;
     if (!create_user("u_fork",    u_fork,    1)) return;
     if (!create_user("u_exec",    u_exec,    1)) return;
+    /*
+     * u_wait 用优先级 2: 等前面 11 个 demo 都退出、槽位空出来之后
+     * 再跑。fork 需要一个新的地址空间槽位, 12 个任务同时活着的时候
+     * 槽位已经占满, 会直接拿到 -ENOMEM。
+     */
+    if (!create_user("u_wait",    u_wait,    2)) return;
     if (!create_user("u_demand",  u_demand,  1)) return;
     if (!create_user("u_overflow", u_overflow, 1)) return;
     if (!create_user("u_swap",    u_swap,    1)) return;
 
-    printf("\n[DEMO] 11 user tasks created, each with its own L1 page table\n");
+    printf("\n[DEMO] 12 user tasks created, each with its own L1 page table\n");
 
     /*
      * 回收演示的驱动任务: 内核态, 优先级 30 (只比 IDLE 高)。

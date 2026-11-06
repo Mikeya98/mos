@@ -27,7 +27,9 @@ typedef enum {
     TASK_RUNNING    = 1,   /* 运行: 正在占用 CPU (即 current) */
     TASK_BLOCKED    = 2,   /* 阻塞: 等待信号量/互斥量 */
     TASK_SLEEPING   = 3,   /* 睡眠: 等待超时唤醒 */
-    TASK_DEAD       = 4    /* 终止: 任务已退出 */
+    TASK_DEAD       = 4,   /* 终止: 任务已退出 */
+    TASK_ZOMBIE     = 5,   /* 僵尸: 已退出, 等父进程 wait 回收 (v0.6 阶段10) */
+    TASK_EXITING    = 6    /* 正在退出: 已经离开就绪队列, 但还站在自己的内核栈上 */
 } task_state_t;
 
 /* =========================== 任务控制块 =========================== */
@@ -100,6 +102,16 @@ typedef struct task_struct {
     u32             asid;
     u32             as_slot;
     u8              as_valid;
+
+    /* --- 进程退出 / wait (v0.6 阶段10) ---
+     * exit_code 在任务变成僵尸后由父进程取走。
+     * wait_pid / wait_active 描述父进程此刻在等谁:
+     *   wait_active=1 表示父进程正阻塞在 task_wait 上, 0 表示没有。
+     *   光看 wait_pid 不够 —— 阻塞在信号量上的任务 wait_pid 也是 0,
+     *   子进程退出时误唤醒会让父进程在 sem_wait 里凭空醒一次。 */
+    s32             exit_code;
+    u32             wait_pid;      /* 0 = 等任意子进程 */
+    u8              wait_active;
 
 } task_t;
 
@@ -234,14 +246,26 @@ void task_yield(void);
 /**
  * @brief  结束当前任务 (SYS_EXIT 的实现)
  *
- * 标记 TASK_DEAD, 移出就绪队列和全局 TCB 列表, 然后调度到下一个任务。
+ * 有父进程: 变成 TASK_ZOMBIE, 保留 TCB 和内核栈等父进程 wait 回收;
+ * 地址空间当场释放 (页表/页框/swap 槽已经不用了)。
+ * 没有父进程: 走延迟回收队列, 由调度器下次切换时释放。
+ *
  * 函数永不返回 — 当前任务的内核栈连同这次调用的现场一起被丢弃。
  *
- * v0.6 阶段5: 地址空间、内核栈、TCB 都会被回收。但当前任务正踩在
- * 自己的内核栈上, 不能当场释放 —— 先挂进延迟回收队列, 等调度切到
- * 别的任务之后再统一释放。
+ * @param  code  退出码, 父进程 wait 时取走
  */
-void task_exit(void);
+void task_exit(s32 code) __attribute__((noreturn));
+
+/**
+ * @brief  等待子进程退出并取走退出码 (SYS_WAIT 的实现)
+ *
+ * @param  pid   要等的子进程 pid, 0 = 任意子进程
+ * @param  code  输出参数, 子进程的退出码
+ * @return 被回收的子进程 pid; 没有子进程返回 -ECHILD
+ *
+ * 有僵尸子进程就直接回收; 没有就阻塞, 子进程退出时唤醒。
+ */
+s32 task_wait(s32 pid, s32 *code);
 
 /**
  * @brief  杀死指定任务 (异常处理用)
