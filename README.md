@@ -2,7 +2,7 @@
 
 [![Platform](https://img.shields.io/badge/platform-ARM%20Cortex--A9-blue)](https://github.com/Mikeya98/mos)
 [![Language](https://img.shields.io/badge/language-C%20%7C%20Assembly-orange)](https://github.com/Mikeya98/mos)
-[![Status](https://img.shields.io/badge/status-v0.6%20--%20exec-brightgreen)](https://github.com/Mikeya98/mos)
+[![Status](https://img.shields.io/badge/status-v0.6%20--%20wait-brightgreen)](https://github.com/Mikeya98/mos)
 [![QEMU](https://img.shields.io/badge/QEMU-verified-lightgrey)](https://github.com/Mikeya98/mos)
 
 MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 上，用 QEMU 仿真验证。每一行代码都是手写的，没有引用任何现成的 RTOS 内核代码。
