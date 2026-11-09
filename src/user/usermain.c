@@ -22,6 +22,7 @@
  *   u_iso_b    — 独立地址空间: 写同一虚拟地址, 两边互不影响
  *   u_fork     — fork + 写时复制: 父子共享页, 谁写谁复制
  *   u_exec     — exec: 清空私有地址空间, 从新入口重新开始
+ *   u_elf      — exec_elf: 从 RAM 盘读 ELF, 装进 0x09000000 执行
  *   u_wait     — wait/僵尸: 子进程退出保留退出码, 父进程回收
  *   u_demand   — 按需分页: 数据页/栈页都是第一次访问才分配
  *   u_overflow — 写栈保护页 → 内核判定栈溢出, 杀掉任务
@@ -559,6 +560,42 @@ static void USER_TEXT u_exec(void)
     usys_exit(0);
 }
 
+/* =========================== ELF 加载演示 (v0.6 阶段11) =========================== */
+
+static const char path_hello[] USER_RODATA = "/hello.elf";
+static const char path_missing[] USER_RODATA = "/missing.elf";
+static const char msg_elf0[] USER_RODATA = "[user] u_elf   : exec_elf(/missing.elf) should fail, old image stays alive\n";
+static const char msg_elf1[] USER_RODATA = "[user] u_elf   : exec_elf(/hello.elf) — real ELF from RAM disk\n";
+static const char msg_elf2[] USER_RODATA = "[user] u_elf   : exec_elf returned error ";
+static const char msg_elf3[] USER_RODATA = "[user] u_elf   : (the loaded image exits itself, we should not be here)\n";
+
+/**
+ * 从 RAM 盘加载独立编译的 /hello.elf。
+ *
+ * 这个任务本身的代码在共享的 .user_text 里; 加载成功后, 用户态
+ * PC 会跳到 0x09000000, 执行的是另一个编译器单元链接出来的镜像。
+ * 成功时 exec_elf 不返回, 所以后面的错误处理只有失败路径会走到。
+ */
+static void USER_TEXT u_elf(void)
+{
+    s32 rc;
+
+    SAY(msg_elf0);
+    rc = usys_exec_elf(path_missing);
+    if (rc < 0) {
+        SAY(msg_elf2);
+        say_hex(msg_empty, (u32)rc, msg_nl);
+    }
+
+    SAY(msg_elf1);
+    rc = usys_exec_elf(path_hello);
+
+    SAY(msg_elf2);
+    say_hex(msg_empty, (u32)rc, msg_nl);
+    SAY(msg_elf3);
+    usys_exit(0);
+}
+
 /* =========================== wait / 僵尸进程演示 (v0.6 阶段10) =========================== */
 
 static const char msg_wt1[] USER_RODATA = "[user] u_wait  : child A exiting with code 7\n";
@@ -791,6 +828,7 @@ void user_demo_init(void)
     if (!create_user("u_iso_b",   u_iso_b,   1)) return;
     if (!create_user("u_fork",    u_fork,    1)) return;
     if (!create_user("u_exec",    u_exec,    1)) return;
+    if (!create_user("u_elf",     u_elf,     1)) return;
     /*
      * u_wait 用优先级 2: 等前面 11 个 demo 都退出、槽位空出来之后
      * 再跑。fork 需要一个新的地址空间槽位, 12 个任务同时活着的时候

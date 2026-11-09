@@ -81,6 +81,7 @@ typedef struct task_struct {
      */
     u32             l1_phys;
     u32             l2_phys;
+    u32             l2_code_phys;   /* 程序区 (0x09000000) L2 表, 阶段11 */
     u32             pf_count;
 
     /* --- 页面换出 (v0.6 阶段7) ---

@@ -2,7 +2,7 @@
 
 [![Platform](https://img.shields.io/badge/platform-ARM%20Cortex--A9-blue)](https://github.com/Mikeya98/mos)
 [![Language](https://img.shields.io/badge/language-C%20%7C%20Assembly-orange)](https://github.com/Mikeya98/mos)
-[![Status](https://img.shields.io/badge/status-v0.6%20--%20wait-brightgreen)](https://github.com/Mikeya98/mos)
+[![Status](https://img.shields.io/badge/status-v0.6%20--%20elf%20loader-brightgreen)](https://github.com/Mikeya98/mos)
 [![QEMU](https://img.shields.io/badge/QEMU-verified-lightgrey)](https://github.com/Mikeya98/mos)
 
 MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 上，用 QEMU 仿真验证。每一行代码都是手写的，没有引用任何现成的 RTOS 内核代码。
@@ -28,8 +28,10 @@ MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 �
 - **fork + 写时复制**：`SYS_FORK` 复制当前用户任务，新建地址空间槽位；已映射的页父子共享同一个物理帧，两侧页表都改成用户只读，谁先写谁在缺页处理里复制一份私有副本（引用计数减到 1 时直接改回可写）。换出页复制独立的 swap 槽，互不影响；物理帧按引用计数回收
 - **每任务用户栈指针**：`SP_usr` 是 CPU 的 banked 寄存器，不随 TCB 自动切换。进入内核时把 `SP_usr` 存进 TCB，调度到某个用户任务之前再写回，避免任务切换后踩到上一个任务的用户栈
 - **exec（简化版）**：`SYS_EXEC` 清空当前任务的私有页表和 swap 槽、保留地址空间槽位与共享用户代码段，然后从用户代码段内的新入口重新开始；数据页和栈页在第一次访问时重新按需分配。异常返回前把 `SPSR_svc` 改成 SVC 模式，先在内核跳板里设置好 `SP_usr` 再回用户态
+- **真正的 ELF 加载**：`SYS_EXEC_ELF` 从 RAM 盘打开 `/hello.elf`，解析 ELF32 program header，把 PT_LOAD 段按 4KB 页装进任务的程序窗口 `0x09000000`，代码段映射成用户只读可执行、数据段映射成用户读写不可执行，`.bss` 自动清零。加载前先校验头部/段范围/页重叠并预分配页框，失败时旧程序保持完整；成功后旧数据页和栈全部释放，入口写回用户态 PC。演示程序由 Makefile 单独编译、打包成 C 数组嵌进内核、开机写进 RAM 盘，走的是完整的“打开文件 → 读取 → 解析”路径
+- **程序区与 fork**：每个地址空间多一张 `0x09000000` 的 L2 页表；fork 时程序页整帧复制（代码段只读、数据段通常一两页，比再维护一套 COW 路径简单）。演示里加载后的程序自己 fork 一次，子进程退出码 3 被父进程 wait 收回
 - **僵尸进程与 wait**：`SYS_EXIT` 带退出码，有父进程的任务退出后变成僵尸，TCB 留在任务表里等父进程 `SYS_WAIT` 取走；父进程可以阻塞等任意/指定子进程，子进程退出时被唤醒。僵尸状态的转换放在 `schedule()` 切换前完成，避免父进程在退出任务还踩着自己内核栈时就把它回收
-- **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST / GET_TTBR0 / VM_STATS / FORK / EXEC / WAIT`；`copy_from_user` / `copy_to_user` 先代用户补页，再走当前任务的页表检查用户指针（区分读/写权限）
+- **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST / GET_TTBR0 / VM_STATS / FORK / EXEC / WAIT / EXEC_ELF`；`copy_from_user` / `copy_to_user` 先代用户补页，再走当前任务的页表检查用户指针（区分读/写权限）
 - **异常恢复**：捕获 Data Abort / Prefetch Abort，打印任务名、故障地址与 DFSR/DFAR，杀掉出错的用户任务后继续调度，系统不宕机
 
 ## 目录结构
@@ -43,9 +45,11 @@ mos/
 │   │   ├── task.c              # TCB + 调度器 + 任务终止
 │   │   ├── syscall.c           # 系统调用表 + copy_from_user/copy_to_user
 │   │   ├── exception.c         # Data/Prefetch Abort → 杀任务并继续调度
+│   │   ├── elf_user.c          # 用户程序 ELF 加载器（段校验/预分配/映射）
 │   │   └── sched_asm.S         # 上下文切换 + 用户态 trampoline
 │   ├── user/
-│   │   └── usermain.c          # 用户态 demo 任务（.user_text 段）
+│   │   ├── usermain.c          # 用户态 demo 任务（.user_text 段）
+│   │   └── prog/hello.c        # 独立编译的用户程序（链接到 0x09000000）
 │   ├── drivers/
 │   │   ├── uart.c              # UART 驱动（Cadence / 16550）
 │   │   ├── gic.c               # GIC PL390 中断控制器

@@ -66,7 +66,8 @@ DRV_SRCS = $(SRC_DIR)/drivers/uart.c \
 KERNEL_SRCS = $(SRC_DIR)/kernel/main.c \
               $(SRC_DIR)/kernel/task.c \
               $(SRC_DIR)/kernel/syscall.c \
-              $(SRC_DIR)/kernel/exception.c
+              $(SRC_DIR)/kernel/exception.c \
+              $(SRC_DIR)/kernel/elf_user.c
 
 # 用户态代码 (编译到 .user_text, 链接到 0x08000000)
 USER_SRCS = $(SRC_DIR)/user/usermain.c
@@ -96,7 +97,13 @@ C_SRCS   = $(LIB_SRCS) $(DRV_SRCS) $(KERNEL_SRCS) $(IPC_SRCS) $(MM_SRCS) $(FS_SR
 # =========================== 目标文件 ===========================
 C_OBJS   = $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(C_SRCS))
 ASM_OBJS = $(patsubst $(SRC_DIR)/%.S, $(OBJ_DIR)/%.o, $(ASM_SRCS))
-ALL_OBJS = $(C_OBJS) $(ASM_OBJS)
+
+# 独立用户程序 (v0.6 阶段11): 单独链接成 ELF, 再打包成 C 数组嵌进内核
+USER_PROG_ELF  = $(BLD_DIR)/user_hello.elf
+USER_PROG_BLOB = $(BLD_DIR)/user_hello_blob.c
+USER_PROG_OBJ  = $(OBJ_DIR)/user_hello_blob.o
+
+ALL_OBJS = $(C_OBJS) $(ASM_OBJS) $(USER_PROG_OBJ)
 DEPS     = $(C_OBJS:.o=.d)
 
 # 头文件依赖: 改头文件后相关的 .o 会自动重编
@@ -119,6 +126,23 @@ $(TARGET): $(ALL_OBJS) kernel.lds
 	@$(CC) $(ARCH_FLAGS) -o $@ $(ALL_OBJS) $(LDFLAGS) -lgcc
 	@echo "  OBJCOPY $(TARGET_BIN)"
 	@$(OBJCOPY) -O binary $@ $(TARGET_BIN)
+
+# 独立用户程序 → ELF → C 数组 → .o
+$(USER_PROG_ELF): $(SRC_DIR)/user/prog/hello.c $(SRC_DIR)/user/prog/user.lds
+	@echo "  ULD     $@"
+	@$(CC) $(ARCH_FLAGS) -I$(INC_DIR) -ffreestanding -nostdlib \
+		-fno-builtin -fno-stack-protector -O2 -s \
+		-Wl,-T,$(SRC_DIR)/user/prog/user.lds \
+		-Wl,-z,max-page-size=0x1000 \
+		-o $@ $(SRC_DIR)/user/prog/hello.c
+
+$(USER_PROG_BLOB): $(USER_PROG_ELF) $(SRC_DIR)/user/prog/mkblob.py
+	@python $(SRC_DIR)/user/prog/mkblob.py $(USER_PROG_ELF) $@ user_hello_elf
+
+$(USER_PROG_OBJ): $(USER_PROG_BLOB)
+	@mkdir -p $(dir $@)
+	@echo "  CC      $<"
+	@$(CC) $(CFLAGS) -c -o $@ $<
 
 # 编译 C 文件
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c

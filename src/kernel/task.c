@@ -663,6 +663,7 @@ void task_init(void)
     idle_tcb.user_sp     = 0;
     idle_tcb.l1_phys     = mmu_kernel_l1();
     idle_tcb.l2_phys     = 0;
+    idle_tcb.l2_code_phys = 0;
     idle_tcb.pf_count    = 0;
     idle_tcb.forked_from = 0;
     idle_tcb.exit_code   = 0;
@@ -754,6 +755,7 @@ task_t *task_create(void (*entry)(void), const char *name,
     /* v0.6 阶段4/5: 内核态任务使用内核主页表 (ASID 0), 没有私有地址空间 */
     t->l1_phys     = mmu_kernel_l1();
     t->l2_phys     = 0;
+    t->l2_code_phys = 0;
     t->pf_count    = 0;
     t->asid        = 0;
     t->as_slot     = 0;
@@ -829,6 +831,7 @@ task_t *task_create_user(void (*entry)(void), const char *name,
 
     t->l1_phys    = as.l1_phys;
     t->l2_phys    = as.l2_phys;
+    t->l2_code_phys = as.l2_code_phys;
     t->pf_count   = 0;
     t->asid       = as.asid;
     t->as_slot    = as.slot;
@@ -899,6 +902,7 @@ task_t *task_fork(task_t *parent, u32 user_pc)
     /* 1. 复制地址空间: 已映射页共享并改成只读, swap 页复制槽 */
     parent_as.l1_phys = parent->l1_phys;
     parent_as.l2_phys = parent->l2_phys;
+    parent_as.l2_code_phys = parent->l2_code_phys;
     parent_as.asid    = parent->asid;
     parent_as.slot    = parent->as_slot;
 
@@ -943,6 +947,7 @@ task_t *task_fork(task_t *parent, u32 user_pc)
     child->user_sp  = parent->user_sp;
     child->l1_phys  = as.l1_phys;
     child->l2_phys  = as.l2_phys;
+    child->l2_code_phys = as.l2_code_phys;
     child->asid     = as.asid;
     child->as_slot  = as.slot;
     child->as_valid = 1;
@@ -1021,6 +1026,7 @@ static void task_release_space(task_t *t)
     t->as_valid = 0;
     us.l1_phys    = t->l1_phys;
     us.l2_phys    = t->l2_phys;
+    us.l2_code_phys = t->l2_code_phys;
     us.asid       = t->asid;
     us.slot       = t->as_slot;
     EXIT_CRITICAL();

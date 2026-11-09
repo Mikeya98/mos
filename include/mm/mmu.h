@@ -39,8 +39,17 @@
 #define USER_STACK_TOP      0x08200000u     /* 栈顶 = 私有区之外的第一页 */
 #define USER_STACK_MAX      (USER_STACK_TOP - USER_STACK_VADDR)  /* 1016KB */
 
+/* 0x09000000 起的 1MB 程序窗口 (v0.6 阶段11)
+ *
+ * 从文件系统加载的 ELF 链接在这个地址, 每个任务一张独立 L2 表.
+ * 0x08200000 - 0x08FFFFFF 是空洞, 任何访问都 fault。
+ */
+#define USER_PROG_VADDR     0x09000000u
+#define USER_PROG_LIMIT     0x09100000u
+#define USER_PROG_SIZE      (USER_PROG_LIMIT - USER_PROG_VADDR)
+
 #define USER_SPACE_BASE     USER_CODE_VADDR
-#define USER_SPACE_LIMIT    USER_STACK_TOP  /* 不含 */
+#define USER_SPACE_LIMIT    USER_PROG_LIMIT  /* 不含; 中间的空洞由逐页检查拒绝 */
 
 /* 与 kernel.lds 一致: 用户代码段的物理地址 */
 #define USER_CODE_PHYS      USER_CODE_VADDR
@@ -98,12 +107,14 @@ u32 mmu_kernel_l1(void);
  * @brief  用内核页表做模板, 建立一张用户 L1 页表
  *
  * 先整表复制内核页表 (保证内核映射完全一致), 再把
- * L1[129] (0x08100000) 换成指向私有 L2 表的粗页表描述符。
+ * L1[129] (0x08100000) 和 L1[144] (0x09000000) 换成指向
+ * 私有 L2 表 / 程序区 L2 表的粗页表描述符。
  *
- * @param  l1        L1 页表 (16KB 对齐)
- * @param  l2_phys   L2 表物理地址 (1KB 对齐)
+ * @param  l1           L1 页表 (16KB 对齐)
+ * @param  l2_phys      私有 L2 表物理地址 (1KB 对齐)
+ * @param  l2_code_phys 程序区 L2 表物理地址 (1KB 对齐)
  */
-void mmu_build_user_l1(u32 *l1, u32 l2_phys);
+void mmu_build_user_l1(u32 *l1, u32 l2_phys, u32 l2_code_phys);
 
 /**
  * @brief  初始化用户 L2 表: 全部 fault

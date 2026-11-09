@@ -123,14 +123,25 @@ SECTIONS
      * 链接器会按输入段的对齐 (4 字节) 放, 结果页表没对齐, TTBR0 一换就飞。 */
     .l1_pool (NOLOAD) : ALIGN(16384) {
         _l1_pool_start = .;
-        . += 0x30000;           /* 12 × 16KB L1 页表 */
+        . += 0x34000;           /* 13 × 16KB L1 页表 */
         _l1_pool_end = .;
     } > DDR
 
     .l2_pool (NOLOAD) : ALIGN(1024) {
         _l2_pool_start = .;
-        . += 0x3000;            /* 12 × 1KB L2 页表 */
+        . += 0x3400;            /* 13 × 1KB L2 页表 */
         _l2_pool_end = .;
+    } > DDR
+
+    /* 程序区 L2 页表池 (v0.6 阶段11)
+     *
+     * 每个任务的 0x09000000 起的 1MB 程序窗口需要一张独立的 L2 表。
+     * ELF 加载器把 PT_LOAD 段按 4KB 页映射到这张表里。
+     */
+    .l2_code_pool (NOLOAD) : ALIGN(1024) {
+        _l2_code_pool_start = .;
+        . += 0x3400;            /* 13 × 1KB */
+        _l2_code_pool_end = .;
     } > DDR
 
     /* 物理页框池 (v0.6 阶段6 按需分页)

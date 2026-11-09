@@ -61,6 +61,9 @@
 #if SYS_WAIT != 11
 #error "SVC immediate for SYS_WAIT is stale"
 #endif
+#if SYS_EXEC_ELF != 12
+#error "SVC immediate for SYS_EXEC_ELF is stale"
+#endif
 
 #define USYS_INLINE  static inline __attribute__((always_inline))
 
@@ -184,6 +187,20 @@ USYS_INLINE s32 usys_wait(s32 pid, s32 *code)
     register u32 r0 __asm__("r0") = (u32)pid;
     register u32 r1 __asm__("r1") = (u32)(uintptr_t)code;
     __asm__ volatile ("SVC #11" : "+r"(r0) : "r"(r1) : "memory");
+    return (s32)r0;
+}
+
+/**
+ * 从文件系统加载一个 ELF 并执行 (v0.6 阶段11)。
+ *
+ * path 是用户内存里的 NUL 结尾字符串。成功时不返回, 当前任务从
+ * ELF 的 e_entry 开始执行, 旧程序的数据页/程序页全部释放;
+ * 失败返回负错误码, 旧程序仍然完整。
+ */
+USYS_INLINE s32 usys_exec_elf(const char *path)
+{
+    register u32 r0 __asm__("r0") = (u32)(uintptr_t)path;
+    __asm__ volatile ("SVC #12" : "+r"(r0) : : "memory");
     return (s32)r0;
 }
 

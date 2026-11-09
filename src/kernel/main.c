@@ -227,6 +227,10 @@ static void slab_demo(void)
  * Filesystem demo — 在 buddy + slab demo 之后运行。
  * 测试: RAM 盘创建 → 格式化 → 挂载 → 文件 CRUD → 目录遍历。
  */
+/* 用户程序 ELF 由 Makefile 打包成 C 数组 (v0.6 阶段11) */
+extern const unsigned char user_hello_elf[];
+extern const unsigned int  user_hello_elf_len;
+
 static void fs_demo(void)
 {
     block_dev_t *ramdisk;
@@ -264,6 +268,17 @@ static void fs_demo(void)
         return;
     }
     printf("[PASS]  mos_mount — filesystem mounted\n\n");
+
+    /* 3b. 把独立编译的用户程序 ELF 写进 RAM 盘 (阶段11)。
+     *     SYS_EXEC_ELF 之后会像读普通文件一样把它读出来加载。 */
+    fd = mos_open("/hello.elf", O_RDWR | O_CREAT);
+    if (fd >= 0) {
+        result = mos_write(fd, user_hello_elf, user_hello_elf_len);
+        printf("[WRITE] /hello.elf — %d bytes (user program ELF)\n", result);
+        mos_close(fd);
+    } else {
+        printf("[WARN]  cannot create /hello.elf\n");
+    }
 
     /* 4. 创建并写入文件 */
     printf("--- File create & write ---\n");
@@ -370,7 +385,7 @@ void kernel_main(void)
     printf("\n");
     printf("========================================\n");
     printf("  MOS RTOS v0.6\n");
-    printf("  MMU + ASID + demand paging + swap + fork/COW + exec\n");
+    printf("  MMU + ASID + demand paging + swap + fork/COW + exec + ELF load\n");
     printf("========================================\n\n");
 
     mmu_init();

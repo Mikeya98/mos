@@ -23,10 +23,12 @@
 
 #include "kernel/syscall.h"
 #include "kernel/task.h"
+#include "kernel/elf_user.h"
 #include "ipc/semaphore.h"
 #include "mm/mmu.h"
 #include "mm/vm.h"
 #include "mm/addr_space.h"
+#include "fs/vfs.h"
 #include "lib/printf.h"
 
 /* fork/exec 返回用户态共用的跳板 (sched_asm.S) */
@@ -55,6 +57,11 @@ extern void fork_return_trampoline(void);
 
 static sem_t user_sems[SYS_SEM_MAX];
 static u8    user_sem_used[SYS_SEM_MAX];
+
+/* exec_elf 的临时镜像缓冲。32KB 足够放演示程序; 以后接真实文件系统
+ * 时应该改成先 mmap 文件页, 而不是整文件读进内核。 */
+#define ELF_IMAGE_MAX   (32u * 1024u)
+static u8 elf_image[ELF_IMAGE_MAX];
 
 /* =========================== 指针校验 =========================== */
 
@@ -358,6 +365,116 @@ void svc_dispatch(u32 svc_num, u32 *frame)
 
         printf("[EXEC] %s: new image at %X, private pages reset\n",
                cur->name, entry);
+        ret = 0;
+        break;
+    }
+
+    case SYS_EXEC_ELF: {
+        /*
+         * 从文件系统加载一个独立编译的 ELF (v0.6 阶段11)。
+         *
+         * 路径字符串在用户内存里, 逐字节拷贝到内核缓冲 —— 用户
+         * 字符串通常只有十几字节, 按固定长度 copy_from_user 会越过
+         * 字符串尾部踩到别的页, 反而误判 EFAULT。
+         */
+        task_t *cur = get_current();
+        char path[64];
+        u32 i;
+        int terminated = 0;
+        int fd, fsize, got;
+        user_space_t us;
+        u32 entry = 0;
+        int rc;
+
+        if (!cur || !cur->is_user) {
+            ret = -EPERM;
+            break;
+        }
+
+        for (i = 0; i < sizeof(path) - 1u; i++) {
+            char c;
+            if (copy_from_user(&c,
+                               (const void *)(uintptr_t)(frame[FRAME_R0] + i),
+                               1) < 0) {
+                ret = -EFAULT;
+                break;
+            }
+            path[i] = c;
+            if (c == '\0') {
+                terminated = 1;
+                break;
+            }
+        }
+        if (ret < 0) {
+            break;
+        }
+        if (!terminated) {
+            ret = -EINVAL;
+            break;
+        }
+
+        fd = mos_open(path, O_RDONLY);
+        if (fd < 0) {
+            printf("[EXEC] %s: open %s failed\n", cur->name, path);
+            ret = -ENOENT;
+            break;
+        }
+        fsize = mos_filesize(fd);
+        if (fsize <= 0 || (u32)fsize > ELF_IMAGE_MAX) {
+            printf("[EXEC] %s: %s bad size %d\n", cur->name, path, fsize);
+            mos_close(fd);
+            ret = -ENOEXEC;
+            break;
+        }
+
+        got = 0;
+        while (got < fsize) {
+            int n = mos_read(fd, elf_image + got, (u32)(fsize - got));
+            if (n <= 0) {
+                break;
+            }
+            got += n;
+        }
+        mos_close(fd);
+        if (got != fsize) {
+            printf("[EXEC] %s: short read %d/%d\n", cur->name, got, fsize);
+            ret = -ENOEXEC;
+            break;
+        }
+
+        us.l1_phys      = cur->l1_phys;
+        us.l2_phys      = cur->l2_phys;
+        us.l2_code_phys = cur->l2_code_phys;
+        us.asid         = cur->asid;
+        us.slot         = cur->as_slot;
+
+        rc = user_elf_load(&us, elf_image, (u32)fsize, &entry);
+        if (rc != ELF_USER_OK) {
+            printf("[EXEC] %s: load %s failed (%d), old image kept\n",
+                   cur->name, path, rc);
+            ret = (rc == ELF_USER_ENOMEM) ? -ENOMEM : -ENOEXEC;
+            break;
+        }
+
+        cur->user_sp    = USER_STACK_TOP;
+        cur->entry      = (void (*)(void))(uintptr_t)entry;
+        cur->pf_count   = 0;
+        cur->cow_count  = 0;
+        cur->vm_clock   = 0;
+        cur->swap_out   = 0;
+        cur->swap_in    = 0;
+
+        /* 和 SYS_EXEC 一样, 复用 fork 跳板回到用户态的新入口 */
+        frame[FRAME_R4] = USER_STACK_TOP;
+        frame[FRAME_R5] = entry;
+        frame[FRAME_LR] = (u32)(uintptr_t)fork_return_trampoline;
+        {
+            u32 svc_mode = 0x13u;
+            __asm__ volatile ("MSR SPSR_cxsf, %0" :: "r"(svc_mode) : "memory");
+        }
+
+        printf("[EXEC] %s: %s loaded from filesystem, entry %X\n",
+               cur->name, path, entry);
         ret = 0;
         break;
     }

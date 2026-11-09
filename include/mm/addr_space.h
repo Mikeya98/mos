@@ -26,13 +26,14 @@
 #include "lib/types.h"
 
 /* 静态池的槽位数量, 与 kernel.lds 里的池大小一致
- * 阶段7 增加了 u_swap 演示任务, 从 8 扩到 12, 给并发任务留余量。 */
-#define USER_SPACE_SLOTS    12
+ * 阶段7 增加了 u_swap 演示任务, 从 8 扩到 12; 阶段11 又加了 u_elf, 扩到 13。 */
+#define USER_SPACE_SLOTS    13
 
 /* 一个用户地址空间的物理资源 */
 typedef struct {
     u32 l1_phys;        /* L1 页表物理地址 */
-    u32 l2_phys;        /* L2 页表物理地址 */
+    u32 l2_phys;        /* 私有区 L2 页表物理地址 */
+    u32 l2_code_phys;   /* 程序区 L2 页表物理地址 (0x09000000) */
     u32 asid;           /* 地址空间编号 (1..USER_SPACE_SLOTS) */
     u32 slot;           /* 池槽位 (0..USER_SPACE_SLOTS-1) */
 } user_space_t;
@@ -92,6 +93,11 @@ u32 user_space_free_count(void);
  * @brief  这个地址空间映射了几页 (调试/演示用)
  */
 u32 user_space_page_count(const user_space_t *us);
+
+/**
+ * @brief  程序区 (0x09000000) 映射了几页 (ELF 加载器用)
+ */
+u32 user_space_prog_pages(const user_space_t *us);
 
 /**
  * @brief  打印地址空间的关键映射 (启动时调试用)

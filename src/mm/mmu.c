@@ -38,6 +38,7 @@ extern u32 _mmu_table_base;
 
 #define USER_CODE_SEC   128u         /* 0x08000000 */
 #define USER_PRIV_SEC   129u         /* 0x08100000 */
+#define USER_PROG_SEC   144u         /* 0x09000000 */
 
 /* DACR: 域 0 设为 client (0b01), 页表 AP 位才生效 */
 #define DACR_DOMAIN0_CLIENT  0x1u
@@ -182,7 +183,7 @@ u32 mmu_kernel_l1(void)
 
 /* =========================== 用户页表 =========================== */
 
-void mmu_build_user_l1(u32 *l1, u32 l2_phys)
+void mmu_build_user_l1(u32 *l1, u32 l2_phys, u32 l2_code_phys)
 {
     const u32 *master = &_mmu_table_base;
     u32 i;
@@ -201,6 +202,7 @@ void mmu_build_user_l1(u32 *l1, u32 l2_phys)
     }
 
     l1[USER_PRIV_SEC] = (l2_phys & 0xFFFFFC00u) | L1_COARSE_TABLE;
+    l1[USER_PROG_SEC] = (l2_code_phys & 0xFFFFFC00u) | L1_COARSE_TABLE;
 
     mmu_dsb();
 }

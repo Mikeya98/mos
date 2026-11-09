@@ -19,12 +19,15 @@
 #include "mm/swap.h"
 #include "kernel/task.h"
 #include "lib/printf.h"
+#include "lib/string.h"
 
 /* =========================== 链接脚本符号 =========================== */
 extern u8 _l1_pool_start;
 extern u8 _l1_pool_end;
 extern u8 _l2_pool_start;
 extern u8 _l2_pool_end;
+extern u8 _l2_code_pool_start;
+extern u8 _l2_code_pool_end;
 
 /* =========================== 槽位位图 =========================== */
 /* bit i = 1 表示槽位 i 已被占用 */
@@ -62,6 +65,11 @@ static u8 *l2_of(u32 slot)
     return &_l2_pool_start + slot * 0x400u;
 }
 
+static u8 *l2_code_of(u32 slot)
+{
+    return &_l2_code_pool_start + slot * 0x400u;
+}
+
 static u32 free_count(void)
 {
     u32 i;
@@ -83,6 +91,7 @@ int user_space_create(user_space_t *us)
     u32 cpsr;
     u8 *l1;
     u8 *l2;
+    u8 *l2c;
 
     if (!us) return -1;
 
@@ -103,7 +112,8 @@ int user_space_create(user_space_t *us)
 
     /* 顺手确认池子的大小和槽位数对得上, 链接脚本改错了能早点发现 */
     if (l1_of(slot) + 0x4000u > &_l1_pool_end ||
-        l2_of(slot) + 0x400u  > &_l2_pool_end) {
+        l2_of(slot) + 0x400u  > &_l2_pool_end ||
+        l2_code_of(slot) + 0x400u > &_l2_code_pool_end) {
         cpsr = irq_lock();          /* 占住的位要还回去 */
         slot_used &= ~(1u << slot);
         irq_unlock(cpsr);
@@ -113,12 +123,14 @@ int user_space_create(user_space_t *us)
 
     l1 = l1_of(slot);
     l2 = l2_of(slot);
+    l2c = l2_code_of(slot);
 
     /* 2. ASID = 槽位号 + 1 */
-    us->slot    = slot;
-    us->asid    = slot + 1u;
-    us->l1_phys = (u32)(uintptr_t)l1;
-    us->l2_phys = (u32)(uintptr_t)l2;
+    us->slot         = slot;
+    us->asid         = slot + 1u;
+    us->l1_phys      = (u32)(uintptr_t)l1;
+    us->l2_phys      = (u32)(uintptr_t)l2;
+    us->l2_code_phys = (u32)(uintptr_t)l2c;
 
     /*
      * 3. 清掉这个 ASID 可能残留的 TLB 项。
@@ -129,9 +141,10 @@ int user_space_create(user_space_t *us)
      */
     mmu_flush_asid(us->asid);
 
-    /* 4. 填页表: L1 复制内核模板 + 指向本任务的 L2, L2 全 fault */
-    mmu_build_user_l1((u32 *)(uintptr_t)l1, us->l2_phys);
+    /* 4. 填页表: L1 复制内核模板 + 指向本任务的两张 L2, 两张 L2 全 fault */
+    mmu_build_user_l1((u32 *)(uintptr_t)l1, us->l2_phys, us->l2_code_phys);
     mmu_build_user_l2((u32 *)(uintptr_t)l2);
+    mmu_build_user_l2((u32 *)(uintptr_t)l2c);
 
     return 0;
 }
@@ -205,6 +218,33 @@ int user_space_fork(user_space_t *child, const user_space_t *parent)
         shared++;
     }
 
+    /*
+     * 程序区 (0x09000000) 的页不参与写时复制。
+     * ELF 的代码段本来就是只读的, 数据段通常也只有一两页; 整帧复制
+     * 比再维护一套"程序区 COW"划算, 也不用改 vm_fault 的区域判断。
+     */
+    if (parent->l2_code_phys) {
+        const u32 *pl2c = (const u32 *)(uintptr_t)parent->l2_code_phys;
+        u32 *cl2c = (u32 *)(uintptr_t)as.l2_code_phys;
+
+        for (i = 0; i < 256u; i++) {
+            u32 ctec = pl2c[i];
+
+            if ((ctec & 0x2u) == 0) {
+                continue;
+            }
+            phys = frame_alloc(0);
+            if (phys == 0) {
+                user_space_destroy(&as);
+                return -1;
+            }
+            memcpy((void *)(uintptr_t)phys,
+                   (const void *)(uintptr_t)(ctec & 0xFFFFF000u),
+                   FRAME_SIZE);
+            cl2c[i] = phys | (ctec & 0xFFFu);
+        }
+    }
+
     mmu_flush_asid(parent->asid);
 
     *child = as;
@@ -218,6 +258,7 @@ int user_space_fork(user_space_t *child, const user_space_t *parent)
 void user_space_reset(user_space_t *us)
 {
     u32 *l2;
+    u32 *l2c;
     u32 i;
 
     if (!us || us->slot >= USER_SPACE_SLOTS) {
@@ -225,6 +266,7 @@ void user_space_reset(user_space_t *us)
     }
 
     l2 = (u32 *)(uintptr_t)us->l2_phys;
+    l2c = (u32 *)(uintptr_t)us->l2_code_phys;
 
     /* 先还 swap 槽, 再逐项还页框 */
     swap_release_l2(us->l2_phys);
@@ -238,6 +280,14 @@ void user_space_reset(user_space_t *us)
             frame_free(l2[i] & 0xFFFFF000u, 0);
         }
         l2[i] = 0;
+    }
+
+    /* 程序区: 所有页都是常驻的, 没有 swap */
+    for (i = 0; i < 256u; i++) {
+        if ((l2c[i] & 0x2u) != 0) {
+            frame_free(l2c[i] & 0xFFFFF000u, 0);
+        }
+        l2c[i] = 0;
     }
 
     /*
@@ -255,7 +305,9 @@ void user_space_destroy(user_space_t *us)
     u32 slot;
     u32 asid;
     u32 l2_phys;
+    u32 l2c_phys;
     const u32 *l2;
+    const u32 *l2c;
     u32 i;
     u32 freed = 0;
 
@@ -266,8 +318,9 @@ void user_space_destroy(user_space_t *us)
     /* 检查 + 清位必须在一个原子区间里, 否则和 create 的 |= 打架 */
     cpsr = irq_lock();
     slot    = us->slot;
-    asid    = us->asid;
-    l2_phys = us->l2_phys;
+    asid     = us->asid;
+    l2_phys  = us->l2_phys;
+    l2c_phys = us->l2_code_phys;
     if ((slot_used & (1u << slot)) == 0) {
         irq_unlock(cpsr);
         return;                     /* 已经还过了 */
@@ -311,6 +364,15 @@ void user_space_destroy(user_space_t *us)
         }
     }
 
+    /* 程序区页表: 每页都是常驻帧 */
+    l2c = (const u32 *)(uintptr_t)l2c_phys;
+    for (i = 0; i < 256u; i++) {
+        if ((l2c[i] & 0x2u) != 0) {
+            frame_free(l2c[i] & 0xFFFFF000u, 0);
+            freed++;
+        }
+    }
+
     if (freed > 0) {
         printf("[AS] slot %u (asid %u): reclaimed %u page frames\n",
                slot, asid, freed);
@@ -342,18 +404,38 @@ u32 user_space_page_count(const user_space_t *us)
     return n;
 }
 
+u32 user_space_prog_pages(const user_space_t *us)
+{
+    const u32 *l2c;
+    u32 i;
+    u32 n = 0;
+
+    if (!us || us->l2_code_phys == 0) {
+        return 0;
+    }
+    l2c = (const u32 *)(uintptr_t)us->l2_code_phys;
+    for (i = 0; i < 256u; i++) {
+        if ((l2c[i] & 0x2u) != 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
 void user_space_dump(const user_space_t *us, const char *name)
 {
     const u32 *l1 = (const u32 *)(uintptr_t)us->l1_phys;
     const u32 *l2 = (const u32 *)(uintptr_t)us->l2_phys;
 
     printf("[AS] %s (slot %u, asid %u)\n", name, us->slot, us->asid);
-    printf("     L1 @ %X  L2 @ %X\n", us->l1_phys, us->l2_phys);
+    printf("     L1 @ %X  L2 @ %X  L2(code) @ %X\n",
+           us->l1_phys, us->l2_phys, us->l2_code_phys);
     printf("     L1[%u] (0x08100000) -> %X (coarse table)\n",
            (u32)(USER_PRIV_VADDR >> 20), l1[USER_PRIV_VADDR >> 20]);
     printf("     L2[0] (data ) -> %X\n", l2[0]);
     printf("     L2[1] (guard) -> %X (must stay 0)\n", l2[1]);
     printf("     L2[2] (stack) -> %X\n", l2[2]);
-    printf("     mapped pages: %u\n", user_space_page_count(us));
+    printf("     mapped pages: %u (private) + %u (program)\n",
+           user_space_page_count(us), user_space_prog_pages(us));
     printf("     free slots: %u / %u\n", free_count(), USER_SPACE_SLOTS);
 }

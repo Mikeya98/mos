@@ -33,7 +33,8 @@
 #define SYS_FORK        9       /* fork() 复制当前进程 (v0.6 阶段8) */
 #define SYS_EXEC        10      /* exec(entry) 重置地址空间并跳到新入口 (阶段9) */
 #define SYS_WAIT        11      /* wait(pid, &code) 回收子进程 (阶段10) */
-#define SYS_MAX         12
+#define SYS_EXEC_ELF    12      /* exec_elf(path) 从文件系统加载 ELF (阶段11) */
+#define SYS_MAX         13
 
 /* =========================== 错误码 =========================== */
 /* 采用 Linux 风格的负值返回, 用户态看到的是 -errno */
@@ -41,6 +42,8 @@
 #define EFAULT          14      /* 用户指针非法 */
 #define ENOMEM          12      /* 内存不足 (fork 地址空间/页框耗尽) */
 #define EPERM           1       /* 权限不足 */
+#define ENOENT          2       /* 文件不存在 */
+#define ENOEXEC         8       /* 不是可加载的可执行文件 */
 #define ECHILD          10      /* 没有这个子进程 (wait) */
 
 /* =========================== 用户地址范围 =========================== */
