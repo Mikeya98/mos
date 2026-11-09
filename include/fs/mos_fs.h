@@ -11,7 +11,8 @@
  * 设计要点:
  *   - inode 0 固定为根目录
  *   - 文件名最长 28 字符, 单层目录结构
- *   - 10 个直接块指针, 最大文件 10 × 512 = 5KB
+ *   - 10 个直接块指针 + 1 个一级间接块 (128 个指针)
+ *   - 最大文件 (10 + 128) × 512 = 69KB, 受 RAM 盘容量限制
  *   - 目录内容是 dirent 数组, 以 inode_num=0 标记空项
  */
 
@@ -28,7 +29,9 @@
 #define MOS_FS_MAX_INODES   16          /* 最大 inode 数 */
 #define MOS_FS_INODES_PER_BLOCK  8      /* 每块 8 个 inode (512/64) */
 #define MOS_FS_DIRECT_BLOCKS 10        /* 直接块指针数 */
-#define MOS_FS_MAX_FILE_SIZE (MOS_FS_DIRECT_BLOCKS * MOS_FS_BLOCK_SIZE)  /* 5KB */
+#define MOS_FS_INDIRECT_BLOCKS (MOS_FS_BLOCK_SIZE / 4)  /* 一级间接块指针数 (128) */
+#define MOS_FS_MAX_FILE_SIZE \
+    ((MOS_FS_DIRECT_BLOCKS + MOS_FS_INDIRECT_BLOCKS) * MOS_FS_BLOCK_SIZE)  /* 69KB */
 #define MOS_FS_NAME_MAX     28          /* 文件名最大长度 */
 #define MOS_FS_DIRENTS_PER_BLOCK 16     /* 每块 16 个目录项 (512/32) */
 #define MOS_FS_INODE_U32_COUNT ((u32)(sizeof(fs_inode_t) / 4))  /* fs_inode_t 的 u32 数 */

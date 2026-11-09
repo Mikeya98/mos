@@ -151,6 +151,20 @@ int mos_fs_free_inode(block_dev_t *dev, u32 inode_num)
         }
     }
 
+    /* 一级间接块: 先还它指向的数据块, 再还表本身 */
+    if (inode.indirect != 0) {
+        u32 table[MOS_FS_INDIRECT_BLOCKS];
+        if (dev->read(dev, inode.indirect, table) == 0) {
+            for (i = 0; i < MOS_FS_INDIRECT_BLOCKS; i++) {
+                if (table[i] != 0) {
+                    mos_fs_free_block(dev, table[i]);
+                }
+            }
+        }
+        mos_fs_free_block(dev, inode.indirect);
+        inode.indirect = 0;
+    }
+
     /* 清零 inode: 逐字段清零 */
     u32 j;
     inode.mode = 0;
@@ -397,6 +411,66 @@ int mos_fs_remove_dirent(block_dev_t *dev, fs_inode_t *dir_inode,
     return -1;  /* 未找到 */
 }
 
+/* =========================== 逻辑块 → 物理块 =========================== */
+
+/*
+ * 10 个直接块之后走一级间接块: inode->indirect 指向一个 512 字节的
+ * 指针表, 表里最多 128 个数据块号。
+ *
+ * create=1 时按需分配: 间接块本身、表项、数据块都可能现拿。create=0
+ * 只查表, 不修改 inode, 所以 read_file 传进来的 const 指针可以安全
+ * 地临时转成非 const。
+ */
+static int inode_bmap(block_dev_t *dev, fs_inode_t *inode,
+                      u32 block_idx, int create, u32 *phys)
+{
+    u32 table[MOS_FS_INDIRECT_BLOCKS];
+
+    *phys = 0;
+
+    if (block_idx < MOS_FS_DIRECT_BLOCKS) {
+        if (inode->blocks[block_idx] == 0 && create) {
+            int b = mos_fs_alloc_block(dev);
+            if (b < 0) return -1;
+            inode->blocks[block_idx] = (u32)b;
+        }
+        *phys = inode->blocks[block_idx];
+        return 0;
+    }
+
+    block_idx -= MOS_FS_DIRECT_BLOCKS;
+    if (block_idx >= MOS_FS_INDIRECT_BLOCKS) {
+        return -1;
+    }
+
+    if (inode->indirect == 0) {
+        if (!create) {
+            return 0;
+        }
+        {
+            int b = mos_fs_alloc_block(dev);
+            if (b < 0) return -1;
+            inode->indirect = (u32)b;
+        }
+    }
+
+    if (dev->read(dev, inode->indirect, table) != 0) {
+        return -1;
+    }
+
+    if (table[block_idx] == 0 && create) {
+        int b = mos_fs_alloc_block(dev);
+        if (b < 0) return -1;
+        table[block_idx] = (u32)b;
+        if (dev->write(dev, inode->indirect, table) != 0) {
+            return -1;
+        }
+    }
+
+    *phys = table[block_idx];
+    return 0;
+}
+
 /* =========================== 文件读写 =========================== */
 
 int mos_fs_read_file(block_dev_t *dev, const fs_inode_t *inode,
@@ -420,10 +494,11 @@ int mos_fs_read_file(block_dev_t *dev, const fs_inode_t *inode,
         u32 chunk = 512 - block_off;
         if (chunk > remaining) chunk = remaining;
 
-        if (block_idx >= MOS_FS_DIRECT_BLOCKS) break;
-
-        u32 phys_block = inode->blocks[block_idx];
-        if (phys_block == 0) break;
+        u32 phys_block;
+        if (inode_bmap(dev, (fs_inode_t *)inode, block_idx, 0,
+                       &phys_block) != 0 || phys_block == 0) {
+            break;
+        }
 
         if (dev->read(dev, phys_block, temp_buf) != 0) break;
 
@@ -457,16 +532,11 @@ int mos_fs_write_file(block_dev_t *dev, fs_inode_t *inode,
         u32 chunk = 512 - block_off;
         if (chunk > remaining) chunk = remaining;
 
-        if (block_idx >= MOS_FS_DIRECT_BLOCKS) break;
-
-        /* 如果该块未分配, 先分配 */
-        if (inode->blocks[block_idx] == 0) {
-            int new_block = mos_fs_alloc_block(dev);
-            if (new_block < 0) break;
-            inode->blocks[block_idx] = (u32)new_block;
+        u32 phys_block;
+        if (inode_bmap(dev, inode, block_idx, 1, &phys_block) != 0 ||
+            phys_block == 0) {
+            break;
         }
-
-        u32 phys_block = inode->blocks[block_idx];
 
         /* 如果不是整块写入, 先读旧内容 */
         if (chunk < 512 || block_off != 0) {

@@ -64,6 +64,16 @@ static inline __attribute__((noreturn)) void prog_exit(s32 code)
     }
 }
 
+/* 这两个变量用来验证加载器的数据段路径:
+ *   counter 在 .data, 初值必须从文件拷进来
+ *   bss_buf 在 .bss, 不占文件字节, 加载后必须是 0
+ * volatile 防止编译器把只读的 counter 优化进 .rodata。 */
+volatile u32 counter = 0x12345678u;
+volatile u32 bss_buf[8];
+
+static const char msg_data[] = "[elf] .data loaded, .bss is zero\n";
+static const char msg_data_bad[] = "[elf] data/bss check FAILED\n";
+static const char msg_writable[] = "[elf] .data is writable\n";
 static const char msg_hello[] =
     "[elf] hello — this image was loaded from /hello.elf\n";
 static const char msg_detail[] =
@@ -96,6 +106,25 @@ static void put_uint(u32 v)
 
 void _start(void)
 {
+    /* .data 初值 + .bss 清零 */
+    {
+        u32 i;
+        int ok = (counter == 0x12345678u);
+
+        for (i = 0; i < 8u; i++) {
+            if (bss_buf[i] != 0u) {
+                ok = 0;
+            }
+        }
+        prog_write(ok ? msg_data : msg_data_bad,
+                   ok ? sizeof(msg_data) - 1u : sizeof(msg_data_bad) - 1u);
+
+        counter = 0xA5A5A5A5u;
+        if (counter == 0xA5A5A5A5u) {
+            prog_write(msg_writable, sizeof(msg_writable) - 1u);
+        }
+    }
+
     prog_write(msg_hello, sizeof(msg_hello) - 1u);
     prog_write(msg_detail, sizeof(msg_detail) - 1u);
 
