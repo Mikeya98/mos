@@ -838,6 +838,8 @@ task_t *task_create_user(void (*entry)(void), const char *name,
     t->as_valid   = 1;
     t->user_sp    = USER_STACK_TOP;
     t->is_user    = 1;
+    t->prog_valid = 0;
+    t->elf_loads  = 0;
 
     /* 4. 重新伪造内核栈帧: 首次调度时经 trampoline 切到用户态。
      *    用户栈顶用固定虚拟地址, 物理页由本任务的页表决定。 */
@@ -957,6 +959,16 @@ task_t *task_fork(task_t *parent, u32 user_pc)
     child->vm_clock = 0;
     child->swap_out = 0;
     child->swap_in  = 0;
+
+    /*
+     * 程序映像按值复制: 子进程继承父进程的程序。已经装载过的页在
+     * user_space_fork 里已经复制成独立帧; 还没装载的页保留 fault,
+     * 子进程第一次访问时按同一份路径/段表自己读文件。
+     */
+    child->prog = parent->prog;
+    child->prog_valid = parent->prog_valid;
+    child->elf_loads  = 0;
+
     child->block_obj = NULL;
     child->held_mutex = NULL;
     child->sleep_ticks = 0;

@@ -800,7 +800,7 @@ static void pool_manager(void)
 void user_demo_init(void)
 {
     printf("========================================\n");
-    printf("  User Mode Demo (v0.6 阶段10: fork/COW + exec + wait)\n");
+    printf("  User Mode Demo (v0.6 阶段12: fork/COW + exec + wait + lazy ELF)\n");
     printf("  user code : %X - %X (shared, read-only)\n",
            (u32)(uintptr_t)&_user_text_start,
            (u32)(uintptr_t)&_user_text_end);

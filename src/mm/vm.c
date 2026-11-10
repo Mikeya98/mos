@@ -28,6 +28,7 @@
 #include "mm/frame.h"
 #include "mm/swap.h"
 #include "kernel/task.h"
+#include "kernel/user_prog.h"
 #include "lib/printf.h"
 
 /* =========================== 协处理器 / 屏障 =========================== */
@@ -128,12 +129,17 @@ typedef enum {
     PAGE_DATA = 0,      /* 私有数据页 */
     PAGE_GUARD,         /* 栈保护页, 永远拒绝 */
     PAGE_STACK,         /* 栈页 */
+    PAGE_PROG,          /* 程序窗口, 内容来自 ELF 文件 (阶段12) */
     PAGE_ILLEGAL        /* 不属于本任务的私有区 */
 } page_kind_t;
 
 static page_kind_t classify(u32 page)
 {
     u32 idx;
+
+    if (page >= USER_PROG_VADDR && page < USER_PROG_LIMIT) {
+        return PAGE_PROG;
+    }
 
     if (page < USER_PRIV_VADDR || page >= USER_STACK_TOP) {
         return PAGE_ILLEGAL;
@@ -148,6 +154,117 @@ static page_kind_t classify(u32 page)
         return PAGE_GUARD;
     }
     return PAGE_STACK;          /* idx 2..255 */
+}
+
+/* =========================== 代码页按需装载 =========================== */
+
+/**
+ * @brief 把刚写入的代码页同步到取指路径 (阶段12)
+ *
+ * 内核用 D-cache 写物理页, 用户态再从同一个物理页取指。中间如果不
+ * 做维护, I-cache 里可能还是这一页被别人用过时的旧指令 —— 虚拟
+ * 地址相同、物理页变了, 而 I-cache 只按虚拟地址打标签。
+ *
+ *   DCIMVAC (c7, c11, 1)  按物理地址 clean+invalidate 到 PoU
+ *   ICIMVAU (c7, c5, 1)   按虚拟地址 invalidate 指令行
+ *
+ * QEMU 不模拟 cache, 这两条在仿真里看不出效果; 上板时它们才是
+ * "第一次跳进新代码页就飞"这类问题的分界线。
+ */
+static void vm_sync_code_page(u32 phys, u32 va)
+{
+    u32 a;
+
+    for (a = 0; a < 4096u; a += 32u) {
+        __asm__ volatile ("MCR p15, 0, %0, c7, c11, 1"
+                          :: "r"(phys + a) : "memory");
+    }
+    for (a = 0; a < 4096u; a += 32u) {
+        __asm__ volatile ("MCR p15, 0, %0, c7, c5, 1"
+                          :: "r"(va + a) : "memory");
+    }
+    vm_dsb();
+    vm_isb();
+}
+
+/**
+ * @brief 程序窗口 (0x09000000) 的缺页: 按页从 ELF 文件读入
+ *
+ * 页表项不是在 exec 时建好的, 而是第一次访问某一页时才有:
+ *   - 段里的页   → 分配页框, 从文件的 offset+vaddr 偏移读 4KB
+ *   - filesz 之后 → 整页清零 (.bss)
+ *   - 不属于任何段 → 拒绝
+ *
+ * 代码页映射成用户只读可执行, 数据页映射成读写 + XN。程序页目前
+ * 不参与换出 (private 区的 swap 只扫 l2 表), 页框不够时优先换出
+ * 本任务的私有页。
+ */
+static int vm_prog_fault(task_t *t, u32 page)
+{
+    const prog_seg_t *seg;
+    u32 *l2c;
+    u32 idx;
+    u32 frame;
+    u32 attr;
+
+    if (!t->is_user || !t->prog_valid || t->l2_code_phys == 0) {
+        return VM_INVALID;
+    }
+
+    idx = (page - USER_PROG_VADDR) >> 12;
+    if (idx >= 256u) {
+        return VM_INVALID;
+    }
+    l2c = (u32 *)(uintptr_t)t->l2_code_phys;
+
+    /* 已经映射 (可能只是 TLB 里残留了 fault 项) */
+    if ((l2c[idx] & 0x2u) != 0) {
+        vm_flush_page(page);
+        return VM_OK;
+    }
+
+    seg = user_prog_seg(&t->prog, page);
+    if (!seg) {
+        return VM_INVALID;
+    }
+
+    frame = frame_alloc(t->pid);
+    if (frame == 0) {
+        /*
+         * 程序页没有 swap 槽, 先换出本任务的一页私有数据/栈页。
+         * avoid 用一个不可能的索引, 不跳过任何页。
+         */
+        if (vm_evict_one(t, 0xFFFFFFFFu) != 0) {
+            return VM_NOMEM;
+        }
+        frame = frame_alloc(t->pid);
+        if (frame == 0) {
+            return VM_NOMEM;
+        }
+    }
+
+    if (user_prog_read_page(&t->prog, page, (void *)(uintptr_t)frame) != 0) {
+        printf("[ELF-PF] %s: read %s page %X failed\n",
+               t->name, t->prog.path, page);
+        frame_free(frame, t->pid);
+        return VM_INVALID;
+    }
+
+    attr = seg->writable ? L2_USER_RW_XN : L2_USER_RO;
+    l2c[idx] = (frame & 0xFFFFF000u) | attr;
+
+    vm_flush_page(page);
+    if (!seg->writable) {
+        vm_sync_code_page(frame, page);
+    }
+
+    t->pf_count++;
+    t->elf_loads++;
+
+    printf("[ELF-PF] %s: %X <- %s+%X (frame %X, page #%u)\n",
+           t->name, page, t->prog.path,
+           page - seg->vaddr + seg->offset, frame, t->elf_loads);
+    return VM_OK;
 }
 
 /* =========================== 缺页处理 =========================== */
@@ -180,6 +297,11 @@ int vm_fault(u32 va, u32 write)
          * 栈会把数据页悄悄覆盖掉, 这种 bug 极难查。
          */
         return VM_GUARD;
+    }
+
+    /* 程序窗口: 内容在 ELF 文件里, 按页读入 (阶段12) */
+    if (kind == PAGE_PROG) {
+        return vm_prog_fault(t, page);
     }
 
     idx = (page - USER_PRIV_VADDR) >> 12;
@@ -392,4 +514,8 @@ void vm_fill_stats(vm_stats_t *st)
     st->swap_used    = swap_used();
     st->swap_total   = swap_total();
     st->cow          = t ? t->cow_count : 0;
+    st->prog_pages   = (t && t->is_user && t->l2_code_phys)
+                       ? vm_count_pages((const u32 *)(uintptr_t)t->l2_code_phys)
+                       : 0;
+    st->elf_loads    = t ? t->elf_loads : 0;
 }

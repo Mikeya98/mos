@@ -280,17 +280,31 @@ prefetch_handler:
      * Prefetch Abort — 取指失败 (PC 指向未映射/无执行权限的地址)
      *
      * lr_abt = 故障指令地址 + 4, 先减掉流水线偏移。
-     * SPSR_abt 的低 5 位记录故障发生时的模式 (USR=0x10 / SVC=0x13),
-     * 交给 C 判断是用户任务越权还是内核自己跑飞。
      *
-     * r0-r3 在异常模式间是共用的, CPS 切到 SVC 后参数仍然有效。
+     * 阶段12 之后这里也要能"补页再重试": 用户程序窗口的代码页在
+     * 第一次执行时才从 ELF 文件装入, 取指 fault 是正常路径。
+     * 现场保存方式和 data_handler 完全一致 —— 取指 fault 时指令还没
+     * 执行, 用户寄存器必须原样保留, 才能重新取这条指令。
+     *
+     *   SRSFD 把 lr_abt / spsr_abt 压到 SVC 栈 (各 4 字节)
+     *   PUSH {r0-r3, r12, lr} 保存调用者保存寄存器 (C 函数会改)
+     *     [sp + 24] = 故障指令地址
+     *     [sp + 28] = 故障时的 CPSR
+     *   返回时 POP + RFEFD, PC 回到故障指令。
+     *
+     * C 处理函数只在"页已经补好"时返回; 其它情况杀任务, 永不返回。
      */
     SUB     lr, lr, #4
-    MOV     r0, lr
-    MRS     r1, SPSR
+    SRSFD   sp!, #MODE_SVC
     CPS     #MODE_SVC
+
+    PUSH    {r0-r3, r12, lr}
+    LDR     r0, [sp, #24]           @ fault_pc
+    LDR     r1, [sp, #28]           @ spsr_abt
     BL      prefetch_abort_handler
-    B       .
+    POP     {r0-r3, r12, lr}
+
+    RFEFD   sp!                     @ 重新取故障指令
 
 data_handler:
     /*

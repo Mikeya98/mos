@@ -2,7 +2,7 @@
 
 [![Platform](https://img.shields.io/badge/platform-ARM%20Cortex--A9-blue)](https://github.com/Mikeya98/mos)
 [![Language](https://img.shields.io/badge/language-C%20%7C%20Assembly-orange)](https://github.com/Mikeya98/mos)
-[![Status](https://img.shields.io/badge/status-v0.6%20--%20elf%20loader-brightgreen)](https://github.com/Mikeya98/mos)
+[![Status](https://img.shields.io/badge/status-v0.6%20--%20lazy%20ELF-brightgreen)](https://github.com/Mikeya98/mos)
 [![QEMU](https://img.shields.io/badge/QEMU-verified-lightgrey)](https://github.com/Mikeya98/mos)
 
 MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 上，用 QEMU 仿真验证。每一行代码都是手写的，没有引用任何现成的 RTOS 内核代码。
@@ -28,7 +28,8 @@ MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 �
 - **fork + 写时复制**：`SYS_FORK` 复制当前用户任务，新建地址空间槽位；已映射的页父子共享同一个物理帧，两侧页表都改成用户只读，谁先写谁在缺页处理里复制一份私有副本（引用计数减到 1 时直接改回可写）。换出页复制独立的 swap 槽，互不影响；物理帧按引用计数回收
 - **每任务用户栈指针**：`SP_usr` 是 CPU 的 banked 寄存器，不随 TCB 自动切换。进入内核时把 `SP_usr` 存进 TCB，调度到某个用户任务之前再写回，避免任务切换后踩到上一个任务的用户栈
 - **exec（简化版）**：`SYS_EXEC` 清空当前任务的私有页表和 swap 槽、保留地址空间槽位与共享用户代码段，然后从用户代码段内的新入口重新开始；数据页和栈页在第一次访问时重新按需分配。异常返回前把 `SPSR_svc` 改成 SVC 模式，先在内核跳板里设置好 `SP_usr` 再回用户态
-- **真正的 ELF 加载**：`SYS_EXEC_ELF` 从 RAM 盘打开 `/hello.elf`，解析 ELF32 program header，把 PT_LOAD 段按 4KB 页装进任务的程序窗口 `0x09000000`，代码段映射成用户只读可执行、数据段映射成用户读写不可执行，`.bss` 自动清零。加载前先校验头部/段范围/页重叠并预分配页框，失败时旧程序保持完整；成功后旧数据页和栈全部释放，入口写回用户态 PC。演示程序由 Makefile 单独编译、打包成 C 数组嵌进内核、开机写进 RAM 盘，走的是完整的“打开文件 → 读取 → 解析”路径
+- **真正的 ELF 加载**：`SYS_EXEC_ELF` 从 RAM 盘打开 `/hello.elf`，解析 ELF32 program header，把 PT_LOAD 段装进任务的程序窗口 `0x09000000`，代码段映射成用户只读可执行、数据段映射成用户读写不可执行，`.bss` 自动清零。加载前先校验头部/段范围/页重叠，失败时旧程序保持完整；成功后旧数据页和栈全部释放，入口写回用户态 PC。演示程序由 Makefile 单独编译、打包成 C 数组嵌进内核、开机写进 RAM 盘，走的是完整的“打开文件 → 读取 → 解析”路径
+- **按需装载代码页**：阶段12 起，exec 只读 ELF 头部（前 1KB 的 ELF header + program header），把段表登记进 TCB，正文一页都不读；第一次执行/读写到某一页时，Prefetch/Data Abort 进入 `vm_prog_fault`，按页从文件 `open/seek/read` 进来并映射。代码页需要 D-cache clean + I-cache invalidate 之后才能安全取指（QEMU 不模拟 cache，上板才见真章）。`/hello.elf` 8744 字节，exec 时 0 页驻留，运行时按需装载 2 页
 - **程序区与 fork**：每个地址空间多一张 `0x09000000` 的 L2 页表；fork 时程序页整帧复制（代码段只读、数据段通常一两页，比再维护一套 COW 路径简单）。演示里加载后的程序自己 fork 一次，子进程退出码 3 被父进程 wait 收回
 - **僵尸进程与 wait**：`SYS_EXIT` 带退出码，有父进程的任务退出后变成僵尸，TCB 留在任务表里等父进程 `SYS_WAIT` 取走；父进程可以阻塞等任意/指定子进程，子进程退出时被唤醒。僵尸状态的转换放在 `schedule()` 切换前完成，避免父进程在退出任务还踩着自己内核栈时就把它回收
 - **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST / GET_TTBR0 / VM_STATS / FORK / EXEC / WAIT / EXEC_ELF`；`copy_from_user` / `copy_to_user` 先代用户补页，再走当前任务的页表检查用户指针（区分读/写权限）
@@ -45,7 +46,8 @@ mos/
 │   │   ├── task.c              # TCB + 调度器 + 任务终止
 │   │   ├── syscall.c           # 系统调用表 + copy_from_user/copy_to_user
 │   │   ├── exception.c         # Data/Prefetch Abort → 杀任务并继续调度
-│   │   ├── elf_user.c          # 用户程序 ELF 加载器（段校验/预分配/映射）
+│   │   ├── elf_user.c          # 用户程序 ELF 装载（只读头部 + 段表登记）
+│   │   ├── user_prog.c         # 程序映像查段 + 按页读文件（阶段12）
 │   │   └── sched_asm.S         # 上下文切换 + 用户态 trampoline
 │   ├── user/
 │   │   ├── usermain.c          # 用户态 demo 任务（.user_text 段）
@@ -161,12 +163,26 @@ Starting scheduler...
 [user] u_exec2 : after exec, data page = 0x00000000
 [user] u_exec2 : value is 0, old address space is gone
 
-[POOL] free slots: 12 / 12, free frames: 64 / 64
-[POOL] wave 0: created 8 tasks, free slots now 4, free frames 64
+[user] u_elf   : exec_elf(/missing.elf) should fail, old image stays alive
+[EXEC] u_elf: load /missing.elf failed (-3), old image kept
+[user] u_elf   : exec_elf(/hello.elf) — real ELF from RAM disk
+[ELF] /hello.elf: 2 segments, 2 pages pending (lazy), entry 90000B8
+[EXEC] u_elf: /hello.elf mapped, entry 90000B8 (code pages load on demand)
+[ELF-PF] u_elf: 9000000 <- /hello.elf+1000 (frame 272000, page #1)
+[ELF-PF] u_elf: 9001000 <- /hello.elf+2000 (frame 275000, page #2)
+[elf] .data loaded, .bss is zero
+[elf] hello — this image was loaded from /hello.elf
+[elf] pid = 9
+[elf] child : forked, program pages copied to new frames
+[elf] parent: wait reaped child, code = 3
+[elf] exit(0)
+
+[POOL] free slots: 13 / 13, free frames: 64 / 64
+[POOL] wave 0: created 8 tasks, free slots now 5, free frames 64
 [user] u_spawn : running in a recycled address space
-[POOL] wave 0: spawn tasks gone, free slots = 12, free frames = 64
+[POOL] wave 0: spawn tasks gone, free slots = 13, free frames = 64
     （wave 1 / 2 重复两轮）
-[POOL] done — 12 of 12 slots free, 64 of 64 frames free
+[POOL] done — 13 of 13 slots free, 64 of 64 frames free
 ```
 
 这些输出分别验证了：
@@ -179,7 +195,8 @@ Starting scheduler...
 6. `u_overflow` 写保护页 `0x08101000`，内核判定栈溢出并杀掉任务，数据页不会被栈悄悄覆盖；
 7. `u_fork` 先往数据页写 `0x11111111`，fork 之后子进程读到同样的值，改成 `0x22222222` 后退出；父进程读回仍然是 `0x11111111`。日志里的 `[COW]` 行是子进程第一次写共享页时触发的页复制，父进程的数据没有被改动；
 8. `u_exec` 往数据页写 `0xAAAAAAAA`，然后 exec 到 `u_exec_new`；新入口读到的数据页是 0，说明私有地址空间确实被清空重建了，共享的用户代码段不受影响；
-9. `pool_mgr` 连续三轮各创建 8 个短命任务（12 个地址空间槽位里占 8 个），每轮结束后槽位全部归还；这些任务不碰栈也不碰数据页，所以**一个物理页框都不占**（free frames 始终 64）——同一份 256KB 页框池，按阶段4 的预分配方案连 4 个任务都撑不住。
+9. `u_elf` 先从 RAM 盘装载独立编译的 `/hello.elf`：exec 日志只有“2 pages pending”，正文页在第一次取指/读数据时才出现两条 `[ELF-PF]`；程序自己 fork 一次，子进程退出码 3 被父进程 wait 收回。加载不存在的 `/missing.elf` 返回 `-ENOENT`，旧镜像继续运行；
+10. `pool_mgr` 连续三轮各创建 8 个短命任务（13 个地址空间槽位里占 8 个），每轮结束后槽位全部归还；这些任务不碰栈也不碰数据页，所以**一个物理页框都不占**（free frames 始终 64）——同一份 256KB 页框池，按阶段4 的预分配方案连 4 个任务都撑不住。
 
 > QEMU 的 zynq 机器默认内存放不下 `0x08000000` 的第二段，`make qemu-run` 里加了 `-m 1024`。
 
@@ -192,8 +209,8 @@ Starting scheduler...
 | v0.3 | Buddy 伙伴内存分配器 | ✅ |
 | v0.4 | SLAB 对象缓存 + TCB 动态分配 | ✅ |
 | v0.5 | MOS-FS 文件系统（VFS + RAM 盘） | ✅ |
-| v0.6 | MMU + 用户态 + 权限隔离 + 每任务独立页表 + ASID + 资源回收 + 按需分页 + 页面换出 + fork/COW + exec（阶段1 开 MMU、阶段2 模式切换、阶段3 隔离/异常恢复、阶段4 TTBR0 切换、阶段5 ASID/reclaim、阶段6 缺页处理/页框池/保护页、阶段7 swap、阶段8 fork/写时复制、阶段9 exec/地址空间重置） | ✅ |
-| 下一步 | 多核调度、进程间共享内存、僵尸进程回收 | 🔜 |
+| v0.6 | MMU + 用户态 + 权限隔离 + 每任务独立页表 + ASID + 资源回收 + 按需分页 + 页面换出 + fork/COW + exec + ELF 装载 + 僵尸回收（阶段1 开 MMU、2 模式切换、3 隔离/异常恢复、4 TTBR0 切换、5 ASID/reclaim、6 缺页处理、7 swap、8 fork/写时复制、9 exec/重置、10 僵尸/wait、11 真实 ELF、12 代码页按需装载） | ✅ |
+| 下一步 | 多核调度、进程间共享内存、块设备/持久化 | 🔜 |
 
 ## 构建细节
 

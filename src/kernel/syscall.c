@@ -58,11 +58,6 @@ extern void fork_return_trampoline(void);
 static sem_t user_sems[SYS_SEM_MAX];
 static u8    user_sem_used[SYS_SEM_MAX];
 
-/* exec_elf 的临时镜像缓冲。32KB 足够放演示程序; 以后接真实文件系统
- * 时应该改成先 mmap 文件页, 而不是整文件读进内核。 */
-#define ELF_IMAGE_MAX   (32u * 1024u)
-static u8 elf_image[ELF_IMAGE_MAX];
-
 /* =========================== 指针校验 =========================== */
 
 /*
@@ -327,12 +322,17 @@ void svc_dispatch(u32 svc_num, u32 *frame)
 
         {
             user_space_t us;
-            us.l1_phys = cur->l1_phys;
-            us.l2_phys = cur->l2_phys;
-            us.asid    = cur->asid;
-            us.slot    = cur->as_slot;
+            us.l1_phys      = cur->l1_phys;
+            us.l2_phys      = cur->l2_phys;
+            us.l2_code_phys = cur->l2_code_phys;
+            us.asid         = cur->asid;
+            us.slot         = cur->as_slot;
             user_space_reset(&us);
         }
+
+        /* 新程序不再是文件映射的, 清掉旧的段表 */
+        cur->prog_valid = 0;
+        cur->elf_loads  = 0;
 
         cur->user_sp    = USER_STACK_TOP;
         cur->pf_count   = 0;
@@ -371,17 +371,19 @@ void svc_dispatch(u32 svc_num, u32 *frame)
 
     case SYS_EXEC_ELF: {
         /*
-         * 从文件系统加载一个独立编译的 ELF (v0.6 阶段11)。
+         * 从文件系统装载一个独立编译的 ELF (v0.6 阶段11/12)。
+         *
+         * 阶段12: 只读 ELF 头部, 正文页在第一次访问时由 vm_prog_fault
+         * 按页从文件读入 —— exec 的代价和程序大小无关。
          *
          * 路径字符串在用户内存里, 逐字节拷贝到内核缓冲 —— 用户
          * 字符串通常只有十几字节, 按固定长度 copy_from_user 会越过
          * 字符串尾部踩到别的页, 反而误判 EFAULT。
          */
         task_t *cur = get_current();
-        char path[64];
+        char path[PROG_PATH_MAX];
         u32 i;
         int terminated = 0;
-        int fd, fsize, got;
         user_space_t us;
         u32 entry = 0;
         int rc;
@@ -413,42 +415,13 @@ void svc_dispatch(u32 svc_num, u32 *frame)
             break;
         }
 
-        fd = mos_open(path, O_RDONLY);
-        if (fd < 0) {
-            printf("[EXEC] %s: open %s failed\n", cur->name, path);
-            ret = -ENOENT;
-            break;
-        }
-        fsize = mos_filesize(fd);
-        if (fsize <= 0 || (u32)fsize > ELF_IMAGE_MAX) {
-            printf("[EXEC] %s: %s bad size %d\n", cur->name, path, fsize);
-            mos_close(fd);
-            ret = -ENOEXEC;
-            break;
-        }
-
-        got = 0;
-        while (got < fsize) {
-            int n = mos_read(fd, elf_image + got, (u32)(fsize - got));
-            if (n <= 0) {
-                break;
-            }
-            got += n;
-        }
-        mos_close(fd);
-        if (got != fsize) {
-            printf("[EXEC] %s: short read %d/%d\n", cur->name, got, fsize);
-            ret = -ENOEXEC;
-            break;
-        }
-
         us.l1_phys      = cur->l1_phys;
         us.l2_phys      = cur->l2_phys;
         us.l2_code_phys = cur->l2_code_phys;
         us.asid         = cur->asid;
         us.slot         = cur->as_slot;
 
-        rc = user_elf_load(&us, elf_image, (u32)fsize, &entry);
+        rc = user_elf_load(&us, path, &cur->prog, &entry);
         if (rc != ELF_USER_OK) {
             printf("[EXEC] %s: load %s failed (%d), old image kept\n",
                    cur->name, path, rc);
@@ -456,6 +429,8 @@ void svc_dispatch(u32 svc_num, u32 *frame)
             break;
         }
 
+        cur->prog_valid = 1;
+        cur->elf_loads  = 0;
         cur->user_sp    = USER_STACK_TOP;
         cur->entry      = (void (*)(void))(uintptr_t)entry;
         cur->pf_count   = 0;
@@ -473,7 +448,7 @@ void svc_dispatch(u32 svc_num, u32 *frame)
             __asm__ volatile ("MSR SPSR_cxsf, %0" :: "r"(svc_mode) : "memory");
         }
 
-        printf("[EXEC] %s: %s loaded from filesystem, entry %X\n",
+        printf("[EXEC] %s: %s mapped, entry %X (code pages load on demand)\n",
                cur->name, path, entry);
         ret = 0;
         break;

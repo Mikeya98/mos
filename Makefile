@@ -67,7 +67,8 @@ KERNEL_SRCS = $(SRC_DIR)/kernel/main.c \
               $(SRC_DIR)/kernel/task.c \
               $(SRC_DIR)/kernel/syscall.c \
               $(SRC_DIR)/kernel/exception.c \
-              $(SRC_DIR)/kernel/elf_user.c
+              $(SRC_DIR)/kernel/elf_user.c \
+              $(SRC_DIR)/kernel/user_prog.c
 
 # 用户态代码 (编译到 .user_text, 链接到 0x08000000)
 USER_SRCS = $(SRC_DIR)/user/usermain.c

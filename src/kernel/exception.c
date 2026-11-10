@@ -212,21 +212,49 @@ int data_abort_handler(u32 fault_pc, u32 spsr_abt)
 
 /**
  * @brief  Prefetch Abort 处理 (取指失败: 跳到无权执行/未映射的地址)
+ *
+ * 阶段12 之后这里多了一种正常结局: 用户程序窗口 (0x09000000) 的
+ * 代码页还没从文件装载。第一次执行到一个新页时, 取指就会 fault,
+ * 这类 IFSR 状态同样是 translation fault, 交给 vm_fault 补页,
+ * 返回 1 让汇编代码 RFE 回去重新取这条指令。
+ *
+ * 其余情况 (往栈上跳、PC 越界、内核自己跑飞) 仍然杀任务/停机。
+ * 返回 0 不会发生 —— 失败路径调用 task_exit 永不返回, 汇编那边
+ * 对返回值的处理只是形式上的统一。
  */
-void prefetch_abort_handler(u32 fault_pc, u32 spsr_abt)
+int prefetch_abort_handler(u32 fault_pc, u32 spsr_abt)
 {
     u32 ifsr = cp15_read_ifsr();
     u32 ifar = cp15_read_ifar();
-    int from_user = report_fault("Prefetch Abort", fault_pc, spsr_abt, ifar, ifsr);
+    u32 mode = spsr_abt & 0x1Fu;
 
-    if (!from_user) {
+    if (mode != 0x10) {
+        report_fault("Prefetch Abort", fault_pc, spsr_abt, ifar, ifsr);
         printf("[ABORT] kernel fault — halting\n");
         while (1) {
             __asm__ volatile ("WFI");
         }
     }
 
+    if (is_page_fault(ifsr)) {
+        int rc = vm_fault(ifar, 0);
+
+        if (rc == VM_OK) {
+            return 1;               /* 代码页已装载, 重试取指 */
+        }
+
+        report_fault("Prefetch Abort", fault_pc, spsr_abt, ifar, ifsr);
+        if (rc == VM_NOMEM) {
+            printf("[ABORT] out of page frames while loading %X\n", ifar);
+        } else {
+            printf("[ABORT] %X is not a loadable program page\n", ifar);
+        }
+    } else {
+        report_fault("Prefetch Abort", fault_pc, spsr_abt, ifar, ifsr);
+    }
+
     printf("[ABORT] terminating user task, scheduler continues\n\n");
 
     task_exit(-4);      /* SIGILL 风格的退出码 */
+    return 0;
 }

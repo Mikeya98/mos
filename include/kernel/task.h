@@ -13,6 +13,7 @@
 
 #include "lib/types.h"
 #include "fs/vfs.h"
+#include "kernel/user_prog.h"
 
 /* =========================== 常量 =========================== */
 #define PRIO_COUNT      32         /* 优先级级数 */
@@ -113,6 +114,14 @@ typedef struct task_struct {
     s32             exit_code;
     u32             wait_pid;      /* 0 = 等任意子进程 */
     u8              wait_active;
+
+    /* --- 程序映像 / 代码页按需装载 (v0.6 阶段12) ---
+     * prog_valid=1 表示 0x09000000 窗口由一个 ELF 文件映射, 段表在
+     * prog 里。缺页时按页读文件, 页表见 l2_code_phys。
+     * elf_loads 是本任务累计按需装载的代码页数。 */
+    prog_image_t    prog;
+    u8              prog_valid;
+    u32             elf_loads;
 
 } task_t;
 
