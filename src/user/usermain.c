@@ -22,7 +22,8 @@
  *   u_iso_b    — 独立地址空间: 写同一虚拟地址, 两边互不影响
  *   u_fork     — fork + 写时复制: 父子共享页, 谁写谁复制
  *   u_exec     — exec: 清空私有地址空间, 从新入口重新开始
- *   u_elf      — exec_elf: 从 RAM 盘读 ELF, 装进 0x09000000 执行
+ *   u_elf      — exec_elf: 从 RAM 盘读 ELF, 装进 0x09000000 执行;
+ *                第二次执行同一文件时只读代码页命中文件页缓存
  *   u_wait     — wait/僵尸: 子进程退出保留退出码, 父进程回收
  *   u_demand   — 按需分页: 数据页/栈页都是第一次访问才分配
  *   u_overflow — 写栈保护页 → 内核判定栈溢出, 杀掉任务
@@ -40,6 +41,7 @@
 #include "mm/vm.h"
 #include "mm/frame.h"
 #include "mm/swap.h"
+#include "mm/page_cache.h"
 
 /* =========================== 段属性 =========================== */
 #define USER_TEXT   __attribute__((section(".user_text")))
@@ -568,6 +570,9 @@ static const char msg_elf0[] USER_RODATA = "[user] u_elf   : exec_elf(/missing.e
 static const char msg_elf1[] USER_RODATA = "[user] u_elf   : exec_elf(/hello.elf) — real ELF from RAM disk\n";
 static const char msg_elf2[] USER_RODATA = "[user] u_elf   : exec_elf returned error ";
 static const char msg_elf3[] USER_RODATA = "[user] u_elf   : (the loaded image exits itself, we should not be here)\n";
+static const char msg_elf4[] USER_RODATA = "[user] u_elf   : child execs /hello.elf first (cold), parent waits then re-execs\n";
+static const char msg_elf5[] USER_RODATA = "[user] u_elf   : fork failed ";
+static const char msg_pc0[]  USER_RODATA = "[user] u_elf   : second exec of /hello.elf — text pages should hit the page cache\n";
 
 /**
  * 从 RAM 盘加载独立编译的 /hello.elf。
@@ -579,6 +584,8 @@ static const char msg_elf3[] USER_RODATA = "[user] u_elf   : (the loaded image e
 static void USER_TEXT u_elf(void)
 {
     s32 rc;
+    s32 pid;
+    s32 status = 0;
 
     SAY(msg_elf0);
     rc = usys_exec_elf(path_missing);
@@ -587,7 +594,36 @@ static void USER_TEXT u_elf(void)
         say_hex(msg_empty, (u32)rc, msg_nl);
     }
 
-    SAY(msg_elf1);
+    /*
+     * 阶段13: 分两次执行同一个文件。
+     *
+     *   子进程先 exec: 缺页时按页读文件, 只读代码页填进页缓存
+     *   父进程 wait 到子进程退出, 再 exec 一次: 代码页直接命中缓存
+     *
+     * 第二次执行和第一次之间隔着一整个进程的生命周期, 缓存里的页
+     * 仍然在 —— 这就是 page cache 和"进程私有页"的区别。
+     */
+    SAY(msg_elf4);
+    pid = usys_fork();
+    if (pid == 0) {
+        SAY(msg_elf1);
+        rc = usys_exec_elf(path_hello);
+
+        SAY(msg_elf2);
+        say_hex(msg_empty, (u32)rc, msg_nl);
+        SAY(msg_elf3);
+        usys_exit(0);
+    }
+
+    if (pid < 0) {
+        SAY(msg_elf5);
+        say_hex(msg_empty, (u32)pid, msg_nl);
+        usys_exit(0);
+    }
+
+    usys_wait(pid, &status);
+
+    SAY(msg_pc0);
     rc = usys_exec_elf(path_hello);
 
     SAY(msg_elf2);
@@ -783,6 +819,25 @@ static void pool_manager(void)
                wave, user_space_free_count(), frame_free_count());
     }
 
+    {
+        u32 hits, misses, live, evict, bypass;
+        u32 reclaimed = 0;
+
+        page_cache_stats(&hits, &misses, &live, &evict, &bypass);
+        printf("[POOL] page cache: %u hits, %u misses, %u live, "
+               "%u evictions, %u bypass\n",
+               hits, misses, live, evict, bypass);
+        printf("[POOL] frames free before cache reclaim: %u / %u\n",
+               frame_free_count(), frame_total());
+
+        /* 驻留的缓存页是干净的, 可以随时丢掉 —— 证明它们不是泄漏 */
+        while (page_cache_reclaim() == 0) {
+            reclaimed++;
+        }
+        printf("[POOL] page cache reclaimed %u idle pages at shutdown\n",
+               reclaimed);
+    }
+
     printf("[POOL] done — %u of %u slots free, %u of %u frames free\n",
            user_space_free_count(), USER_SPACE_SLOTS,
            frame_free_count(), frame_total());
@@ -800,7 +855,7 @@ static void pool_manager(void)
 void user_demo_init(void)
 {
     printf("========================================\n");
-    printf("  User Mode Demo (v0.6 阶段12: fork/COW + exec + wait + lazy ELF)\n");
+    printf("  User Mode Demo (v0.6 阶段13: fork/COW + exec + wait + lazy ELF + page cache)\n");
     printf("  user code : %X - %X (shared, read-only)\n",
            (u32)(uintptr_t)&_user_text_start,
            (u32)(uintptr_t)&_user_text_end);

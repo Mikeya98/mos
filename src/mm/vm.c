@@ -27,6 +27,7 @@
 #include "mm/mmu.h"
 #include "mm/frame.h"
 #include "mm/swap.h"
+#include "mm/page_cache.h"
 #include "kernel/task.h"
 #include "kernel/user_prog.h"
 #include "lib/printf.h"
@@ -123,6 +124,25 @@ static int vm_evict_one(task_t *t, u32 avoid_idx)
     return -1;
 }
 
+/**
+ * @brief 缺页时取一帧: 先试直接分配, 再试回收文件缓存, 最后才换出私有页
+ *
+ * 顺序是有讲究的: 文件缓存页是干净的, 丢掉不用写 swap; 私有页换出
+ * 要写 4KB 到 swap 区, 换回来还要读一次。能用前者就不用后者。
+ */
+static u32 vm_alloc_frame(task_t *t, u32 avoid_idx)
+{
+    u32 frame = frame_alloc(t->pid);
+
+    if (frame == 0 && page_cache_reclaim() == 0) {
+        frame = frame_alloc(t->pid);
+    }
+    if (frame == 0 && vm_evict_one(t, avoid_idx) == 0) {
+        frame = frame_alloc(t->pid);
+    }
+    return frame;
+}
+
 /* =========================== 地址分类 =========================== */
 
 typedef enum {
@@ -206,6 +226,7 @@ static int vm_prog_fault(task_t *t, u32 page)
     u32 idx;
     u32 frame;
     u32 attr;
+    u32 foff;
 
     if (!t->is_user || !t->prog_valid || t->l2_code_phys == 0) {
         return VM_INVALID;
@@ -228,19 +249,34 @@ static int vm_prog_fault(task_t *t, u32 page)
         return VM_INVALID;
     }
 
-    frame = frame_alloc(t->pid);
+    /* 这一页内容在文件里的偏移。只读段用它当缓存键。 */
+    foff = seg->offset + (page - seg->vaddr);
+
+    /*
+     * 只读代码页: 先查页缓存 (阶段13)。
+     *
+     * 命中说明别的进程 (或者本进程退出后仍驻留的缓存) 已经读过这一页,
+     * 直接把页表指向同一帧, 不再碰文件系统。命中时 lookup 已经把
+     * 引用计数加好了, 进程退出时 page_cache_put 会还回去。
+     */
+    if (!seg->writable) {
+        frame = page_cache_lookup(t->prog.path, foff);
+        if (frame != 0) {
+            l2c[idx] = (frame & 0xFFFFF000u) | L2_USER_RO;
+            vm_flush_page(page);
+            vm_sync_code_page(frame, page);
+
+            t->pf_count++;
+            t->elf_loads++;
+            printf("[ELF-PF] %s: %X shared from page cache (frame %X)\n",
+                   t->name, page, frame);
+            return VM_OK;
+        }
+    }
+
+    frame = vm_alloc_frame(t, 0xFFFFFFFFu);
     if (frame == 0) {
-        /*
-         * 程序页没有 swap 槽, 先换出本任务的一页私有数据/栈页。
-         * avoid 用一个不可能的索引, 不跳过任何页。
-         */
-        if (vm_evict_one(t, 0xFFFFFFFFu) != 0) {
-            return VM_NOMEM;
-        }
-        frame = frame_alloc(t->pid);
-        if (frame == 0) {
-            return VM_NOMEM;
-        }
+        return VM_NOMEM;
     }
 
     if (user_prog_read_page(&t->prog, page, (void *)(uintptr_t)frame) != 0) {
@@ -255,6 +291,14 @@ static int vm_prog_fault(task_t *t, u32 page)
 
     vm_flush_page(page);
     if (!seg->writable) {
+        /*
+         * 只读页放进缓存。insert 成功时帧归缓存所有 (refs=1), 进程
+         * 页表再持有一个引用; 缓存满且全被映射时 insert 失败, 这一帧
+         * 就按私有页处理, 进程退出时直接归还。
+         */
+        if (page_cache_insert(t->prog.path, foff, frame) == 0) {
+            page_cache_ref(frame);      /* 进程页表持有的那个引用 */
+        }
         vm_sync_code_page(frame, page);
     }
 
@@ -262,8 +306,7 @@ static int vm_prog_fault(task_t *t, u32 page)
     t->elf_loads++;
 
     printf("[ELF-PF] %s: %X <- %s+%X (frame %X, page #%u)\n",
-           t->name, page, t->prog.path,
-           page - seg->vaddr + seg->offset, frame, t->elf_loads);
+           t->name, page, t->prog.path, foff, frame, t->elf_loads);
     return VM_OK;
 }
 
@@ -315,15 +358,9 @@ int vm_fault(u32 va, u32 write)
     if (swap_pte_is(l2[idx])) {
         u32 slot = swap_pte_slot(l2[idx]);
 
-        frame = frame_alloc(t->pid);
+        frame = vm_alloc_frame(t, idx);
         if (frame == 0) {
-            if (vm_evict_one(t, idx) != 0) {
-                return VM_NOMEM;
-            }
-            frame = frame_alloc(t->pid);
-            if (frame == 0) {
-                return VM_NOMEM;
-            }
+            return VM_NOMEM;
         }
 
         if (swap_load(slot, frame) != 0) {
@@ -361,15 +398,9 @@ int vm_fault(u32 va, u32 write)
                 volatile u32 *src;
                 volatile u32 *dst;
 
-                frame = frame_alloc(t->pid);
+                frame = vm_alloc_frame(t, idx);
                 if (frame == 0) {
-                    if (vm_evict_one(t, idx) != 0) {
-                        return VM_NOMEM;
-                    }
-                    frame = frame_alloc(t->pid);
-                    if (frame == 0) {
-                        return VM_NOMEM;
-                    }
+                    return VM_NOMEM;
                 }
 
                 /* 复制整页, 然后把旧帧的引用还掉 */
@@ -404,15 +435,9 @@ int vm_fault(u32 va, u32 write)
      * 情况 2: 真正的第一次访问。
      * 页框池耗尽时先换出一页, 再重新试一次; swap 也满了才算失败。
      * ------------------------------------------------------------------ */
-    frame = frame_alloc(t->pid);
+    frame = vm_alloc_frame(t, idx);
     if (frame == 0) {
-        if (vm_evict_one(t, idx) != 0) {
-            return VM_NOMEM;
-        }
-        frame = frame_alloc(t->pid);
-        if (frame == 0) {
-            return VM_NOMEM;
-        }
+        return VM_NOMEM;
     }
 
     /*

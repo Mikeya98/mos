@@ -2,7 +2,7 @@
 
 [![Platform](https://img.shields.io/badge/platform-ARM%20Cortex--A9-blue)](https://github.com/Mikeya98/mos)
 [![Language](https://img.shields.io/badge/language-C%20%7C%20Assembly-orange)](https://github.com/Mikeya98/mos)
-[![Status](https://img.shields.io/badge/status-v0.6%20--%20lazy%20ELF-brightgreen)](https://github.com/Mikeya98/mos)
+[![Status](https://img.shields.io/badge/status-v0.6%20--%20page%20cache-brightgreen)](https://github.com/Mikeya98/mos)
 [![QEMU](https://img.shields.io/badge/QEMU-verified-lightgrey)](https://github.com/Mikeya98/mos)
 
 MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 上，用 QEMU 仿真验证。每一行代码都是手写的，没有引用任何现成的 RTOS 内核代码。
@@ -29,8 +29,9 @@ MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 �
 - **每任务用户栈指针**：`SP_usr` 是 CPU 的 banked 寄存器，不随 TCB 自动切换。进入内核时把 `SP_usr` 存进 TCB，调度到某个用户任务之前再写回，避免任务切换后踩到上一个任务的用户栈
 - **exec（简化版）**：`SYS_EXEC` 清空当前任务的私有页表和 swap 槽、保留地址空间槽位与共享用户代码段，然后从用户代码段内的新入口重新开始；数据页和栈页在第一次访问时重新按需分配。异常返回前把 `SPSR_svc` 改成 SVC 模式，先在内核跳板里设置好 `SP_usr` 再回用户态
 - **真正的 ELF 加载**：`SYS_EXEC_ELF` 从 RAM 盘打开 `/hello.elf`，解析 ELF32 program header，把 PT_LOAD 段装进任务的程序窗口 `0x09000000`，代码段映射成用户只读可执行、数据段映射成用户读写不可执行，`.bss` 自动清零。加载前先校验头部/段范围/页重叠，失败时旧程序保持完整；成功后旧数据页和栈全部释放，入口写回用户态 PC。演示程序由 Makefile 单独编译、打包成 C 数组嵌进内核、开机写进 RAM 盘，走的是完整的“打开文件 → 读取 → 解析”路径
-- **按需装载代码页**：阶段12 起，exec 只读 ELF 头部（前 1KB 的 ELF header + program header），把段表登记进 TCB，正文一页都不读；第一次执行/读写到某一页时，Prefetch/Data Abort 进入 `vm_prog_fault`，按页从文件 `open/seek/read` 进来并映射。代码页需要 D-cache clean + I-cache invalidate 之后才能安全取指（QEMU 不模拟 cache，上板才见真章）。`/hello.elf` 8744 字节，exec 时 0 页驻留，运行时按需装载 2 页
-- **程序区与 fork**：每个地址空间多一张 `0x09000000` 的 L2 页表；fork 时程序页整帧复制（代码段只读、数据段通常一两页，比再维护一套 COW 路径简单）。演示里加载后的程序自己 fork 一次，子进程退出码 3 被父进程 wait 收回
+- **按需装载代码页**：阶段12 起，exec 只读 ELF 头部（前 1KB 的 ELF header + program header），把段表登记进 TCB，正文一页都不读；第一次执行/读写到某一页时，Prefetch/Data Abort 进入 `vm_prog_fault`，按页从文件 `open/seek/read` 进来并映射。代码页需要 D-cache clean + I-cache invalidate 之后才能安全取指（QEMU 不模拟 cache，上板才见真章）。`/hello.elf` 16936 字节，exec 时 0 页驻留，运行时按需装载 2 页代码 + 1 页数据
+- **文件页缓存**：`mm/page_cache.c` 维护一张 16 项线性表，键是 `(文件路径, 文件偏移)`，值是物理页框。只读 ELF 代码页进缓存，多个进程（包括先后执行的）共享同一份物理内存；每项自带引用计数，`refs==1` 表示只有缓存自己钉着，可以被 LRU 驱逐或直接回收。可写数据段不进缓存。页框池耗尽时先回收空闲缓存页——文件页是干净的，丢弃比换出私有页便宜。演示：子进程第一次 exec 填 2 页缓存，父进程 wait 后再次 exec 同一个文件，2 次缺页全部命中；收尾把空闲缓存页回收掉，64/64 帧完整归还
+- **程序区与 fork**：每个地址空间多一张 `0x09000000` 的 L2 页表；fork 时只读代码页如果在页缓存里，直接加引用共享同一帧，可写数据段仍整帧复制（数据页通常只有一两页，比再维护一套程序区 COW 简单）。演示里加载后的程序自己 fork 一次，子进程退出码 3 被父进程 wait 收回
 - **僵尸进程与 wait**：`SYS_EXIT` 带退出码，有父进程的任务退出后变成僵尸，TCB 留在任务表里等父进程 `SYS_WAIT` 取走；父进程可以阻塞等任意/指定子进程，子进程退出时被唤醒。僵尸状态的转换放在 `schedule()` 切换前完成，避免父进程在退出任务还踩着自己内核栈时就把它回收
 - **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST / GET_TTBR0 / VM_STATS / FORK / EXEC / WAIT / EXEC_ELF`；`copy_from_user` / `copy_to_user` 先代用户补页，再走当前任务的页表检查用户指针（区分读/写权限）
 - **异常恢复**：捕获 Data Abort / Prefetch Abort，打印任务名、故障地址与 DFSR/DFAR，杀掉出错的用户任务后继续调度，系统不宕机
@@ -67,6 +68,7 @@ mos/
 │   │   ├── frame.c             # 物理页框池（位图 + 所有者记录）
 │   │   ├── swap.c              # 页面换出区（槽位位图 + 4KB 拷贝 + 回收）
 │   │   ├── vm.c                # 按需分页：缺页分类、补页、页面换出、统计
+│   │   ├── page_cache.c        # 文件页缓存：共享代码页 + 引用计数 + LRU
 │   │   └── addr_space.c        # 每任务地址空间槽位：分配、ASID、回收页框
 │   ├── fs/
 │   │   ├── block_dev.c         # 块设备抽象 + RAM 盘
@@ -99,6 +101,7 @@ make clean      # 清理构建产物
 ========================================
   MOS RTOS v0.6
   MMU + per-task page tables + ASID + demand paging
+  + file-backed page cache (shared text pages)
 ========================================
 
 [INIT] MMU enabled (identity map)

@@ -17,6 +17,7 @@
 #include "mm/mmu.h"
 #include "mm/frame.h"
 #include "mm/swap.h"
+#include "mm/page_cache.h"
 #include "kernel/task.h"
 #include "lib/printf.h"
 #include "lib/string.h"
@@ -219,9 +220,12 @@ int user_space_fork(user_space_t *child, const user_space_t *parent)
     }
 
     /*
-     * 程序区 (0x09000000) 的页不参与写时复制。
-     * ELF 的代码段本来就是只读的, 数据段通常也只有一两页; 整帧复制
-     * 比再维护一套"程序区 COW"划算, 也不用改 vm_fault 的区域判断。
+     * 程序区 (0x09000000):
+     *
+     *   - 只读代码页若由页缓存管理, 直接加引用共享同一帧 (阶段13)。
+     *     代码本来就不会被写, 没必要每个进程一份。
+     *   - 可写数据段仍然是整帧复制。程序区的数据页没有 COW: 它们通常
+     *     只有一两页, 维护一套新的 COW 路径不如复制省事。
      */
     if (parent->l2_code_phys) {
         const u32 *pl2c = (const u32 *)(uintptr_t)parent->l2_code_phys;
@@ -229,10 +233,23 @@ int user_space_fork(user_space_t *child, const user_space_t *parent)
 
         for (i = 0; i < 256u; i++) {
             u32 ctec = pl2c[i];
+            u32 ap;
 
             if ((ctec & 0x2u) == 0) {
                 continue;
             }
+
+            /* AP=11 是可写的数据段, 必须复制; 只读代码页才谈共享 */
+            ap = (ctec >> 4) & 0x3u;
+            if (ap != 3u && page_cache_owns(ctec)) {
+                if (page_cache_ref(ctec & 0xFFFFF000u) == 0) {
+                    user_space_destroy(&as);
+                    return -1;
+                }
+                cl2c[i] = ctec;
+                continue;
+            }
+
             phys = frame_alloc(0);
             if (phys == 0) {
                 user_space_destroy(&as);
@@ -282,10 +299,14 @@ void user_space_reset(user_space_t *us)
         l2[i] = 0;
     }
 
-    /* 程序区: 所有页都是常驻的, 没有 swap */
+    /*
+     * 程序区: 所有页都是常驻的, 没有 swap。
+     * 走 page_cache_put 而不是 frame_free: 共享代码页只是还掉本进程
+     * 的引用, 缓存里那一份要留到 LRU 驱逐时才真正释放。
+     */
     for (i = 0; i < 256u; i++) {
         if ((l2c[i] & 0x2u) != 0) {
-            frame_free(l2c[i] & 0xFFFFF000u, 0);
+            page_cache_put(l2c[i] & 0xFFFFF000u);
         }
         l2c[i] = 0;
     }
@@ -364,11 +385,11 @@ void user_space_destroy(user_space_t *us)
         }
     }
 
-    /* 程序区页表: 每页都是常驻帧 */
+    /* 程序区页表: 缓存页只减引用, 私有页直接还帧 */
     l2c = (const u32 *)(uintptr_t)l2c_phys;
     for (i = 0; i < 256u; i++) {
         if ((l2c[i] & 0x2u) != 0) {
-            frame_free(l2c[i] & 0xFFFFF000u, 0);
+            page_cache_put(l2c[i] & 0xFFFFF000u);
             freed++;
         }
     }

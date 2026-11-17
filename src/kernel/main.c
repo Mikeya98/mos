@@ -25,6 +25,7 @@
 #include "mm/mmu.h"
 #include "mm/swap.h"
 #include "mm/frame.h"
+#include "mm/page_cache.h"
 #include "fs/block_dev.h"
 #include "fs/mos_fs.h"
 #include "fs/vfs.h"
@@ -386,6 +387,7 @@ void kernel_main(void)
     printf("========================================\n");
     printf("  MOS RTOS v0.6\n");
     printf("  MMU + ASID + demand paging + swap + fork/COW + exec + lazy ELF\n");
+    printf("  + file-backed page cache (shared text pages)\n");
     printf("========================================\n\n");
 
     mmu_init();
@@ -394,6 +396,9 @@ void kernel_main(void)
     frame_init();
     printf("[INIT] Frame allocator ready (%u frames = %u KB)\n",
            frame_total(), frame_total() * 4u);
+
+    page_cache_init();
+    printf("[INIT] Page cache ready (%u pages max)\n", 16u);
 
     swap_init();
     printf("[INIT] Swap area ready (%u pages = %u KB)\n",

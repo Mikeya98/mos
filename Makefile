@@ -85,6 +85,7 @@ MM_SRCS  = $(SRC_DIR)/mm/buddy.c \
            $(SRC_DIR)/mm/frame.c \
            $(SRC_DIR)/mm/swap.c \
            $(SRC_DIR)/mm/vm.c \
+           $(SRC_DIR)/mm/page_cache.c \
            $(SRC_DIR)/mm/addr_space.c
 
 # 文件系统 (v0.5)

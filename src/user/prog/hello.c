@@ -71,6 +71,12 @@ static inline __attribute__((noreturn)) void prog_exit(s32 code)
 volatile u32 counter = 0x12345678u;
 volatile u32 bss_buf[8];
 
+/* 阶段13: 把只读段撑到多页, 页缓存演示才有得看。
+ * 下标由 pid 算出来, 编译器无法把访问折成立即数, 每一页都会真的读到。 */
+static const unsigned char rodata_pages[8192] = { 0x5A };
+
+static const char msg_ro[] = "[elf] rodata pages read, checksum = ";
+
 static const char msg_data[] = "[elf] .data loaded, .bss is zero\n";
 static const char msg_data_bad[] = "[elf] data/bss check FAILED\n";
 static const char msg_writable[] = "[elf] .data is writable\n";
@@ -127,6 +133,17 @@ void _start(void)
 
     prog_write(msg_hello, sizeof(msg_hello) - 1u);
     prog_write(msg_detail, sizeof(msg_detail) - 1u);
+
+    /* 两个运行期下标, 分别落在只读段的前半和最后半, 把后续页装进来 */
+    {
+        u32 pick = (u32)prog_getpid() & 0x1FFFu;
+        u32 sum  = (u32)rodata_pages[pick]
+                 + (u32)rodata_pages[0x1FFFu - pick];
+
+        prog_write(msg_ro, sizeof(msg_ro) - 1u);
+        put_uint(sum);
+        prog_write("\n", 1);
+    }
 
     prog_write(msg_pid, sizeof(msg_pid) - 1u);
     put_uint((u32)prog_getpid());
