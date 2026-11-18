@@ -187,48 +187,64 @@ int mos_fs_free_inode(block_dev_t *dev, u32 inode_num)
 int mos_fs_alloc_block(block_dev_t *dev)
 {
     fs_superblock_t sb;
+    u32 total_data_blocks;
+    u32 bitmap_blocks;
+    u32 bb;
+
     if (mos_fs_read_superblock(dev, &sb) != 0) return -1;
     if (sb.free_blocks == 0) return -1;
 
-    /* 读块位图 (在 bitmap_start 块) */
-    if (dev->read(dev, sb.bitmap_start, temp_buf) != 0) return -1;
+    /*
+     * v0.7: 位图可以占多个块。
+     *
+     * 原来只有一块位图 (512 B = 4096 位), 放在 64KB RAM 盘上刚好够。
+     * SD 卡动辄几千上万个块, 继续按一块算就会读越界。位图块数由
+     * data_start - bitmap_start 推出, 超级块布局本身已经记录了。
+     */
+    total_data_blocks = sb.total_blocks - sb.data_start;
+    bitmap_blocks = (total_data_blocks + MOS_FS_BITMAP_BITS_PER_BLOCK - 1) /
+                    MOS_FS_BITMAP_BITS_PER_BLOCK;
 
-    /* 在数据块范围内 (block sb.data_start ~ sb.total_blocks-1) 找空闲位 */
-    u32 total_data_blocks = sb.total_blocks - sb.data_start;
-    u32 byte_idx, bit_idx;
-    int found = -1;
+    for (bb = 0; bb < bitmap_blocks; bb++) {
+        u32 base_bit = bb * MOS_FS_BITMAP_BITS_PER_BLOCK;
+        u32 bits = total_data_blocks - base_bit;
+        u32 byte_idx, bit_idx;
 
-    for (byte_idx = 0; byte_idx < (total_data_blocks + 7) / 8; byte_idx++) {
-        if (temp_buf[byte_idx] != 0xFF) {  /* 有空位 */
+        if (bits > MOS_FS_BITMAP_BITS_PER_BLOCK) {
+            bits = MOS_FS_BITMAP_BITS_PER_BLOCK;
+        }
+
+        if (dev->read(dev, sb.bitmap_start + bb, temp_buf) != 0) return -1;
+
+        for (byte_idx = 0; byte_idx < (bits + 7) / 8; byte_idx++) {
+            if (temp_buf[byte_idx] == 0xFF) continue;
+
             for (bit_idx = 0; bit_idx < 8; bit_idx++) {
-                u32 block_offset = byte_idx * 8 + bit_idx;
-                if (block_offset >= total_data_blocks) break;
-                if (!(temp_buf[byte_idx] & (1u << bit_idx))) {
-                    /* 找到空闲块 */
-                    temp_buf[byte_idx] |= (1u << bit_idx);
-                    found = (int)(sb.data_start + block_offset);
-                    break;
-                }
+                u32 off = byte_idx * 8 + bit_idx;
+                u32 found;
+                u32 i;
+
+                if (off >= bits) break;
+                if (temp_buf[byte_idx] & (1u << bit_idx)) continue;
+
+                temp_buf[byte_idx] |= (1u << bit_idx);
+                found = sb.data_start + base_bit + off;
+
+                /* 写回这一块位图 */
+                dev->write(dev, sb.bitmap_start + bb, temp_buf);
+
+                /* 清零新块 (避免读到旧数据) */
+                for (i = 0; i < 128; i++) ((u32 *)temp_buf)[i] = 0;
+                dev->write(dev, found, temp_buf);
+
+                sb.free_blocks--;
+                mos_fs_write_superblock(dev, &sb);
+                return (int)found;
             }
-            if (found >= 0) break;
         }
     }
 
-    if (found < 0) return -1;
-
-    /* 写回位图 */
-    dev->write(dev, sb.bitmap_start, temp_buf);
-
-    /* 清零新块 (避免读到旧数据) */
-    u32 i;
-    for (i = 0; i < 128; i++) ((u32 *)temp_buf)[i] = 0;
-    dev->write(dev, (u32)found, temp_buf);
-
-    /* 更新空闲计数 */
-    sb.free_blocks--;
-    mos_fs_write_superblock(dev, &sb);
-
-    return found;
+    return -1;
 }
 
 int mos_fs_free_block(block_dev_t *dev, u32 block_no)
@@ -237,17 +253,18 @@ int mos_fs_free_block(block_dev_t *dev, u32 block_no)
     if (mos_fs_read_superblock(dev, &sb) != 0) return -1;
     if (block_no < sb.data_start || block_no >= sb.total_blocks) return -1;
 
-    /* 读位图 */
-    if (dev->read(dev, sb.bitmap_start, temp_buf) != 0) return -1;
+    /* 定位到块号对应的那一位 (位图可能跨多个块) */
+    {
+        u32 bit_off = block_no - sb.data_start;
+        u32 bb      = bit_off / MOS_FS_BITMAP_BITS_PER_BLOCK;
+        u32 in_blk  = bit_off % MOS_FS_BITMAP_BITS_PER_BLOCK;
+        u32 byte_idx = in_blk / 8;
+        u32 bit_idx  = in_blk % 8;
 
-    /* 清位 */
-    u32 block_offset = block_no - sb.data_start;
-    u32 byte_idx = block_offset / 8;
-    u32 bit_idx  = block_offset % 8;
-    temp_buf[byte_idx] &= ~(1u << bit_idx);
-
-    /* 写回位图 */
-    dev->write(dev, sb.bitmap_start, temp_buf);
+        if (dev->read(dev, sb.bitmap_start + bb, temp_buf) != 0) return -1;
+        temp_buf[byte_idx] &= ~(1u << bit_idx);
+        dev->write(dev, sb.bitmap_start + bb, temp_buf);
+    }
 
     sb.free_blocks++;
     mos_fs_write_superblock(dev, &sb);
@@ -585,7 +602,27 @@ int mos_fs_mkfs(block_dev_t *dev)
                              / MOS_FS_INODES_PER_BLOCK;
 
     sb.bitmap_start       = sb.inode_table_start + sb.inode_table_blocks;
-    sb.data_start         = sb.bitmap_start + 1;
+
+    /*
+     * 位图块数取决于数据区大小, 数据区起始又取决于位图块数。
+     * 先按 1 块估, 迭代两三次就收敛 (块数每次至少翻 4096 倍)。
+     */
+    {
+        u32 bmp_blocks = 1;
+        u32 iter;
+
+        for (iter = 0; iter < 4; iter++) {
+            u32 data_start = sb.bitmap_start + bmp_blocks;
+            u32 data_blocks = dev->total_blocks - data_start;
+            u32 need = (data_blocks + MOS_FS_BITMAP_BITS_PER_BLOCK - 1) /
+                       MOS_FS_BITMAP_BITS_PER_BLOCK;
+
+            if (need < 1) need = 1;
+            if (need == bmp_blocks) break;
+            bmp_blocks = need;
+        }
+        sb.data_start = sb.bitmap_start + bmp_blocks;
+    }
 
     sb.free_blocks        = dev->total_blocks - sb.data_start;
     sb.free_inodes        = MOS_FS_MAX_INODES;
@@ -612,12 +649,14 @@ int mos_fs_mkfs(block_dev_t *dev)
     }
     mos_fs_write_inode(dev, 0, &root_inode);
 
-    /* 4. 初始化块位图 */
+    /* 4. 初始化块位图 (可能不止一块) */
     {
         u32 j;
         for (j = 0; j < 128; j++) ((u32 *)temp_buf)[j] = 0;
     }
-    dev->write(dev, sb.bitmap_start, temp_buf);
+    for (i = 0; i < sb.data_start - sb.bitmap_start; i++) {
+        dev->write(dev, sb.bitmap_start + i, temp_buf);
+    }
 
     /* 5. 更新超级块 (free_inodes 减 1) */
     sb.free_inodes--;

@@ -164,6 +164,20 @@ int mos_mount(block_dev_t *dev)
     if (mos_fs_read_superblock(dev, &sb) != 0) return -1;
     if (sb.magic != MOS_FS_MAGIC) return -1;
 
+    /*
+     * v0.7: 超级块必须和当前设备对得上。
+     *
+     * 换过卡 / 卡容量读错时, 旧超级块里的 total_blocks 可能比设备还大,
+     * 继续挂载会按越界块号读写。第一次在 QEMU 上跑 SD 驱动时把容量
+     * 算成了 2064MB, 写出来的文件系统就是这么坏的。
+     */
+    if (sb.block_size  != dev->block_size ||
+        sb.total_blocks >  dev->total_blocks ||
+        sb.data_start  <= sb.bitmap_start ||
+        sb.data_start  >= sb.total_blocks) {
+        return -1;
+    }
+
     mounted_dev = dev;
     {
         u32 *src = (u32 *)&sb;

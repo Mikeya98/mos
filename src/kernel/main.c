@@ -27,6 +27,7 @@
 #include "mm/frame.h"
 #include "mm/page_cache.h"
 #include "fs/block_dev.h"
+#include "drivers/sd.h"
 #include "fs/mos_fs.h"
 #include "fs/vfs.h"
 #include "user/user.h"
@@ -234,43 +235,75 @@ extern const unsigned int  user_hello_elf_len;
 
 static void fs_demo(void)
 {
-    block_dev_t *ramdisk;
+    block_dev_t *dev = NULL;
     char buf[128];
     char name[32];
     int fd, dd, result;
     u32 i;
 
     printf("========================================\n");
-    printf("  Filesystem Demo (MOS-FS v0.5)\n");
+    printf("  Filesystem Demo (MOS-FS v0.7)\n");
     printf("========================================\n\n");
 
-    /* 1. 创建 64KB RAM 盘 */
-    ramdisk = ramdisk_create(64 * 1024);
-    if (!ramdisk) {
-        printf("[FAIL] ramdisk_create\n");
-        return;
-    }
-    printf("[CREATE] RAM disk: %u blocks × %u B = %u KB\n",
-           ramdisk->total_blocks, ramdisk->block_size,
-           ramdisk->total_blocks * ramdisk->block_size / 1024);
+    /*
+     * 1. 优先用真实块设备 (SD 卡)。
+     *
+     * QEMU 启动时用 -drive file=build/sd.img,if=sd 挂一张卡; 没有挂卡
+     * 就退回 RAM 盘, 保证老流程照样能跑。
+     *
+     * 卡上已经有 MOS-FS 时直接挂载 —— 第二次运行就能读到上次写的文件,
+     * 这是 RAM 盘做不到的。
+     */
+    if (sd_init() == 0) {
+        dev = sd_block_device();
+        printf("[BLK]  SD card: %u blocks × %u B = %u MB\n",
+               dev->total_blocks, dev->block_size,
+               dev->total_blocks * dev->block_size / (1024 * 1024));
 
-    /* 2. 格式化 */
-    result = mos_fs_mkfs(ramdisk);
-    if (result != 0) {
-        printf("[FAIL] mos_fs_mkfs\n");
-        return;
-    }
-    printf("[PASS]  mos_fs_mkfs — MOS-FS formatted\n");
+        if (mos_mount(dev) == 0) {
+            printf("[PASS]  existing MOS-FS mounted (data persisted)\n");
+        } else {
+            printf("[BLK]  blank card, formatting...\n");
+            result = mos_fs_mkfs(dev);
+            if (result != 0) {
+                printf("[FAIL] mos_fs_mkfs\n");
+                return;
+            }
+            result = mos_mount(dev);
+            if (result != 0) {
+                printf("[FAIL] mos_mount after mkfs\n");
+                return;
+            }
+            printf("[PASS]  MOS-FS formatted and mounted\n");
+        }
+        printf("\n");
+    } else {
+        printf("[BLK]  no SD card, falling back to RAM disk\n");
+        dev = ramdisk_create(64 * 1024);
+        if (!dev) {
+            printf("[FAIL] ramdisk_create\n");
+            return;
+        }
+        printf("[CREATE] RAM disk: %u blocks × %u B = %u KB\n",
+               dev->total_blocks, dev->block_size,
+               dev->total_blocks * dev->block_size / 1024);
 
-    /* 3. 挂载 */
-    result = mos_mount(ramdisk);
-    if (result != 0) {
-        printf("[FAIL] mos_mount (magic mismatch?)\n");
-        return;
-    }
-    printf("[PASS]  mos_mount — filesystem mounted\n\n");
+        result = mos_fs_mkfs(dev);
+        if (result != 0) {
+            printf("[FAIL] mos_fs_mkfs\n");
+            return;
+        }
+        printf("[PASS]  mos_fs_mkfs — MOS-FS formatted\n");
 
-    /* 3b. 把独立编译的用户程序 ELF 写进 RAM 盘 (阶段11)。
+        result = mos_mount(dev);
+        if (result != 0) {
+            printf("[FAIL] mos_mount (magic mismatch?)\n");
+            return;
+        }
+        printf("[PASS]  mos_mount — filesystem mounted\n\n");
+    }
+
+    /* 3b. 把独立编译的用户程序 ELF 写进块设备 (阶段11)。
      *     SYS_EXEC_ELF 之后会像读普通文件一样把它读出来加载。 */
     fd = mos_open("/hello.elf", O_RDWR | O_CREAT);
     if (fd >= 0) {
@@ -385,9 +418,9 @@ void kernel_main(void)
 
     printf("\n");
     printf("========================================\n");
-    printf("  MOS RTOS v0.6\n");
+    printf("  MOS RTOS v0.7\n");
     printf("  MMU + ASID + demand paging + swap + fork/COW + exec + lazy ELF\n");
-    printf("  + file-backed page cache (shared text pages)\n");
+    printf("  + file-backed page cache + SD card (persistent storage)\n");
     printf("========================================\n\n");
 
     mmu_init();

@@ -60,7 +60,8 @@ LIB_SRCS = $(SRC_DIR)/lib/string.c \
 # 驱动
 DRV_SRCS = $(SRC_DIR)/drivers/uart.c \
            $(SRC_DIR)/drivers/gic.c \
-           $(SRC_DIR)/drivers/timer.c
+           $(SRC_DIR)/drivers/timer.c \
+           $(SRC_DIR)/drivers/sd.c
 
 # 内核
 KERNEL_SRCS = $(SRC_DIR)/kernel/main.c \
@@ -115,10 +116,11 @@ DEPS     = $(C_OBJS:.o=.d)
 TARGET   = $(BLD_DIR)/mos.elf
 TARGET_BIN = $(BLD_DIR)/mos.bin
 TARGET_LST = $(BLD_DIR)/mos.lst
+SD_IMG   = $(BLD_DIR)/sd.img
 
 # =========================== 目标 ===========================
 
-.PHONY: all qemu clean dump size dirs
+.PHONY: all qemu qemu-run clean dump size dirs
 
 all: dirs $(TARGET) size
 
@@ -161,7 +163,7 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.S
 # QEMU 仿真 (带 GDB server)
 # -m 1024: 用户代码段链接在 0x08000000 (128MB 处), QEMU zynq 默认内存
 #          不够大时 ELF 的第二段不会被加载, 必须显式给 1GB。
-qemu: all
+qemu: all $(SD_IMG)
 	@echo ""
 	@echo "======================================"
 	@echo "  Starting QEMU (xilinx-zynq-a9)"
@@ -169,6 +171,7 @@ qemu: all
 	@echo ""
 	qemu-system-arm -M xilinx-zynq-a9 -m 1024 \
 		-device loader,file=$(TARGET),cpu-num=0 \
+		-drive file=$(SD_IMG),if=sd,format=raw \
 		-nographic \
 		-serial mon:stdio \
 		-s -S &
@@ -176,12 +179,18 @@ qemu: all
 	@echo "QEMU started with GDB server on :1234"
 	@echo "Connect: gdb-multiarch -ex 'target remote :1234' build/mos.elf"
 
-# 仅编译 + QEMU (直接运行)
-qemu-run: all
+# 仅编译 + QEMU (直接运行, 带 SD 卡)
+qemu-run: all $(SD_IMG)
 	qemu-system-arm -M xilinx-zynq-a9 -m 1024 \
 		-device loader,file=$(TARGET),cpu-num=0 \
+		-drive file=$(SD_IMG),if=sd,format=raw \
 		-nographic \
 		-serial mon:stdio
+
+$(SD_IMG):
+	@mkdir -p $(BLD_DIR)
+	@python -c "open('$(SD_IMG)','wb').write(bytes(8*1024*1024))"
+	@echo "  SD image created: $(SD_IMG)"
 
 # 反汇编
 dump: all

@@ -2,11 +2,15 @@
  * @file    mos_fs.h
  * @brief   MOS-FS 极简文件系统 — 磁盘格式定义与底层操作
  *
- * 磁盘布局 (64KB RAM 盘, 512B 块, 128 块):
- *   Block 0:     超级块
- *   Block 1-2:   Inode 表 (16 inode, 每块 8 个, 每个 64B)
- *   Block 3:     块位图 (128 bits = 16 bytes)
- *   Block 4-127: 数据区 (根目录 + 文件数据)
+ * 磁盘布局 (以 64KB RAM 盘为例, 512B 块, 128 块):
+ *   Block 0:       超级块
+ *   Block 1-2:     Inode 表 (16 inode, 每块 8 个, 每个 64B)
+ *   Block 3..N:    块位图 (每块管 4096 个数据块, 按容量自动延长)
+ *   Block N+1..:   数据区 (根目录 + 文件数据)
+ *
+ * v0.7 把位图从"固定一块"改成多块: SD 卡有 16384 个块, 一块位图
+ * 只够 4096 个, 继续按一块算会读越界。位图块数可以由
+ * data_start - bitmap_start 推出来, 超级块布局不用改。
  *
  * 设计要点:
  *   - inode 0 固定为根目录
@@ -33,6 +37,7 @@
 #define MOS_FS_MAX_FILE_SIZE \
     ((MOS_FS_DIRECT_BLOCKS + MOS_FS_INDIRECT_BLOCKS) * MOS_FS_BLOCK_SIZE)  /* 69KB */
 #define MOS_FS_NAME_MAX     28          /* 文件名最大长度 */
+#define MOS_FS_BITMAP_BITS_PER_BLOCK (MOS_FS_BLOCK_SIZE * 8)  /* 一块位图能管 4096 个块 */
 #define MOS_FS_DIRENTS_PER_BLOCK 16     /* 每块 16 个目录项 (512/32) */
 #define MOS_FS_INODE_U32_COUNT ((u32)(sizeof(fs_inode_t) / 4))  /* fs_inode_t 的 u32 数 */
 

@@ -2,21 +2,23 @@
 
 [![Platform](https://img.shields.io/badge/platform-ARM%20Cortex--A9-blue)](https://github.com/Mikeya98/mos)
 [![Language](https://img.shields.io/badge/language-C%20%7C%20Assembly-orange)](https://github.com/Mikeya98/mos)
-[![Status](https://img.shields.io/badge/status-v0.6%20--%20page%20cache-brightgreen)](https://github.com/Mikeya98/mos)
+[![Status](https://img.shields.io/badge/status-v0.7%20--%20SD%20card-brightgreen)](https://github.com/Mikeya98/mos)
 [![QEMU](https://img.shields.io/badge/QEMU-verified-lightgrey)](https://github.com/Mikeya98/mos)
 
 MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 上，用 QEMU 仿真验证。每一行代码都是手写的，没有引用任何现成的 RTOS 内核代码。
 
 这个项目的目标，是把"操作系统内核"里那些听起来很重的概念——调度、同步、内存管理、文件系统、MMU、用户态切换——一个个用最小可运行的方式实现出来。写的过程中踩了不少坑，都记在 commit 信息和配套文章里了。
 
-## 现在做到哪了（v0.6）
+## 现在做到哪了（v0.7）
 
 内核已经跑通的部分：
 
 - **优先级抢占式调度器**：32 级优先级，用 32-bit 位图 + ARM `CLZ` 指令做到 O(1) 选任务；同优先级内时间片轮转
 - **同步原语**：计数信号量、互斥量（带优先级继承）、消息队列（环形缓冲 + 双等待队列）
 - **内存管理**：Buddy 伙伴分配器（二分分裂 + 异或合并）、SLAB 对象缓存（固定大小对象，O(1) 分配/释放）
-- **文件系统**：MOS-FS——VFS 层 + 块设备抽象 + RAM 盘 + 一套极简磁盘格式；inode 10 个直接块 + 1 个一级间接块（128 个指针），最大文件 69KB
+- **文件系统**：MOS-FS——VFS 层 + 块设备抽象 + 一套极简磁盘格式；inode 10 个直接块 + 1 个一级间接块（128 个指针），最大文件 69KB；块位图支持多块，能管理大容量设备
+- **SD 卡驱动（v0.7）**：Zynq 的 SDHCI 控制器 + PIO 轮询传输，走完整的 SD 初始化流程（CMD0 → CMD8 → ACMD41 → CMD2 → CMD3 → CMD9 → CMD7 → CMD16），CMD17/CMD24 按块读写，支持 SDSC（字节寻址）和 SDHC/SDXC（块寻址）。文件系统优先挂到 SD 卡上，没有卡才退回 RAM 盘；QEMU 用 `-drive file=build/sd.img,if=sd` 挂一张 8MB 镜像，第二次启动能直接读到上次写的文件
+- **持久化验证**：`make qemu-run` 第一次运行格式化卡，重启后挂载已有 MOS-FS，`/hello.txt` 内容原样读回；用户程序 `/hello.elf` 也从 SD 卡按需装载，页缓存在 SD 上照常工作
 - **MMU**：两级页表（L1 section 1MB + L2 small page 4KB）、identity mapping、DDR 可缓存 / 外设 device 分区、已开启 MMU
 - **用户态**：用户态任务（USR/SVC 模式切换）、双栈、trampoline 首次进用户态
 - **权限隔离**：内核区 AP=01 仅特权态可访问；用户代码段 AP=10（用户只读、可执行）；DACR 由 manager 改为 client，让页表 AP 位真正生效
@@ -56,7 +58,8 @@ mos/
 │   ├── drivers/
 │   │   ├── uart.c              # UART 驱动（Cadence / 16550）
 │   │   ├── gic.c               # GIC PL390 中断控制器
-│   │   └── timer.c             # Cortex-A9 私有定时器 + tick
+│   │   ├── timer.c             # Cortex-A9 私有定时器 + tick
+│   │   └── sd.c                # SDHCI + SD 卡驱动（v0.7）
 │   ├── ipc/
 │   │   ├── semaphore.c         # 计数信号量
 │   │   ├── mutex.c             # 互斥量 + 优先级继承
@@ -88,8 +91,11 @@ mos/
 
 ```bash
 make            # 编译，生成 build/mos.elf
-make qemu-run   # 编译并直接在 QEMU 里跑（串口输出到终端）
+make qemu-run   # 编译并直接在 QEMU 里跑（自动创建 8MB SD 镜像 build/sd.img）
 make qemu       # 编译并启动 QEMU，带 GDB server（:1234）
+
+# 想从空白卡重新验证持久化，删掉镜像再跑一次即可：
+rm build/sd.img && make qemu-run
 make dump       # 反汇编到 build/mos.lst
 make size       # 打印各段大小
 make clean      # 清理构建产物
@@ -212,6 +218,7 @@ Starting scheduler...
 | v0.3 | Buddy 伙伴内存分配器 | ✅ |
 | v0.4 | SLAB 对象缓存 + TCB 动态分配 | ✅ |
 | v0.5 | MOS-FS 文件系统（VFS + RAM 盘） | ✅ |
+| v0.7 | SDHCI + SD 卡驱动、文件系统落到真实块设备、多块位图 | ✅ |
 | v0.6 | MMU + 用户态 + 权限隔离 + 每任务独立页表 + ASID + 资源回收 + 按需分页 + 页面换出 + fork/COW + exec + ELF 装载 + 僵尸回收（阶段1 开 MMU、2 模式切换、3 隔离/异常恢复、4 TTBR0 切换、5 ASID/reclaim、6 缺页处理、7 swap、8 fork/写时复制、9 exec/重置、10 僵尸/wait、11 真实 ELF、12 代码页按需装载） | ✅ |
 | 下一步 | 多核调度、进程间共享内存、块设备/持久化 | 🔜 |
 
