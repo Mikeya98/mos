@@ -34,7 +34,16 @@
 #define SYS_EXEC        10      /* exec(entry) 重置地址空间并跳到新入口 (阶段9) */
 #define SYS_WAIT        11      /* wait(pid, &code) 回收子进程 (阶段10) */
 #define SYS_EXEC_ELF    12      /* exec_elf(path) 从文件系统加载 ELF (阶段11) */
-#define SYS_MAX         13
+#define SYS_SIGACTION   13      /* sigaction(sig, handler, tramp) (v0.7 阶段2) */
+#define SYS_KILL        14      /* kill(pid, sig) */
+#define SYS_SIGRETURN   15      /* 从信号处理函数返回 */
+#define SYS_GETPPID     16      /* 返回父进程 pid, 没有父亲返回 0 */
+#define SYS_MAX         17
+
+/* =========================== 信号 =========================== */
+#define MOS_NSIG        32
+#define SIGUSR1         10
+#define SIGUSR2         12
 
 /* =========================== 错误码 =========================== */
 /* 采用 Linux 风格的负值返回, 用户态看到的是 -errno */
@@ -45,6 +54,7 @@
 #define ENOENT          2       /* 文件不存在 */
 #define ENOEXEC         8       /* 不是可加载的可执行文件 */
 #define ECHILD          10      /* 没有这个子进程 (wait) */
+#define ESRCH           3       /* 没有这个进程 (kill) */
 
 /* =========================== 用户地址范围 =========================== */
 /* 定义在 mm/mmu.h: 0x08000000 - 0x08111000 */
@@ -66,6 +76,19 @@ void syscall_init(void);
  * SYS_EXIT 不会返回 (当前任务被销毁并切走)。
  */
 void svc_dispatch(u32 svc_num, u32 *frame);
+
+/**
+ * @brief  返回用户态之前检查并投递信号 (v0.7 阶段2)
+ *
+ * @param  frame  用户态 r0-r12 + lr 的保存区 (SVC/IRQ 入口压在内核栈上的)
+ * @param  pc     中断/系统调用后的用户返回地址
+ * @return 实际应该返回的用户 PC: 没有信号就是 pc, 有信号就是 handler
+ *
+ * 有信号时会把用户现场 (r0-r12, pc, sp, lr) 压到用户栈上, 设置
+ * SP_usr 指向信号帧, 把用户态 LR 设成 tramp, 然后返回 handler 地址。
+ * handler 执行完返回时会跳到 tramp, 由 tramp 发 SVC SIGRETURN 恢复现场。
+ */
+u32 user_signal_check(u32 *frame, u32 pc);
 
 /**
  * @brief  从用户空间拷贝数据到内核空间

@@ -64,6 +64,18 @@
 #if SYS_EXEC_ELF != 12
 #error "SVC immediate for SYS_EXEC_ELF is stale"
 #endif
+#if SYS_SIGACTION != 13
+#error "SVC immediate for SYS_SIGACTION is stale"
+#endif
+#if SYS_KILL != 14
+#error "SVC immediate for SYS_KILL is stale"
+#endif
+#if SYS_SIGRETURN != 15
+#error "SVC immediate for SYS_SIGRETURN is stale"
+#endif
+#if SYS_GETPPID != 16
+#error "SVC immediate for SYS_GETPPID is stale"
+#endif
 
 #define USYS_INLINE  static inline __attribute__((always_inline))
 
@@ -201,6 +213,49 @@ USYS_INLINE s32 usys_exec_elf(const char *path)
 {
     register u32 r0 __asm__("r0") = (u32)(uintptr_t)path;
     __asm__ volatile ("SVC #12" : "+r"(r0) : : "memory");
+    return (s32)r0;
+}
+
+/**
+ * 安装信号处理函数 (v0.7 阶段2)。
+ *
+ * @param sig      信号号 (SIGUSR1 / SIGUSR2 ...)
+ * @param handler  用户处理函数地址; 0 = 恢复默认动作 (终止进程)
+ * @param tramp    处理函数返回后进入的跳板地址, 里面执行 SVC SIGRETURN
+ *
+ * 进入 handler 时 r0 = 信号号, 用户态 LR 已经被内核填成 tramp,
+ * 所以处理函数正常 return 就会回到内核恢复被打断的现场。
+ */
+USYS_INLINE s32 usys_sigaction(u32 sig, void (*handler)(int), void (*tramp)(void))
+{
+    register u32 r0 __asm__("r0") = sig;
+    register u32 r1 __asm__("r1") = (u32)(uintptr_t)handler;
+    register u32 r2 __asm__("r2") = (u32)(uintptr_t)tramp;
+    __asm__ volatile ("SVC #13" : "+r"(r0) : "r"(r1), "r"(r2) : "memory");
+    return (s32)r0;
+}
+
+/** 给 pid 发信号; pid=0 表示自己。 */
+USYS_INLINE s32 usys_kill(s32 pid, u32 sig)
+{
+    register u32 r0 __asm__("r0") = (u32)pid;
+    register u32 r1 __asm__("r1") = sig;
+    __asm__ volatile ("SVC #14" : "+r"(r0) : "r"(r1) : "memory");
+    return (s32)r0;
+}
+
+/** 信号处理函数的返回跳板: 恢复被打断的现场。 */
+USYS_INLINE void usys_sigreturn(void)
+{
+    register u32 r0 __asm__("r0") = 0;
+    __asm__ volatile ("SVC #15" : "+r"(r0) : : "memory");
+}
+
+/** 取父进程 pid (fork 出来的子进程才有, 否则 0)。 */
+USYS_INLINE s32 usys_getppid(void)
+{
+    register u32 r0 __asm__("r0") = 0;
+    __asm__ volatile ("SVC #16" : "+r"(r0) : : "memory");
     return (s32)r0;
 }
 

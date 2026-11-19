@@ -385,7 +385,19 @@ static void fs_demo(void)
 
 /* =========================== 中断分发 =========================== */
 
-void irq_dispatch(void)
+/**
+ * @brief IRQ 分发 (v0.7 阶段2 起带完整的用户现场)
+ *
+ * @param  frame  被中断时压栈的 r0-r12 + lr (14 个字)
+ * @param  pc     被打断的用户地址 (lr_irq - 4)
+ * @return        实际要返回的用户 PC: 没有 pending 信号就是 pc 本身
+ *
+ * 为什么要在这里投递信号: 用户任务被中断时, 它的 r0-r12 还在寄存器里,
+ * 只有中断入口把它们压栈之后内核才有完整的现场可以保存到信号帧里。
+ * 调度器切换任务之后, 本函数会在被切回来的那个任务的栈上继续执行,
+ * 所以 frame 指针始终对应当前任务。
+ */
+u32 irq_dispatch_frame(u32 *frame, u32 pc)
 {
     u32 irq_id;
 
@@ -408,6 +420,9 @@ void irq_dispatch(void)
         printf("[WARN] Unknown IRQ: %u\n", irq_id);
         gic_send_eoi(irq_id);
     }
+
+    /* 返回用户态之前投递 pending 信号 */
+    return user_signal_check(frame, pc);
 }
 
 /* =========================== 内核入口 =========================== */

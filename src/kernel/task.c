@@ -969,6 +969,14 @@ task_t *task_fork(task_t *parent, u32 user_pc)
     child->prog_valid = parent->prog_valid;
     child->elf_loads  = 0;
 
+    /* v0.7 阶段2: 子进程继承信号处理函数, 但 pending 位清空 ——
+     * 父进程还没处理的信号不该突然打到刚 fork 出来的孩子身上。 */
+    for (i = 0; i < MOS_NSIG; i++) {
+        child->sig_handler[i] = parent->sig_handler[i];
+        child->sig_tramp[i]   = parent->sig_tramp[i];
+    }
+    child->sig_pending = 0;
+
     child->block_obj = NULL;
     child->held_mutex = NULL;
     child->sleep_ticks = 0;
@@ -1227,6 +1235,29 @@ void task_kill(task_t *t)
     if (!self) {
         task_release(t);
     }
+}
+
+/* =========================== 信号投递 (v0.7 阶段2) =========================== */
+
+s32 task_signal_send(s32 pid, u32 sig)
+{
+    task_t *t;
+
+    if (sig == 0 || sig >= MOS_NSIG) {
+        return -1;
+    }
+
+    t = (pid == 0) ? current_task : find_task_by_pid((u32)pid);
+    if (!t || t == &idle_tcb || t->state == TASK_DEAD ||
+        t->state == TASK_ZOMBIE) {
+        return -1;
+    }
+
+    ENTER_CRITICAL();
+    t->sig_pending |= (1u << sig);
+    EXIT_CRITICAL();
+
+    return 0;
 }
 
 /**

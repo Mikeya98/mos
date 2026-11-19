@@ -714,6 +714,123 @@ static void USER_TEXT u_wait(void)
     usys_exit(0);
 }
 
+/* =========================== 信号演示 (v0.7 阶段2) =========================== */
+
+static const char msg_sg1[] USER_RODATA =
+    "[user] u_signal: install SIGUSR1 handler, then fork a sender\n";
+static const char msg_sg2[] USER_RODATA =
+    "[user] u_signal: handler ran, sig = ";
+static const char msg_sg3[] USER_RODATA =
+    "[user] u_signal: sigreturn restored the interrupted flow\n";
+static const char msg_sg4[] USER_RODATA =
+    "[user] u_signal: sender child reaped (exit 0)\n";
+static const char msg_sg5[] USER_RODATA =
+    "[user] u_signal: child without handler terminated with -12 (-SIGUSR2)\n";
+static const char msg_sg6[] USER_RODATA =
+    "[user] u_signal: WRONG result — signal delivery FAILED\n";
+static const char msg_sg7[] USER_RODATA =
+    "[user] u_signal: fork FAILED\n";
+static const char msg_sg8[] USER_RODATA =
+    "[user] u_signal: sigaction FAILED\n";
+
+/*
+ * 信号处理函数返回后要执行的一小段代码。
+ * 内核在进入 handler 之前把用户态 LR 改成这个地址, 所以 handler
+ * 正常 return 就会落到这里, 再发 SVC SIGRETURN 让内核恢复现场。
+ */
+static void USER_TEXT sig_tramp(void)
+{
+    usys_sigreturn();
+    while (1) {
+        __asm__ volatile ("NOP");
+    }
+}
+
+static void USER_TEXT sig_handler(int sig)
+{
+    volatile u32 *seen = (volatile u32 *)(uintptr_t)USER_DATA_VADDR;
+
+    *seen = (u32)sig;
+}
+
+/**
+ * 信号演示。
+ *
+ *   子进程 A: yield 若干次后给父进程发 SIGUSR1
+ *   父进程  : 装好 handler 后轮转等信号; 收到后 handler 写私有数据页,
+ *             sigreturn 回到等待循环, 父进程再 wait 回收子进程
+ *   子进程 B: 把 SIGUSR2 恢复成默认动作后给自己发一个 —— 内核在
+ *             kill 返回前按默认动作终止它, 父进程 wait 拿到 -12
+ */
+static void USER_TEXT u_signal(void)
+{
+    volatile u32 *seen = (volatile u32 *)(uintptr_t)USER_DATA_VADDR;
+    s32 child;
+    s32 code;
+    s32 r;
+    u32 i;
+
+    *seen = 0;
+
+    SAY(msg_sg1);
+    if (usys_sigaction(SIGUSR1, sig_handler, sig_tramp) < 0) {
+        SAY(msg_sg8);
+        usys_exit(0);
+    }
+
+    /* ---- 子进程 A: 发 SIGUSR1 ---- */
+    child = usys_fork();
+    if (child == 0) {
+        for (i = 0; i < 300; i++) {
+            usys_yield();
+        }
+        usys_kill(usys_getppid(), SIGUSR1);
+        usys_exit(0);
+    }
+    if (child < 0) {
+        SAY(msg_sg7);
+        usys_exit(0);
+    }
+
+    for (i = 0; i < 5000 && *seen == 0; i++) {
+        usys_yield();
+    }
+
+    if (*seen == SIGUSR1) {
+        SAY(msg_sg2);
+        say_hex(msg_empty, *seen, msg_nl);
+        SAY(msg_sg3);
+    } else {
+        SAY(msg_sg6);
+    }
+
+    code = -1;
+    usys_wait(child, &code);
+    SAY(msg_sg4);
+
+    /* ---- 子进程 B: 默认动作终止 ---- */
+    child = usys_fork();
+    if (child == 0) {
+        usys_sigaction(SIGUSR2, 0, 0);
+        usys_kill(0, SIGUSR2);      /* 发给自己的信号在 kill 返回前生效 */
+        usys_exit(7);               /* 不会执行到这里 */
+    }
+    if (child < 0) {
+        SAY(msg_sg7);
+        usys_exit(0);
+    }
+
+    code = 0;
+    r = usys_wait(child, &code);
+    if (r == child && code == -12) {
+        SAY(msg_sg5);
+    } else {
+        SAY(msg_sg6);
+    }
+
+    usys_exit(0);
+}
+
 /* =========================== 内核侧初始化 =========================== */
 
 extern u8 _user_text_start;
@@ -855,7 +972,7 @@ static void pool_manager(void)
 void user_demo_init(void)
 {
     printf("========================================\n");
-    printf("  User Mode Demo (v0.6 阶段13: fork/COW + exec + wait + lazy ELF + page cache)\n");
+    printf("  User Mode Demo (v0.7: fork/COW + exec + wait + lazy ELF + page cache + signals)\n");
     printf("  user code : %X - %X (shared, read-only)\n",
            (u32)(uintptr_t)&_user_text_start,
            (u32)(uintptr_t)&_user_text_end);
@@ -890,11 +1007,12 @@ void user_demo_init(void)
      * 槽位已经占满, 会直接拿到 -ENOMEM。
      */
     if (!create_user("u_wait",    u_wait,    2)) return;
+    if (!create_user("u_signal",  u_signal,  2)) return;
     if (!create_user("u_demand",  u_demand,  1)) return;
     if (!create_user("u_overflow", u_overflow, 1)) return;
     if (!create_user("u_swap",    u_swap,    1)) return;
 
-    printf("\n[DEMO] 12 user tasks created, each with its own L1 page table\n");
+    printf("\n[DEMO] 14 user tasks created, each with its own L1 page table\n");
 
     /*
      * 回收演示的驱动任务: 内核态, 优先级 30 (只比 IDLE 高)。

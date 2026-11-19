@@ -33,6 +33,8 @@
 /* 异常处理 (exception.c) */
 .extern data_abort_handler
 .extern prefetch_abort_handler
+/* IRQ 分发 + 信号投递 (main.c) */
+.extern irq_dispatch_frame
 
 /* =========================== 链接脚本符号 =========================== */
 /* 数据段边界 (copy data from LMA to VMA) */
@@ -342,31 +344,38 @@ data_handler:
 irq_handler:
     /*
      * IRQ 处理流程:
-     *   1. 保存 r0-r12, lr 到被中断任务的栈
+     *   1. 保存完整用户现场 r0-r12, lr 到被中断任务的栈
      *   2. 读 GIC IAR 获取中断 ID
      *   3. 根据 ID 调用对应的 ISR
      *   4. 写 GIC EOIR
      *   5. 检查是否需要调度
-     *   6. 恢复上下文
+     *   6. 检查并投递 pending 信号 (v0.7 阶段2)
+     *   7. 恢复上下文
+     *
+     * 栈布局 (从低到高):
+     *   PUSH {r0-r12, lr}      14 个字: r0..r12 在 [sp+0..48], [sp+52] 是
+     *                          SVC 模式自己的 LR (被中断代码的返回地址)
+     *   SRSFD 保存的 lr_irq / spsr_irq 在 [sp+56] / [sp+60]
+     *
+     * 注意别把 [sp+52] 当成"被打断的 PC": LR 是 banked 寄存器, SRSFD
+     * 存的是 IRQ 模式那份 (真正的返回地址), PUSH 进去的是 SVC 模式
+     * 那份 (被中断函数自己的 LR), 两者不是一回事。
+     * C 函数返回的"实际返回 PC"写回 [sp+56] —— RFEFD 从那里取 PC。
      */
-
-    @ 保存现场: r0-r12, lr_irq → SVC 栈
-    SUB     lr, lr, #4              @ IRQ 返回时需要减去 4 (流水线偏移)
-    SRSFD   sp!, #MODE_SVC          @ 保存 lr_irq 和 spsr_irq 到 SVC 栈
-
-    @ 切到 SVC 模式执行 ISR
+    SUB     lr, lr, #4              @ lr_irq 是"下一条指令", 减 4 才是被打断的指令
+    SRSFD   sp!, #MODE_SVC
     CPS     #MODE_SVC
 
-    @ 保存 caller-saved 寄存器
-    PUSH    {r0-r3, r12, lr}
+    PUSH    {r0-r12, lr}            @ 完整现场 (v0.7 起信号需要 r4-r11)
 
-    @ 调用 C 语言 IRQ 分发函数
-    BL      irq_dispatch
+    MOV     r0, sp                  @ frame = 压栈现场
+    LDR     r1, [sp, #56]           @ pc = SRSFD 保存的 lr_irq (真正的返回地址)
+    BL      irq_dispatch_frame      @ 返回实际要返回的 PC
 
-    @ 恢复 caller-saved 寄存器
-    POP     {r0-r3, r12, lr}
+    STR     r0, [sp, #56]           @ 写回 RFE 的 PC 槽 (可能被换成 handler)
+    POP     {r0-r12, lr}
 
-    @ 异常返回 (同时恢复 CPSR)
+    @ 异常返回 (同时恢复 CPSR); USR 的 SP/LR 已由信号投递代码写好
     RFEFD   sp!
 
 fiq_handler:

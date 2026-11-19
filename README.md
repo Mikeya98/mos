@@ -2,7 +2,7 @@
 
 [![Platform](https://img.shields.io/badge/platform-ARM%20Cortex--A9-blue)](https://github.com/Mikeya98/mos)
 [![Language](https://img.shields.io/badge/language-C%20%7C%20Assembly-orange)](https://github.com/Mikeya98/mos)
-[![Status](https://img.shields.io/badge/status-v0.7%20--%20SD%20card-brightgreen)](https://github.com/Mikeya98/mos)
+[![Status](https://img.shields.io/badge/status-v0.7%20--%20SD%20card%20%2B%20signals-brightgreen)](https://github.com/Mikeya98/mos)
 [![QEMU](https://img.shields.io/badge/QEMU-verified-lightgrey)](https://github.com/Mikeya98/mos)
 
 MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 上，用 QEMU 仿真验证。每一行代码都是手写的，没有引用任何现成的 RTOS 内核代码。
@@ -35,7 +35,8 @@ MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 �
 - **文件页缓存**：`mm/page_cache.c` 维护一张 16 项线性表，键是 `(文件路径, 文件偏移)`，值是物理页框。只读 ELF 代码页进缓存，多个进程（包括先后执行的）共享同一份物理内存；每项自带引用计数，`refs==1` 表示只有缓存自己钉着，可以被 LRU 驱逐或直接回收。可写数据段不进缓存。页框池耗尽时先回收空闲缓存页——文件页是干净的，丢弃比换出私有页便宜。演示：子进程第一次 exec 填 2 页缓存，父进程 wait 后再次 exec 同一个文件，2 次缺页全部命中；收尾把空闲缓存页回收掉，64/64 帧完整归还
 - **程序区与 fork**：每个地址空间多一张 `0x09000000` 的 L2 页表；fork 时只读代码页如果在页缓存里，直接加引用共享同一帧，可写数据段仍整帧复制（数据页通常只有一两页，比再维护一套程序区 COW 简单）。演示里加载后的程序自己 fork 一次，子进程退出码 3 被父进程 wait 收回
 - **僵尸进程与 wait**：`SYS_EXIT` 带退出码，有父进程的任务退出后变成僵尸，TCB 留在任务表里等父进程 `SYS_WAIT` 取走；父进程可以阻塞等任意/指定子进程，子进程退出时被唤醒。僵尸状态的转换放在 `schedule()` 切换前完成，避免父进程在退出任务还踩着自己内核栈时就把它回收
-- **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST / GET_TTBR0 / VM_STATS / FORK / EXEC / WAIT / EXEC_ELF`；`copy_from_user` / `copy_to_user` 先代用户补页，再走当前任务的页表检查用户指针（区分读/写权限）
+- **信号（v0.7 阶段2）**：`SYS_SIGACTION / KILL / SIGRETURN / GETPPID`。handler 地址存在 TCB 里，kill 只置 pending 位；任务下一次从内核返回用户态时，内核把 r0-r12/PC/SP/LR 压成信号帧放到用户栈上，把用户态 LR 改成用户传入的 tramp，再跳进 handler。handler 返回时 tramp 发 `SIGRETURN`，内核从信号帧恢复现场继续跑。没装 handler 的信号按默认动作终止进程；fork 继承处理函数但清空 pending，exec 全部复位；`u_signal` 演示了 handler 投递、sigreturn 恢复和默认终止（退出码 -12）三种路径
+- **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST / GET_TTBR0 / VM_STATS / FORK / EXEC / WAIT / EXEC_ELF / SIGACTION / KILL / SIGRETURN / GETPPID`；`copy_from_user` / `copy_to_user` 先代用户补页，再走当前任务的页表检查用户指针（区分读/写权限）
 - **异常恢复**：捕获 Data Abort / Prefetch Abort，打印任务名、故障地址与 DFSR/DFAR，杀掉出错的用户任务后继续调度，系统不宕机
 
 ## 目录结构
@@ -186,12 +187,12 @@ Starting scheduler...
 [elf] parent: wait reaped child, code = 3
 [elf] exit(0)
 
-[POOL] free slots: 13 / 13, free frames: 64 / 64
+[POOL] free slots: 14 / 14, free frames: 64 / 64
 [POOL] wave 0: created 8 tasks, free slots now 5, free frames 64
 [user] u_spawn : running in a recycled address space
-[POOL] wave 0: spawn tasks gone, free slots = 13, free frames = 64
+[POOL] wave 0: spawn tasks gone, free slots = 14, free frames = 64
     （wave 1 / 2 重复两轮）
-[POOL] done — 13 of 13 slots free, 64 of 64 frames free
+[POOL] done — 14 of 14 slots free, 64 of 64 frames free
 ```
 
 这些输出分别验证了：
@@ -205,7 +206,8 @@ Starting scheduler...
 7. `u_fork` 先往数据页写 `0x11111111`，fork 之后子进程读到同样的值，改成 `0x22222222` 后退出；父进程读回仍然是 `0x11111111`。日志里的 `[COW]` 行是子进程第一次写共享页时触发的页复制，父进程的数据没有被改动；
 8. `u_exec` 往数据页写 `0xAAAAAAAA`，然后 exec 到 `u_exec_new`；新入口读到的数据页是 0，说明私有地址空间确实被清空重建了，共享的用户代码段不受影响；
 9. `u_elf` 先从 RAM 盘装载独立编译的 `/hello.elf`：exec 日志只有“2 pages pending”，正文页在第一次取指/读数据时才出现两条 `[ELF-PF]`；程序自己 fork 一次，子进程退出码 3 被父进程 wait 收回。加载不存在的 `/missing.elf` 返回 `-ENOENT`，旧镜像继续运行；
-10. `pool_mgr` 连续三轮各创建 8 个短命任务（13 个地址空间槽位里占 8 个），每轮结束后槽位全部归还；这些任务不碰栈也不碰数据页，所以**一个物理页框都不占**（free frames 始终 64）——同一份 256KB 页框池，按阶段4 的预分配方案连 4 个任务都撑不住。
+10. `u_signal` 给父进程发 `SIGUSR1`：handler 在父进程下一次系统调用返回时被投递，写私有数据页后正常返回；`SIGRETURN` 恢复被打断的 yield 循环，等待循环继续往下跑。子进程 B 没有装 `SIGUSR2` handler，kill 自己后按默认动作终止，父进程 wait 拿到的退出码是 -12；
+11. `pool_mgr` 连续三轮各创建 8 个短命任务（14 个地址空间槽位里占 8 个），每轮结束后槽位全部归还；这些任务不碰栈也不碰数据页，所以**一个物理页框都不占**（free frames 始终 64）——同一份 256KB 页框池，按阶段4 的预分配方案连 4 个任务都撑不住。
 
 > QEMU 的 zynq 机器默认内存放不下 `0x08000000` 的第二段，`make qemu-run` 里加了 `-m 1024`。
 
@@ -219,6 +221,7 @@ Starting scheduler...
 | v0.4 | SLAB 对象缓存 + TCB 动态分配 | ✅ |
 | v0.5 | MOS-FS 文件系统（VFS + RAM 盘） | ✅ |
 | v0.7 | SDHCI + SD 卡驱动、文件系统落到真实块设备、多块位图 | ✅ |
+| v0.7 阶段2 | 信号：sigaction/kill/sigreturn、用户栈信号帧、默认终止 | ✅ |
 | v0.6 | MMU + 用户态 + 权限隔离 + 每任务独立页表 + ASID + 资源回收 + 按需分页 + 页面换出 + fork/COW + exec + ELF 装载 + 僵尸回收（阶段1 开 MMU、2 模式切换、3 隔离/异常恢复、4 TTBR0 切换、5 ASID/reclaim、6 缺页处理、7 swap、8 fork/写时复制、9 exec/重置、10 僵尸/wait、11 真实 ELF、12 代码页按需装载） | ✅ |
 | 下一步 | 多核调度、进程间共享内存、块设备/持久化 | 🔜 |
 

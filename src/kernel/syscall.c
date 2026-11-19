@@ -30,9 +30,15 @@
 #include "mm/addr_space.h"
 #include "fs/vfs.h"
 #include "lib/printf.h"
+#include "lib/irq.h"
 
 /* fork/exec 返回用户态共用的跳板 (sched_asm.S) */
 extern void fork_return_trampoline(void);
+
+/* 用户态 SP / LR 的读写 (sched_asm.S, v0.6 阶段8 / v0.7 阶段2) */
+extern void write_user_sp(u32 sp);
+extern u32  read_user_lr(void);
+extern void write_user_lr(u32 lr);
 
 /* =========================== 临界区宏 =========================== */
 #define ENTER_CRITICAL()  __asm__ volatile("CPSID i" ::: "memory", "cc")
@@ -208,11 +214,200 @@ static int sys_vm_stats(void *uout)
     return 0;
 }
 
+/* =========================== 信号 (v0.7 阶段2) =========================== */
+
+/*
+ * 信号帧压在用户栈上, 布局 (20 个字, 80 字节):
+ *   [0..12]  r0-r12
+ *   [13]     被打断的用户 PC
+ *   [14]     被打断时的用户 SP
+ *   [15]     魔数 (sigreturn 校验用)
+ *   [16]     被打断时的用户 LR
+ *   [17..19] 对齐填充
+ *
+ * 为什么 LR 也要存: LR 是 banked 寄存器, 进入 handler 时内核把它改成
+ * tramp, 原值不存下来就恢复不了。
+ */
+#define SIG_FRAME_WORDS 20
+#define SIG_FRAME_MAGIC 0x5349474Eu     /* "SIGN" */
+
+static int user_code_addr_ok(u32 addr)
+{
+    if (addr >= USER_CODE_VADDR && addr < USER_PRIV_VADDR) {
+        return 1;
+    }
+    if (addr >= USER_PROG_VADDR && addr < USER_PROG_LIMIT) {
+        return 1;
+    }
+    return 0;
+}
+
+static int sys_sigaction(task_t *cur, u32 sig, u32 handler, u32 tramp)
+{
+    if (!cur || !cur->is_user) {
+        return -EPERM;
+    }
+    if (sig == 0 || sig >= MOS_NSIG) {
+        return -EINVAL;
+    }
+    if (handler != 0) {
+        if (!user_code_addr_ok(handler) || !user_code_addr_ok(tramp)) {
+            return -EINVAL;
+        }
+    }
+
+    cur->sig_handler[sig] = handler;
+    cur->sig_tramp[sig]   = (handler != 0) ? tramp : 0;
+    return 0;
+}
+
+static int sys_kill(u32 pid, u32 sig)
+{
+    if (sig == 0 || sig >= MOS_NSIG) {
+        return -EINVAL;
+    }
+    if (task_signal_send((s32)pid, sig) < 0) {
+        return -ESRCH;
+    }
+    return 0;
+}
+
+/**
+ * @brief SIGRETURN: 从信号帧恢复被打断的用户现场
+ *
+ * 此时用户 SP 指向 handler 进入前内核压好的信号帧 (handler 正常
+ * return 后 SP 回到入口值)。恢复 r0-r12 / PC / SP / LR 之后返回一个
+ * 特殊值, 由调用者跳过 frame[0] 的覆盖 —— 否则会把恢复出来的
+ * r0 又改写成 0。
+ */
+#define SIGRETURN_RESTORED  0x53494721      /* 内部标记, 不会返回给用户 */
+
+static int sys_sigreturn(u32 *frame)
+{
+    task_t *cur = get_current();
+    u32 kframe[SIG_FRAME_WORDS];
+    u32 sp;
+    u32 i;
+
+    if (!cur || !cur->is_user) {
+        return -EPERM;
+    }
+
+    sp = cur->user_sp;
+    if (copy_from_user(kframe, (const void *)(uintptr_t)sp,
+                       (u32)sizeof(kframe)) < 0) {
+        return -EFAULT;
+    }
+    if (kframe[15] != SIG_FRAME_MAGIC) {
+        printf("[SIG] %s: bad signal frame at %X\n", cur->name, sp);
+        return -EINVAL;
+    }
+
+    for (i = 0; i < 13; i++) {
+        frame[i] = kframe[i];
+    }
+    frame[FRAME_LR] = kframe[13];
+    cur->user_sp    = kframe[14];
+
+    /*
+     * 恢复 banked SP/LR。写 LR 之后到异常返回之间不能调度,
+     * 否则别的任务跑一轮会把用户态 LR 覆盖掉。
+     */
+    irq_save();
+    write_user_sp(kframe[14]);
+    write_user_lr(kframe[16]);
+
+    return SIGRETURN_RESTORED;
+}
+
+/**
+ * @brief 返回用户态前投递一个待处理信号
+ *
+ * SVC 和 IRQ 两条返回路径共用。选择编号最小的 pending 信号:
+ *   - 没装 handler → 默认动作: 终止进程 (task_exit 永不返回)
+ *   - 装了 handler → 现场压用户栈, 返回 handler 地址
+ *
+ * @param frame  r0-r12 + lr 的保存区
+ * @param pc     本应返回的用户 PC
+ * @return       实际返回 PC (handler 或原 pc)
+ */
+u32 user_signal_check(u32 *frame, u32 pc)
+{
+    task_t *cur = get_current();
+    u32 sig;
+    u32 handler;
+    u32 tramp;
+    u32 old_sp;
+    u32 new_sp;
+    u32 kframe[SIG_FRAME_WORDS];
+    u32 i;
+
+    if (!cur || !cur->is_user || cur->sig_pending == 0) {
+        return pc;
+    }
+
+    for (sig = 1; sig < MOS_NSIG; sig++) {
+        if (cur->sig_pending & (1u << sig)) {
+            break;
+        }
+    }
+    if (sig >= MOS_NSIG) {
+        return pc;
+    }
+
+    cur->sig_pending &= ~(1u << sig);
+    handler = cur->sig_handler[sig];
+
+    if (handler == 0) {
+        printf("[SIG] %s: signal %u has no handler, default = terminate\n",
+               cur->name, sig);
+        task_exit(-(s32)sig);
+    }
+
+    tramp  = cur->sig_tramp[sig];
+    old_sp = cur->user_sp;
+    new_sp = (old_sp - SIG_FRAME_WORDS * 4u) & ~0x7u;
+
+    for (i = 0; i < 13; i++) {
+        kframe[i] = frame[i];
+    }
+    kframe[13] = pc;
+    kframe[14] = old_sp;
+    kframe[15] = SIG_FRAME_MAGIC;
+
+    /*
+     * 从这里到异常返回之间关中断:
+     *   - 读到的是本任务被打断时的用户 LR;
+     *   - 写完 banked SP/LR 之后不允许别的任务跑进用户态。
+     * 异常返回会从 SPSR 恢复用户 CPSR, 中断自然重新打开。
+     */
+    irq_save();
+    kframe[16] = read_user_lr();
+
+    if (copy_to_user((void *)(uintptr_t)new_sp, kframe,
+                     (u32)sizeof(kframe)) < 0) {
+        printf("[SIG] %s: cannot build signal frame at %X\n",
+               cur->name, new_sp);
+        task_exit(-11);
+    }
+
+    cur->user_sp = new_sp;
+    write_user_sp(new_sp);
+    write_user_lr(tramp);
+
+    frame[FRAME_R0] = sig;
+
+    printf("[SIG] %s: sig %u → handler %X (frame at %X, sp %X)\n",
+           cur->name, sig, handler, new_sp, old_sp);
+    return handler;
+}
+
 /* =========================== 分发 =========================== */
 
 void svc_dispatch(u32 svc_num, u32 *frame)
 {
     int ret = 0;
+    int sigreturn_done = 0;
 
     /*
      * v0.6 阶段8: 进内核第一件事就是把 SP_usr 存进 TCB。
@@ -363,6 +558,16 @@ void svc_dispatch(u32 svc_num, u32 *frame)
             __asm__ volatile ("MSR SPSR_cxsf, %0" :: "r"(svc_mode) : "memory");
         }
 
+        /* 新程序不继承旧程序的信号处理函数 */
+        {
+            u32 si;
+            for (si = 0; si < MOS_NSIG; si++) {
+                cur->sig_handler[si] = 0;
+                cur->sig_tramp[si]   = 0;
+            }
+            cur->sig_pending = 0;
+        }
+
         printf("[EXEC] %s: new image at %X, private pages reset\n",
                cur->name, entry);
         ret = 0;
@@ -448,9 +653,43 @@ void svc_dispatch(u32 svc_num, u32 *frame)
             __asm__ volatile ("MSR SPSR_cxsf, %0" :: "r"(svc_mode) : "memory");
         }
 
+        /* 新程序不继承旧程序的信号处理函数 */
+        {
+            u32 si;
+            for (si = 0; si < MOS_NSIG; si++) {
+                cur->sig_handler[si] = 0;
+                cur->sig_tramp[si]   = 0;
+            }
+            cur->sig_pending = 0;
+        }
+
         printf("[EXEC] %s: %s mapped, entry %X (code pages load on demand)\n",
                cur->name, path, entry);
         ret = 0;
+        break;
+    }
+
+    case SYS_SIGACTION: {
+        task_t *cur = get_current();
+        ret = sys_sigaction(cur, frame[FRAME_R0], frame[FRAME_R1],
+                            frame[FRAME_R2]);
+        break;
+    }
+
+    case SYS_KILL:
+        ret = sys_kill(frame[FRAME_R0], frame[FRAME_R1]);
+        break;
+
+    case SYS_SIGRETURN:
+        ret = sys_sigreturn(frame);
+        if (ret == SIGRETURN_RESTORED) {
+            sigreturn_done = 1;
+        }
+        break;
+
+    case SYS_GETPPID: {
+        task_t *cur = get_current();
+        ret = cur ? (int)cur->forked_from : 0;
         break;
     }
 
@@ -463,8 +702,20 @@ void svc_dispatch(u32 svc_num, u32 *frame)
     }
     }
 
-    /* 返回值写回 r0, 异常返回后用户态从 r0 读结果 */
-    frame[FRAME_R0] = (u32)ret;
+    /*
+     * 返回值写回 r0, 异常返回后用户态从 r0 读结果。
+     * SYS_SIGRETURN 已经把原始现场恢复进 frame, 不能再覆盖 r0。
+     */
+    if (!sigreturn_done) {
+        frame[FRAME_R0] = (u32)ret;
+    }
+
+    /*
+     * 返回用户态前投递 pending 信号 (v0.7 阶段2)。
+     * 放在最后: 信号处理函数保存的 r0 就是这次系统调用的返回值,
+     * sigreturn 恢复现场后用户态能正常拿到它。
+     */
+    frame[FRAME_LR] = user_signal_check(frame, frame[FRAME_LR]);
 }
 
 /* =========================== 初始化 =========================== */

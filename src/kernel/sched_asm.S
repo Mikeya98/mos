@@ -143,6 +143,32 @@ write_user_sp:
     BX      lr
 
 /* ============================================================
+ * 用户态 LR 的读取 / 设置 (v0.7 阶段2)
+ *
+ * LR 和 SP 一样是 banked 寄存器: USR 模式和 SVC 模式各有一份。
+ * 信号处理需要让 handler 返回后跳到用户态 tramp, 也就是把 USR 这一份
+ * LR 改掉。SVC 模式下直接写 r14 改的是 LR_svc, 用户态根本看不到,
+ * 所以还是借道 SYS 模式 (SYS 和 USR 共用 SP/LR)。
+ *
+ * 注意 CPS 切换模式时当前模式的 LR 保持不变, 所以 BX lr 仍然能用
+ * SVC 模式下保存的返回地址。
+ * ============================================================ */
+.global read_user_lr
+read_user_lr:
+    CPS     #T_MOD_SYS
+    MOV     r0, lr
+    CPS     #T_MOD_SVC
+    BX      lr
+
+.global write_user_lr
+write_user_lr:
+    @ r0 = 要设置的用户态 LR
+    CPS     #T_MOD_SYS
+    MOV     lr, r0
+    CPS     #T_MOD_SVC
+    BX      lr
+
+/* ============================================================
  * fork 子进程的首次返回 (v0.6 阶段8)
  *
  * task_fork 伪造的上下文帧里:

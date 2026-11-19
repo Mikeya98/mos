@@ -115,6 +115,16 @@ typedef struct task_struct {
     u32             wait_pid;      /* 0 = 等任意子进程 */
     u8              wait_active;
 
+    /* --- 信号 (v0.7 阶段2) ---
+     * sig_handler[sig] != 0 表示用户装了处理函数, 0 = 默认动作 (终止)。
+     * sig_tramp[sig] 是用户传入的返回到内核的跳板 (执行 SVC SIGRETURN),
+     * 进入 handler 前会被填进用户态的 LR。
+     * sig_pending 是待处理信号的位图, 在下一次从内核返回用户态时生效。 */
+#define MOS_NSIG        32
+    u32             sig_handler[MOS_NSIG];
+    u32             sig_tramp[MOS_NSIG];
+    u32             sig_pending;
+
     /* --- 程序映像 / 代码页按需装载 (v0.6 阶段12) ---
      * prog_valid=1 表示 0x09000000 窗口由一个 ELF 文件映射, 段表在
      * prog 里。缺页时按页读文件, 页表见 l2_code_phys。
@@ -286,6 +296,18 @@ s32 task_wait(s32 pid, s32 *code);
  * @param  t  目标任务 (NULL / IDLE 时直接返回)
  */
 void task_kill(task_t *t);
+
+/**
+ * @brief  给指定任务投递一个信号 (v0.7 阶段2 SYS_KILL 的实现)
+ *
+ * @param  pid  目标任务 pid, 0 表示当前任务
+ * @param  sig  信号号 1..31
+ * @return 0 成功, -1 没有这个任务 (由 SYS_KILL 翻译成 -ESRCH)
+ *
+ * 只置 pending 位, 不立刻打断目标: 信号在目标任务下一次从内核
+ * 返回用户态时统一投递。
+ */
+s32 task_signal_send(s32 pid, u32 sig);
 
 /* === 睡眠中断处理 (由 timer_isr 触发) === */
 
