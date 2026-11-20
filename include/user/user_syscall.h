@@ -76,6 +76,9 @@
 #if SYS_GETPPID != 16
 #error "SVC immediate for SYS_GETPPID is stale"
 #endif
+#if SYS_SIGPROCMASK != 17
+#error "SVC immediate for SYS_SIGPROCMASK is stale"
+#endif
 
 #define USYS_INLINE  static inline __attribute__((always_inline))
 
@@ -256,6 +259,21 @@ USYS_INLINE s32 usys_getppid(void)
 {
     register u32 r0 __asm__("r0") = 0;
     __asm__ volatile ("SVC #16" : "+r"(r0) : : "memory");
+    return (s32)r0;
+}
+
+/**
+ * 读/改信号屏蔽字 (v0.7 阶段3)。
+ *
+ * how: SIG_BLOCK / SIG_UNBLOCK / SIG_SETMASK；set 是位图，
+ * oldset 非 0 时写回修改前的屏蔽字。返回 0 或负错误码。
+ */
+USYS_INLINE s32 usys_sigprocmask(u32 how, u32 set, u32 *oldset)
+{
+    register u32 r0 __asm__("r0") = how;
+    register u32 r1 __asm__("r1") = set;
+    register u32 r2 __asm__("r2") = (u32)(uintptr_t)oldset;
+    __asm__ volatile ("SVC #17" : "+r"(r0) : "r"(r1), "r"(r2) : "memory");
     return (s32)r0;
 }
 

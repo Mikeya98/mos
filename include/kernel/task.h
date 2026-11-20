@@ -69,6 +69,13 @@ typedef struct task_struct {
 
     /* --- 用户态 (v0.6 阶段2) --- */
     u32             user_sp;       /* 用户态栈指针 (SP_usr, 首次进入时用) */
+    /*
+     * v0.7 阶段3: 用户态 LR (LR_usr) 也是 banked 寄存器。
+     * 信号 handler 返回要靠它跳到 tramp; 如果任务在 handler 里被
+     * 时钟中断切走, 别的任务会把它覆盖掉, 所以必须跟 SP 一样
+     * 在每次上下文切换时保存/恢复。
+     */
+    u32             user_lr;
     u8              is_user;       /* 1=用户态任务 (USR), 0=内核态任务 (SVC) */
 
     /* --- 地址空间 (v0.6 阶段4) --- */
@@ -119,11 +126,22 @@ typedef struct task_struct {
      * sig_handler[sig] != 0 表示用户装了处理函数, 0 = 默认动作 (终止)。
      * sig_tramp[sig] 是用户传入的返回到内核的跳板 (执行 SVC SIGRETURN),
      * 进入 handler 前会被填进用户态的 LR。
-     * sig_pending 是待处理信号的位图, 在下一次从内核返回用户态时生效。 */
+     * sig_pending 是待处理信号的位图, 在下一次从内核返回用户态时生效。
+     *
+     * v0.7 阶段3:
+     *   sig_blocked    屏蔽字。被屏蔽的信号只挂 pending, 不投递。
+     *   sig_interrupted 这次阻塞是被信号打断的, 阻塞中的系统调用
+     *                  看到它要返回 -EINTR。
+     *   block_remove   把本任务从等待队列摘下来的回调。信号量队列
+     *                  和 fork/wait 的阻塞方式不一样, 由阻塞者自己填。
+     *                  NULL 表示这种阻塞不在链表上 (task_wait)。 */
 #define MOS_NSIG        32
     u32             sig_handler[MOS_NSIG];
     u32             sig_tramp[MOS_NSIG];
     u32             sig_pending;
+    u32             sig_blocked;
+    u8              sig_interrupted;
+    void          (*block_remove)(void *obj, struct task_struct *t);
 
     /* --- 程序映像 / 代码页按需装载 (v0.6 阶段12) ---
      * prog_valid=1 表示 0x09000000 窗口由一个 ELF 文件映射, 段表在
@@ -249,6 +267,7 @@ task_t *get_current(void);
 /**
  * @brief  让当前任务睡眠指定毫秒
  * @param  ms  睡眠时长 (毫秒)
+ * @return 0 正常睡醒; -EINTR 被信号提前唤醒
  *
  * 操作:
  *   1. 设置 current->sleep_ticks = ms / TICK_MS
@@ -256,7 +275,7 @@ task_t *get_current(void);
  *   3. 从就绪队列移除
  *   4. 调用 schedule()
  */
-void task_sleep(u32 ms);
+s32 task_sleep(u32 ms);
 
 /**
  * @brief  主动放弃 CPU (让给同优先级下一个任务)
@@ -304,8 +323,8 @@ void task_kill(task_t *t);
  * @param  sig  信号号 1..31
  * @return 0 成功, -1 没有这个任务 (由 SYS_KILL 翻译成 -ESRCH)
  *
- * 只置 pending 位, 不立刻打断目标: 信号在目标任务下一次从内核
- * 返回用户态时统一投递。
+ * 只置 pending 位; 如果目标正阻塞在信号量/wait 上、且这条信号
+ * 没有被屏蔽, 会把它唤醒并让阻塞的系统调用返回 -EINTR。
  */
 s32 task_signal_send(s32 pid, u32 sig);
 

@@ -172,8 +172,8 @@ static int sys_sem_wait(u32 id)
     if (id >= SYS_SEM_MAX || !user_sem_used[id]) {
         return -EINVAL;
     }
-    sem_wait(&user_sems[id]);
-    return 0;
+    /* v0.7 阶段3: 可能返回 -EINTR (信号打断了阻塞) */
+    return sem_wait(&user_sems[id]);
 }
 
 static int sys_sem_post(u32 id)
@@ -273,6 +273,41 @@ static int sys_kill(u32 pid, u32 sig)
 }
 
 /**
+ * @brief SIGPROCMASK: 读/改信号屏蔽字 (v0.7 阶段3)
+ *
+ * @param how   SIG_BLOCK / SIG_UNBLOCK / SIG_SETMASK
+ * @param set   要操作的位图
+ * @param oldp  非 0 时把修改前的屏蔽字写回用户
+ */
+static int sys_sigprocmask(task_t *cur, u32 how, u32 set, u32 oldp)
+{
+    if (!cur || !cur->is_user) {
+        return -EPERM;
+    }
+    if (how > SIG_SETMASK) {
+        return -EINVAL;
+    }
+
+    if (oldp != 0) {
+        u32 old = cur->sig_blocked;
+        if (copy_to_user((void *)(uintptr_t)oldp, &old, sizeof(old)) < 0) {
+            return -EFAULT;
+        }
+    }
+
+    set &= 0xFFFFFFFEu;         /* 信号 0 保留 */
+
+    if (how == SIG_BLOCK) {
+        cur->sig_blocked |= set;
+    } else if (how == SIG_UNBLOCK) {
+        cur->sig_blocked &= ~set;
+    } else {
+        cur->sig_blocked = set;
+    }
+    return 0;
+}
+
+/**
  * @brief SIGRETURN: 从信号帧恢复被打断的用户现场
  *
  * 此时用户 SP 指向 handler 进入前内核压好的信号帧 (handler 正常
@@ -335,6 +370,7 @@ u32 user_signal_check(u32 *frame, u32 pc)
 {
     task_t *cur = get_current();
     u32 sig;
+    u32 deliverable;
     u32 handler;
     u32 tramp;
     u32 old_sp;
@@ -342,12 +378,21 @@ u32 user_signal_check(u32 *frame, u32 pc)
     u32 kframe[SIG_FRAME_WORDS];
     u32 i;
 
-    if (!cur || !cur->is_user || cur->sig_pending == 0) {
+    /*
+     * v0.7 阶段3: 被屏蔽的信号留在 pending 里, 这里跳过。
+     * 解除屏蔽后, 下一次从内核返回用户态时会正常投递。
+     */
+    if (!cur || !cur->is_user) {
+        return pc;
+    }
+
+    deliverable = cur->sig_pending & ~cur->sig_blocked & 0xFFFFFFFEu;
+    if (deliverable == 0) {
         return pc;
     }
 
     for (sig = 1; sig < MOS_NSIG; sig++) {
-        if (cur->sig_pending & (1u << sig)) {
+        if (deliverable & (1u << sig)) {
             break;
         }
     }
@@ -435,7 +480,7 @@ void svc_dispatch(u32 svc_num, u32 *frame)
         break;
 
     case SYS_SLEEP:
-        task_sleep(frame[FRAME_R0]);
+        ret = task_sleep(frame[FRAME_R0]);
         break;
 
     case SYS_GETPID:
@@ -692,6 +737,11 @@ void svc_dispatch(u32 svc_num, u32 *frame)
         ret = cur ? (int)cur->forked_from : 0;
         break;
     }
+
+    case SYS_SIGPROCMASK:
+        ret = sys_sigprocmask(get_current(), frame[FRAME_R0],
+                              frame[FRAME_R1], frame[FRAME_R2]);
+        break;
 
     default: {
         task_t *cur = get_current();

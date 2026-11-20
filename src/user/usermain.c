@@ -28,6 +28,8 @@
  *   u_demand   — 按需分页: 数据页/栈页都是第一次访问才分配
  *   u_overflow — 写栈保护页 → 内核判定栈溢出, 杀掉任务
  *   u_swap     — 页框池耗尽 → 把页换出到 swap 区, 再读回来校验
+ *   u_signal   — 信号: handler 投递 / sigreturn / 默认终止 /
+ *                屏蔽字 / 信号唤醒阻塞在 sem_wait 上的任务 (-EINTR)
  */
 
 #include "lib/types.h"
@@ -733,6 +735,24 @@ static const char msg_sg7[] USER_RODATA =
 static const char msg_sg8[] USER_RODATA =
     "[user] u_signal: sigaction FAILED\n";
 
+/* v0.7 阶段3: 屏蔽字 + 阻塞唤醒 */
+static const char msg_sk1[] USER_RODATA =
+    "[user] u_signal: block SIGUSR1, then send it to self\n";
+static const char msg_sk2[] USER_RODATA =
+    "[user] u_signal: handler did not run while blocked — mask OK\n";
+static const char msg_sk3[] USER_RODATA =
+    "[user] u_signal: unblock — the pending signal should fire now\n";
+static const char msg_sk4[] USER_RODATA =
+    "[user] u_signal: handler ran after unblock — sigprocmask OK\n";
+static const char msg_sk5[] USER_RODATA =
+    "[user] u_signal: block in sem_wait(0), child will signal us\n";
+static const char msg_sk6[] USER_RODATA =
+    "[user] u_signal: sem_wait returned -EINTR — blocked wakeup OK\n";
+static const char msg_sk7[] USER_RODATA =
+    "[user] u_signal: sem_wait was NOT interrupted — FAILED\n";
+static const char msg_sk8[] USER_RODATA =
+    "[user] u_signal: blocked signal leaked through — FAILED\n";
+
 /*
  * 信号处理函数返回后要执行的一小段代码。
  * 内核在进入 handler 之前把用户态 LR 改成这个地址, 所以 handler
@@ -827,6 +847,61 @@ static void USER_TEXT u_signal(void)
     } else {
         SAY(msg_sg6);
     }
+
+    /* ---- v0.7 阶段3: 屏蔽字 ---- */
+    *seen = 0;
+    SAY(msg_sk1);
+    if (usys_sigprocmask(SIG_BLOCK, 1u << SIGUSR1, 0) < 0) {
+        SAY(msg_sk7);
+        usys_exit(0);
+    }
+    usys_kill(0, SIGUSR1);
+
+    for (i = 0; i < 200; i++) {
+        usys_yield();
+    }
+
+    if (*seen == 0) {
+        SAY(msg_sk2);
+    } else {
+        SAY(msg_sk8);
+    }
+
+    SAY(msg_sk3);
+    usys_sigprocmask(SIG_UNBLOCK, 1u << SIGUSR1, 0);
+
+    /* 解除屏蔽的系统调用返回时, 内核在回用户态之前就把 handler 投递了 */
+    if (*seen == SIGUSR1) {
+        SAY(msg_sk4);
+    } else {
+        SAY(msg_sg6);
+    }
+
+    /* ---- v0.7 阶段3: 信号唤醒阻塞在信号量上的任务 ---- */
+    SAY(msg_sk5);
+    child = usys_fork();
+    if (child == 0) {
+        for (i = 0; i < 2000; i++) {
+            usys_yield();
+        }
+        usys_kill(usys_getppid(), SIGUSR1);
+        usys_exit(0);
+    }
+    if (child < 0) {
+        SAY(msg_sg7);
+        usys_exit(0);
+    }
+
+    *seen = 0;
+    r = usys_sem_wait(0);       /* count=0, 阻塞; 被上面的子进程打断 */
+    if (r == -EINTR && *seen == SIGUSR1) {
+        SAY(msg_sk6);
+    } else {
+        SAY(msg_sk7);
+    }
+
+    code = 0;
+    usys_wait(child, &code);
 
     usys_exit(0);
 }
@@ -972,7 +1047,8 @@ static void pool_manager(void)
 void user_demo_init(void)
 {
     printf("========================================\n");
-    printf("  User Mode Demo (v0.7: fork/COW + exec + wait + lazy ELF + page cache + signals)\n");
+    printf("  User Mode Demo (v0.7: fork/COW + exec + wait + lazy ELF + page cache\n");
+    printf("                  + signals + sigprocmask/EINTR)\n");
     printf("  user code : %X - %X (shared, read-only)\n",
            (u32)(uintptr_t)&_user_text_start,
            (u32)(uintptr_t)&_user_text_end);

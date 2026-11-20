@@ -25,6 +25,8 @@
 /* v0.6 阶段8: 汇编实现的 banked SP_usr 读写 + fork 返回跳板 */
 extern u32  read_user_sp(void);
 extern void write_user_sp(u32 sp);
+extern u32  read_user_lr(void);
+extern void write_user_lr(u32 lr);
 extern void fork_return_trampoline(void);
 
 /* =========================== 外部引用 =========================== */
@@ -84,7 +86,8 @@ static u32 tcb_count = 0;
 /* 延迟回收 (实现在本文件后半部分, schedule 里要提前调用) */
 static void reclaim_drain(void);
 
-/* 每任务 SP_usr 恢复 (实现在 fork 小节, schedule 里要提前调用) */
+/* 每任务 SP_usr / LR_usr 保存与恢复 (schedule 里使用) */
+static void task_save_user_lr(task_t *t);
 static void task_restore_user_sp(task_t *t);
 
 /* v0.6 阶段10: 僵尸进程 / wait */
@@ -485,9 +488,14 @@ void schedule(void)
         next->state = TASK_RUNNING;
 
         /*
-         * 恢复新任务的用户栈指针 (v0.6 阶段8)。
-         * SP_usr 是 banked 寄存器, 不随 TCB 自动切换, 必须显式写回。
+         * 保存当前任务的 LR_usr, 再恢复新任务的 SP_usr / LR_usr。
+         *
+         * 两个都是 banked 寄存器, 不随 TCB 自动切换。v0.7 阶段3 之前
+         * 只处理了 SP: 信号投递把 LR_usr 改成 tramp 之后, handler 如果
+         * 被 tick 切走, 别的用户任务会把 LR_usr 覆盖, handler 返回时
+         * 就跳到别人的返回地址上。
          */
+        task_save_user_lr(old);
         task_restore_user_sp(next);
 
         /*
@@ -577,11 +585,20 @@ void sched_request(void)
     need_resched = 1;
 }
 
-void task_sleep(u32 ms)
+s32 task_sleep(u32 ms)
 {
-    if (ms == 0) return;
+    if (ms == 0) return 0;
 
     ENTER_CRITICAL();
+
+    /*
+     * v0.7 阶段3: 睡眠之前检查可投递信号。信号在系统调用入口之前
+     * 就到了的话, 直接返回 -EINTR, 否则会睡到超时才被投递。
+     */
+    if (current_task->sig_pending & ~current_task->sig_blocked & 0xFFFFFFFEu) {
+        EXIT_CRITICAL();
+        return -EINTR;
+    }
 
     current_task->sleep_ticks = ms / TICK_MS;
     if (current_task->sleep_ticks == 0) {
@@ -594,6 +611,16 @@ void task_sleep(u32 ms)
 
     EXIT_CRITICAL();
     schedule();
+
+    /*
+     * v0.7 阶段3: 正常睡醒由 sys_tick_handler 唤醒; 信号打断由
+     * task_signal_send 唤醒并置 sig_interrupted, 这里按 -EINTR 返回。
+     */
+    if (current_task->sig_interrupted) {
+        current_task->sig_interrupted = 0;
+        return -EINTR;
+    }
+    return 0;
 }
 
 /* =========================== 系统 tick =========================== */
@@ -883,6 +910,30 @@ static void task_restore_user_sp(task_t *t)
 
     cpsr = irq_save();
     write_user_sp(t->user_sp);
+    write_user_lr(t->user_lr);
+    irq_restore(cpsr);
+}
+
+/**
+ * @brief  把当前任务的 LR_usr 存回 TCB (v0.7 阶段3)
+ *
+ * LR_usr 是 CPU 全局的 banked 寄存器, 和 SP_usr 一样不跟 TCB 走。
+ * 信号投递会把 LR_usr 改成 tramp; 如果 handler 被时钟中断切走,
+ * 下一个用户任务会用 LR_usr 做函数返回, 再切回来时 handler 的
+ * 返回地址就变成了别人的值, 直接跑飞。
+ *
+ * 在每次 context_switch 之前调用 (当前任务还是 old)。
+ */
+static void task_save_user_lr(task_t *t)
+{
+    u32 cpsr;
+
+    if (!t || !t->is_user) {
+        return;
+    }
+
+    cpsr = irq_save();
+    t->user_lr = read_user_lr();
     irq_restore(cpsr);
 }
 
@@ -975,7 +1026,10 @@ task_t *task_fork(task_t *parent, u32 user_pc)
         child->sig_handler[i] = parent->sig_handler[i];
         child->sig_tramp[i]   = parent->sig_tramp[i];
     }
-    child->sig_pending = 0;
+    child->sig_pending     = 0;
+    child->sig_blocked     = parent->sig_blocked;   /* fork 继承屏蔽字 */
+    child->sig_interrupted = 0;
+    child->block_remove    = NULL;
 
     child->block_obj = NULL;
     child->held_mutex = NULL;
@@ -1242,6 +1296,8 @@ void task_kill(task_t *t)
 s32 task_signal_send(s32 pid, u32 sig)
 {
     task_t *t;
+    int woke = 0;
+    int preempt = 0;
 
     if (sig == 0 || sig >= MOS_NSIG) {
         return -1;
@@ -1255,7 +1311,44 @@ s32 task_signal_send(s32 pid, u32 sig)
 
     ENTER_CRITICAL();
     t->sig_pending |= (1u << sig);
+
+    /*
+     * v0.7 阶段3: 目标正阻塞、且这条信号没有被屏蔽 → 唤醒它。
+     *
+     * 只处理用户任务。用户任务的阻塞只有两种:
+     *   - sem_wait: 在信号量的链表上, TCB 里有 block_remove 负责摘链
+     *   - task_wait: 扫 TCB 找子进程, 没有等待队列, block_remove 为 NULL
+     *
+     * 被屏蔽的信号不唤醒, 留在 pending 里等 sigprocmask 解除屏蔽。
+     */
+    if (t->is_user && !(t->sig_blocked & (1u << sig)) &&
+        (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING)) {
+        t->sig_interrupted = 1;
+
+        if (t->state == TASK_BLOCKED && t->block_remove) {
+            t->block_remove(t->block_obj, t);
+        }
+        t->sleep_ticks  = 0;
+        t->block_obj    = NULL;
+        t->block_remove = NULL;
+
+        ready_enqueue(t);       /* 内部把 state 改成 TASK_READY */
+        woke = 1;
+
+        if (current_task && t->priority < current_task->priority) {
+            preempt = 1;
+        }
+    }
+
     EXIT_CRITICAL();
+
+    if (woke) {
+        printf("[SIG] %s: sig %u wakes blocked task pid %u\n",
+               t->name, sig, t->pid);
+    }
+    if (preempt) {
+        schedule();
+    }
 
     return 0;
 }
@@ -1386,6 +1479,19 @@ s32 task_wait(s32 pid, s32 *code)
 
         ENTER_CRITICAL();
 
+        /*
+         * v0.7 阶段3: 被信号唤醒的 wait 按 -EINTR 返回。
+         * 放在扫描子进程之前: 这次醒来不是子进程状态变了, 而是
+         * 用户装了 handler 的信号到了, 应该让用户自己决定重不重试。
+         */
+        if (cur->sig_interrupted) {
+            cur->sig_interrupted = 0;
+            cur->wait_active = 0;
+            cur->wait_pid = 0;
+            EXIT_CRITICAL();
+            return -EINTR;
+        }
+
         for (i = 0; i < tcb_count; i++) {
             task_t *t = tcb_list[i];
 
@@ -1437,6 +1543,17 @@ s32 task_wait(s32 pid, s32 *code)
             cur->wait_pid = 0;
             EXIT_CRITICAL();
             return -ECHILD;
+        }
+
+        /*
+         * v0.7 阶段3: 和 sem_wait 一样, 阻塞前先检查信号。
+         * 有可投递的信号就不睡了, 让返回路径先投递。
+         */
+        if (cur->sig_pending & ~cur->sig_blocked & 0xFFFFFFFEu) {
+            cur->wait_active = 0;
+            cur->wait_pid = 0;
+            EXIT_CRITICAL();
+            return -EINTR;
         }
 
         cur->wait_pid = (u32)pid;

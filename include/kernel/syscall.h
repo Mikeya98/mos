@@ -38,12 +38,18 @@
 #define SYS_KILL        14      /* kill(pid, sig) */
 #define SYS_SIGRETURN   15      /* 从信号处理函数返回 */
 #define SYS_GETPPID     16      /* 返回父进程 pid, 没有父亲返回 0 */
-#define SYS_MAX         17
+#define SYS_SIGPROCMASK 17      /* sigprocmask(how, set, oldset) (v0.7 阶段3) */
+#define SYS_MAX         18
 
 /* =========================== 信号 =========================== */
 #define MOS_NSIG        32
 #define SIGUSR1         10
 #define SIGUSR2         12
+
+/* sigprocmask 的 how */
+#define SIG_BLOCK       0       /* 把 set 里的信号加入屏蔽字 */
+#define SIG_UNBLOCK     1       /* 从屏蔽字里去掉 set */
+#define SIG_SETMASK     2       /* 直接替换屏蔽字 */
 
 /* =========================== 错误码 =========================== */
 /* 采用 Linux 风格的负值返回, 用户态看到的是 -errno */
@@ -55,6 +61,7 @@
 #define ENOEXEC         8       /* 不是可加载的可执行文件 */
 #define ECHILD          10      /* 没有这个子进程 (wait) */
 #define ESRCH           3       /* 没有这个进程 (kill) */
+#define EINTR           4       /* 阻塞的系统调用被信号打断 (v0.7 阶段3) */
 
 /* =========================== 用户地址范围 =========================== */
 /* 定义在 mm/mmu.h: 0x08000000 - 0x08111000 */

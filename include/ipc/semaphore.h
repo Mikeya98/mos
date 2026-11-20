@@ -57,8 +57,12 @@ void sem_init(sem_t *sem, int init_count);
  *
  * 注意: 可以嵌套调用 (同一任务调用多次 wait 会造成死锁),
  * v0.1 不做重入检测。
+ *
+ * 返回:
+ *   0      拿到信号量
+ *   -EINTR 阻塞期间被信号打断 (v0.7 阶段3), 计数已还原
  */
-void sem_wait(sem_t *sem);
+int sem_wait(sem_t *sem);
 
 /**
  * @brief  V 操作 (Signal / Up) — 释放信号量
