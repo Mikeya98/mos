@@ -139,6 +139,18 @@ typedef struct task_struct {
     u32             sig_handler[MOS_NSIG];
     u32             sig_tramp[MOS_NSIG];
     u32             sig_pending;
+
+    /*
+     * v0.7 阶段4: 实时信号排队 + SIG_IGN。
+     *
+     *   sig_count[sig]  这条信号还有几份没投递。普通信号按 POSIX
+     *                   语义合并成 1 份; SIGRTMIN..SIGRTMAX 最多排
+     *                   MOS_SIG_MAXPENDING 份, 满了丢弃。
+     *   sig_ignore      SIG_IGN 位图。被忽略的信号连 pending 都不置,
+     *                   直接丢掉 —— 和 POSIX 一致。
+     */
+    u8              sig_count[MOS_NSIG];
+    u32             sig_ignore;
     u32             sig_blocked;
     u8              sig_interrupted;
     void          (*block_remove)(void *obj, struct task_struct *t);

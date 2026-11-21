@@ -753,6 +753,23 @@ static const char msg_sk7[] USER_RODATA =
 static const char msg_sk8[] USER_RODATA =
     "[user] u_signal: blocked signal leaked through — FAILED\n";
 
+static const char msg_rt1[] USER_RODATA =
+    "[user] u_signal: block SIGRTMIN, queue it 3 times\n";
+static const char msg_rt2[] USER_RODATA =
+    "[user] u_signal: RT signal stayed pending while blocked — mask OK\n";
+static const char msg_rt3[] USER_RODATA =
+    "[user] u_signal: handler ran 3 times after unblock — queue OK\n";
+static const char msg_rt_bad[] USER_RODATA =
+    "[user] u_signal: RT queue FAILED\n";
+static const char msg_prio_ok[] USER_RODATA =
+    "[user] u_signal: RT delivered before the lower-numbered USR1 — priority OK\n";
+static const char msg_prio_bad[] USER_RODATA =
+    "[user] u_signal: signal priority FAILED\n";
+static const char msg_ign1[] USER_RODATA =
+    "[user] u_signal: SIG_IGN on SIGUSR2, then kill self\n";
+static const char msg_ign2[] USER_RODATA =
+    "[user] u_signal: still alive — SIG_IGN dropped the signal\n";
+
 /*
  * 信号处理函数返回后要执行的一小段代码。
  * 内核在进入 handler 之前把用户态 LR 改成这个地址, 所以 handler
@@ -771,6 +788,22 @@ static void USER_TEXT sig_handler(int sig)
     volatile u32 *seen = (volatile u32 *)(uintptr_t)USER_DATA_VADDR;
 
     *seen = (u32)sig;
+}
+
+/*
+ * 阶段4 用的 handler: 记录投递顺序。
+ *   p[0] = 已经跑到第几次
+ *   p[1..] = 依次收到的信号号
+ * 数据页只有 1 页, 这里最多记 4 次就够验证排队和优先级。
+ */
+static void USER_TEXT sig_handler_rt(int sig)
+{
+    volatile u32 *p = (volatile u32 *)(uintptr_t)USER_DATA_VADDR;
+
+    if (p[0] < 4u) {
+        p[1 + p[0]] = (u32)sig;
+    }
+    p[0] = p[0] + 1u;
 }
 
 /**
@@ -902,6 +935,80 @@ static void USER_TEXT u_signal(void)
 
     code = 0;
     usys_wait(child, &code);
+
+    /* ================= v0.7 阶段4: 排队 / SIG_IGN / 优先级 ================= */
+
+    /*
+     * 实时信号排队: 屏蔽 SIGRTMIN, 连发 3 次, 解除屏蔽后 handler
+     * 应该跑 3 次。普通信号只会保留一份, 这个对比就是 POSIX 里
+     * "标准信号会丢, 实时信号不会" 的那条规则。
+     */
+    SAY(msg_rt1);
+    if (usys_sigaction(SIGRTMIN, sig_handler_rt, sig_tramp) < 0) {
+        SAY(msg_sg7);
+        usys_exit(0);
+    }
+
+    *seen = 0;
+    usys_sigprocmask(SIG_SETMASK, 1u << SIGRTMIN, 0);
+    usys_kill(0, SIGRTMIN);
+    usys_kill(0, SIGRTMIN);
+    usys_kill(0, SIGRTMIN);
+    for (i = 0; i < 100; i++) {
+        usys_yield();
+    }
+    if (*seen == 0) {
+        SAY(msg_rt2);
+    } else {
+        SAY(msg_rt_bad);
+    }
+
+    usys_sigprocmask(SIG_SETMASK, 0, 0);
+    for (i = 0; i < 100; i++) {
+        usys_yield();
+    }
+    if (*seen == 3 && seen[1] == SIGRTMIN && seen[2] == SIGRTMIN &&
+        seen[3] == SIGRTMIN) {
+        SAY(msg_rt3);
+    } else {
+        SAY(msg_rt_bad);
+    }
+
+    /*
+     * 优先级: 实时信号段 (24..31) 整体优先于普通信号。
+     * 同时挂起 SIGUSR1 和 SIGRTMIN, RT 应该先投递, 即使 USR1
+     * 的编号更小。
+     */
+    *seen = 0;
+    /* USR1 换成记录顺序的 handler, 否则它会覆盖掉计数 */
+    usys_sigaction(SIGUSR1, sig_handler_rt, sig_tramp);
+    usys_sigprocmask(SIG_SETMASK, (1u << SIGRTMIN) | (1u << SIGUSR1), 0);
+    usys_kill(0, SIGUSR1);
+    usys_kill(0, SIGRTMIN);
+    usys_sigprocmask(SIG_SETMASK, 0, 0);
+    for (i = 0; i < 100; i++) {
+        usys_yield();
+    }
+    if (*seen == 2 && seen[1] == SIGRTMIN && seen[2] == SIGUSR1) {
+        SAY(msg_prio_ok);
+    } else {
+        SAY(msg_prio_bad);
+    }
+
+    /*
+     * SIG_IGN: 忽略 SIGUSR2 之后 kill 自己, 不能死。
+     */
+    SAY(msg_ign1);
+    usys_sigaction(SIGUSR2, (void (*)(int))SIG_IGN, 0);
+    usys_kill(0, SIGUSR2);
+    for (i = 0; i < 50; i++) {
+        usys_yield();
+    }
+    SAY(msg_ign2);
+
+    /* 恢复默认动作, 免得影响后面的 demo */
+    usys_sigaction(SIGUSR2, 0, 0);
+    usys_sigprocmask(SIG_SETMASK, 0, 0);
 
     usys_exit(0);
 }

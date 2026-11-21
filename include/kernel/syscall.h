@@ -46,6 +46,26 @@
 #define SIGUSR1         10
 #define SIGUSR2         12
 
+/*
+ * v0.7 阶段4: 实时信号 + SIG_IGN
+ *
+ * POSIX 把 SIGRTMIN..SIGRTMAX 定义为"会排队"的信号: 同一信号连续
+ * 发 3 次, handler 会跑 3 次; 普通信号只保留一份 (后面的丢弃)。
+ * 这里取 24..31 作为实时信号段, MOS_SIG_MAXPENDING 是每条信号的
+ * 最大排队深度 —— 真实内核一般不设上限, RTOS 里用一个固定数组更可控。
+ *
+ * SIG_IGN 借用 POSIX 的写法 (handler == 1): 传给 sigaction 表示
+ * "忽略这条信号", 内核在 kill 时就把它丢掉, 不进 pending。
+ */
+#define SIG_IGN         1u
+#define MOS_SIGRTMIN    24
+#define MOS_SIGRTMAX    31
+#define MOS_SIG_MAXPENDING 8
+
+/* POSIX 习惯的别名 */
+#define SIGRTMIN        MOS_SIGRTMIN
+#define SIGRTMAX        MOS_SIGRTMAX
+
 /* sigprocmask 的 how */
 #define SIG_BLOCK       0       /* 把 set 里的信号加入屏蔽字 */
 #define SIG_UNBLOCK     1       /* 从屏蔽字里去掉 set */

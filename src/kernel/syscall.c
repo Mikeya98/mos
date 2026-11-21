@@ -250,6 +250,20 @@ static int sys_sigaction(task_t *cur, u32 sig, u32 handler, u32 tramp)
     if (sig == 0 || sig >= MOS_NSIG) {
         return -EINVAL;
     }
+
+    /*
+     * v0.7 阶段4: handler == SIG_IGN 表示忽略这条信号。
+     * 按 POSIX, 改成立即忽略时要把已经 pending 的那一份丢掉。
+     */
+    if (handler == SIG_IGN) {
+        cur->sig_handler[sig] = 0;
+        cur->sig_tramp[sig]   = 0;
+        cur->sig_ignore      |= (1u << sig);
+        cur->sig_pending     &= ~(1u << sig);
+        cur->sig_count[sig]   = 0;
+        return 0;
+    }
+
     if (handler != 0) {
         if (!user_code_addr_ok(handler) || !user_code_addr_ok(tramp)) {
             return -EINVAL;
@@ -258,6 +272,7 @@ static int sys_sigaction(task_t *cur, u32 sig, u32 handler, u32 tramp)
 
     cur->sig_handler[sig] = handler;
     cur->sig_tramp[sig]   = (handler != 0) ? tramp : 0;
+    cur->sig_ignore      &= ~(1u << sig);
     return 0;
 }
 
@@ -386,21 +401,51 @@ u32 user_signal_check(u32 *frame, u32 pc)
         return pc;
     }
 
-    deliverable = cur->sig_pending & ~cur->sig_blocked & 0xFFFFFFFEu;
+    deliverable = cur->sig_pending & ~cur->sig_blocked &
+                  ~cur->sig_ignore & 0xFFFFFFFEu;
     if (deliverable == 0) {
         return pc;
     }
 
-    for (sig = 1; sig < MOS_NSIG; sig++) {
-        if (deliverable & (1u << sig)) {
+    /*
+     * v0.7 阶段4: 实时信号优先于普通信号。POSIX 的规则是
+     * "先按优先级, 同优先级按编号小的先投递"; 这里把 RT 段整体
+     * 排在前面, 段内仍然取最小号。
+     *
+     * 普通信号取最小号 —— 和 Linux 上 SIGKILL(9) 先于 SIGUSR1(10)
+     * 的直觉一致。
+     */
+    sig = 0;
+    for (i = MOS_SIGRTMIN; i <= MOS_SIGRTMAX; i++) {
+        if (deliverable & (1u << i)) {
+            sig = i;
             break;
         }
     }
-    if (sig >= MOS_NSIG) {
+    if (sig == 0) {
+        for (i = 1; i < MOS_SIGRTMIN; i++) {
+            if (deliverable & (1u << i)) {
+                sig = i;
+                break;
+            }
+        }
+    }
+    if (sig == 0) {
         return pc;
     }
 
-    cur->sig_pending &= ~(1u << sig);
+    /*
+     * 每次投递消耗一份。实时信号还有下一份时保留 pending 位,
+     * 下一次从 SVC/IRQ 返回用户态会接着投递; 普通信号只有一份,
+     * 直接清位。
+     */
+    if (cur->sig_count[sig] > 1) {
+        cur->sig_count[sig]--;
+    } else {
+        cur->sig_count[sig] = 0;
+        cur->sig_pending &= ~(1u << sig);
+    }
+
     handler = cur->sig_handler[sig];
 
     if (handler == 0) {
@@ -609,8 +654,10 @@ void svc_dispatch(u32 svc_num, u32 *frame)
             for (si = 0; si < MOS_NSIG; si++) {
                 cur->sig_handler[si] = 0;
                 cur->sig_tramp[si]   = 0;
+                cur->sig_count[si]   = 0;
             }
             cur->sig_pending = 0;
+            cur->sig_ignore  = 0;
         }
 
         printf("[EXEC] %s: new image at %X, private pages reset\n",
@@ -704,8 +751,10 @@ void svc_dispatch(u32 svc_num, u32 *frame)
             for (si = 0; si < MOS_NSIG; si++) {
                 cur->sig_handler[si] = 0;
                 cur->sig_tramp[si]   = 0;
+                cur->sig_count[si]   = 0;
             }
             cur->sig_pending = 0;
+            cur->sig_ignore  = 0;
         }
 
         printf("[EXEC] %s: %s mapped, entry %X (code pages load on demand)\n",

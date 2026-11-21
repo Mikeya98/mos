@@ -1025,8 +1025,10 @@ task_t *task_fork(task_t *parent, u32 user_pc)
     for (i = 0; i < MOS_NSIG; i++) {
         child->sig_handler[i] = parent->sig_handler[i];
         child->sig_tramp[i]   = parent->sig_tramp[i];
+        child->sig_count[i]   = 0;                  /* 排队份数不继承 */
     }
     child->sig_pending     = 0;
+    child->sig_ignore      = parent->sig_ignore;    /* SIG_IGN 是处置方式, 继承 */
     child->sig_blocked     = parent->sig_blocked;   /* fork 继承屏蔽字 */
     child->sig_interrupted = 0;
     child->block_remove    = NULL;
@@ -1310,6 +1312,32 @@ s32 task_signal_send(s32 pid, u32 sig)
     }
 
     ENTER_CRITICAL();
+
+    /*
+     * v0.7 阶段4: 被忽略的信号连 pending 都不置。
+     * sigaction 和 kill 可能并发 (比如一个任务刚装 SIG_IGN, 另一个
+     * 正在发), 所以判断放进临界区。
+     */
+    if (t->sig_ignore & (1u << sig)) {
+        EXIT_CRITICAL();
+        return 0;
+    }
+
+    /*
+     * 实时信号排队, 普通信号合并。
+     *
+     * POSIX 的规则: 普通信号在 pending 期间再来一次只保留一份;
+     * SIGRTMIN..SIGRTMAX 每次投递都占一个位置, handler 要跑同样
+     * 的次数。这里用 sig_count 计数, 上限 MOS_SIG_MAXPENDING。
+     */
+    if (sig >= MOS_SIGRTMIN && sig <= MOS_SIGRTMAX) {
+        if (t->sig_count[sig] < MOS_SIG_MAXPENDING) {
+            t->sig_count[sig]++;
+        }
+    } else if (!(t->sig_pending & (1u << sig))) {
+        t->sig_count[sig] = 1;
+    }
+
     t->sig_pending |= (1u << sig);
 
     /*
