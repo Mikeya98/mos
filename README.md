@@ -37,8 +37,9 @@ MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 �
 - **僵尸进程与 wait**：`SYS_EXIT` 带退出码，有父进程的任务退出后变成僵尸，TCB 留在任务表里等父进程 `SYS_WAIT` 取走；父进程可以阻塞等任意/指定子进程，子进程退出时被唤醒。僵尸状态的转换放在 `schedule()` 切换前完成，避免父进程在退出任务还踩着自己内核栈时就把它回收
 - **实时信号排队 + SIG_IGN（v0.7 阶段4）**：TCB 增加 `sig_count[32]` 和 `sig_ignore` 位图。`SIGRTMIN..SIGRTMAX`（24..31）连续发 3 次会在 pending 里排 3 份，handler 依次跑 3 次；普通信号在 pending 期间重复到达只保留一份（和 POSIX 一致）。投递顺序先看段：实时信号整段优先于普通信号，段内再取编号最小的。`sigaction(sig, SIG_IGN, 0)` 直接设置忽略位，之后投递的信号在 `kill` 时就丢掉、连 pending 都不置；fork 继承忽略位、不继承排队份数，exec 全部复位。`u_signal` 新增三段验证：排队 3 份、RT 优先于更小号的 SIGUSR1、SIG_IGN 后 kill 自己仍存活
 - **信号屏蔽与可中断等待（v0.7 阶段3）**：`SYS_SIGPROCMASK`（BLOCK/UNBLOCK/SETMASK）维护每任务屏蔽字，被屏蔽的信号只挂在 pending 里，解除屏蔽后在下一次返回用户态时投递。信号可以打断阻塞中的 `sem_wait`、`wait` 和 `sleep`：目标任务在信号量等待队列上时由 TCB 里的 `block_remove` 回调摘链并退还计数，阻塞的系统调用返回 `-EINTR`。阻塞前也会检查一次 pending，避免"信号先到、任务随后睡死"的窗口
+- **信号值 sigqueue（v0.7 阶段5）**：`SYS_SIGQUEUE(pid, sig, value)` 让信号带一个 32 位值，handler 从 r1 拿到（r0 仍是信号号）。普通信号不排队，已 pending 时后到的值丢弃、只保留第一份；实时信号每个值进独立的环形队列，按 FIFO 依次投递。内核在 handler 执行期间自动屏蔽当前信号（POSIX 默认语义），旧屏蔽字存进信号帧第 17 个字、`SIGRETURN` 时恢复，这样同一个实时信号不会嵌套进自己的 handler。`u_signal` 验证了三件事：普通信号合并保留第一个值、RT 三个值按 C1/C2/C3 顺序到达、跨任务把 0x42 发给孩子进程并由退出码带回
 - **信号（v0.7 阶段2）**：`SYS_SIGACTION / KILL / SIGRETURN / GETPPID`。handler 地址存在 TCB 里，kill 只置 pending 位；任务下一次从内核返回用户态时，内核把 r0-r12/PC/SP/LR 压成信号帧放到用户栈上，把用户态 LR 改成用户传入的 tramp，再跳进 handler。handler 返回时 tramp 发 `SIGRETURN`，内核从信号帧恢复现场继续跑。没装 handler 的信号按默认动作终止进程；fork 继承处理函数但清空 pending，exec 全部复位；`u_signal` 演示了 handler 投递、sigreturn 恢复和默认终止（退出码 -12）三种路径
-- **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST / GET_TTBR0 / VM_STATS / FORK / EXEC / WAIT / EXEC_ELF / SIGACTION / KILL / SIGRETURN / GETPPID`；`copy_from_user` / `copy_to_user` 先代用户补页，再走当前任务的页表检查用户指针（区分读/写权限）
+- **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST / GET_TTBR0 / VM_STATS / FORK / EXEC / WAIT / EXEC_ELF / SIGACTION / KILL / SIGRETURN / GETPPID / SIGPROCMASK / SIGQUEUE`；`copy_from_user` / `copy_to_user` 先代用户补页，再走当前任务的页表检查用户指针（区分读/写权限）
 - **异常恢复**：捕获 Data Abort / Prefetch Abort，打印任务名、故障地址与 DFSR/DFAR，杀掉出错的用户任务后继续调度，系统不宕机
 
 ## 目录结构
@@ -226,6 +227,7 @@ Starting scheduler...
 | v0.7 阶段2 | 信号：sigaction/kill/sigreturn、用户栈信号帧、默认终止 | ✅ |
 | v0.7 阶段3 | 信号屏蔽、-EINTR 唤醒阻塞任务、LR_usr 随任务切换 | ✅ |
 | v0.7 阶段4 | 实时信号排队、投递优先级、SIG_IGN | ✅ |
+| v0.7 阶段5 | 信号值 sigqueue、RT FIFO 值队列、handler 自动屏蔽当前信号 | ✅ |
 | v0.6 | MMU + 用户态 + 权限隔离 + 每任务独立页表 + ASID + 资源回收 + 按需分页 + 页面换出 + fork/COW + exec + ELF 装载 + 僵尸回收（阶段1 开 MMU、2 模式切换、3 隔离/异常恢复、4 TTBR0 切换、5 ASID/reclaim、6 缺页处理、7 swap、8 fork/写时复制、9 exec/重置、10 僵尸/wait、11 真实 ELF、12 代码页按需装载） | ✅ |
 | 下一步 | 多核调度、进程间共享内存、块设备/持久化 | 🔜 |
 

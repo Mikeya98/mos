@@ -226,8 +226,10 @@ USYS_INLINE s32 usys_exec_elf(const char *path)
  * @param handler  用户处理函数地址; 0 = 恢复默认动作 (终止进程)
  * @param tramp    处理函数返回后进入的跳板地址, 里面执行 SVC SIGRETURN
  *
- * 进入 handler 时 r0 = 信号号, 用户态 LR 已经被内核填成 tramp,
- * 所以处理函数正常 return 就会回到内核恢复被打断的现场。
+ * 进入 handler 时 r0 = 信号号、r1 = 信号值 (v0.7 阶段5, kill 发的
+ * 信号值为 0)。用户态 LR 已经被内核填成 tramp, 所以处理函数正常
+ * return 就会回到内核恢复被打断的现场。只关心信号号的处理函数可以
+ * 只声明一个 int 参数, 多出来的 r1 会被忽略。
  */
 USYS_INLINE s32 usys_sigaction(u32 sig, void (*handler)(int), void (*tramp)(void))
 {
@@ -274,6 +276,22 @@ USYS_INLINE s32 usys_sigprocmask(u32 how, u32 set, u32 *oldset)
     register u32 r1 __asm__("r1") = set;
     register u32 r2 __asm__("r2") = (u32)(uintptr_t)oldset;
     __asm__ volatile ("SVC #17" : "+r"(r0) : "r"(r1), "r"(r2) : "memory");
+    return (s32)r0;
+}
+
+/**
+ * 发一个带值的信号 (v0.7 阶段5)。
+ *
+ * handler 收到 r0 = 信号号、r1 = value。普通信号已经 pending 时
+ * 后到的值会丢弃; 实时信号按 FIFO 排队, 每个值都会投递一次。
+ * pid=0 表示自己。
+ */
+USYS_INLINE s32 usys_sigqueue(s32 pid, u32 sig, u32 value)
+{
+    register u32 r0 __asm__("r0") = (u32)pid;
+    register u32 r1 __asm__("r1") = sig;
+    register u32 r2 __asm__("r2") = value;
+    __asm__ volatile ("SVC #18" : "+r"(r0) : "r"(r1), "r"(r2) : "memory");
     return (s32)r0;
 }
 

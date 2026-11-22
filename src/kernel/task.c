@@ -1026,6 +1026,10 @@ task_t *task_fork(task_t *parent, u32 user_pc)
         child->sig_handler[i] = parent->sig_handler[i];
         child->sig_tramp[i]   = parent->sig_tramp[i];
         child->sig_count[i]   = 0;                  /* 排队份数不继承 */
+        child->sig_value[i]   = 0;                  /* 待投递的值也不继承 */
+    }
+    for (i = 0; i < MOS_RT_SIGS; i++) {
+        child->sig_rt_head[i] = 0;
     }
     child->sig_pending     = 0;
     child->sig_ignore      = parent->sig_ignore;    /* SIG_IGN 是处置方式, 继承 */
@@ -1297,6 +1301,11 @@ void task_kill(task_t *t)
 
 s32 task_signal_send(s32 pid, u32 sig)
 {
+    return task_signal_queue(pid, sig, 0);
+}
+
+s32 task_signal_queue(s32 pid, u32 sig, u32 value)
+{
     task_t *t;
     int woke = 0;
     int preempt = 0;
@@ -1332,10 +1341,20 @@ s32 task_signal_send(s32 pid, u32 sig)
      */
     if (sig >= MOS_SIGRTMIN && sig <= MOS_SIGRTMAX) {
         if (t->sig_count[sig] < MOS_SIG_MAXPENDING) {
+            u32 rt = sig - MOS_SIGRTMIN;
+            u32 tail = (u32)t->sig_rt_head[rt] + t->sig_count[sig];
+
+            /* 环形队列: 队头 + 已有份数 = 新一份的位置 */
+            t->sig_rt_queue[rt][tail % MOS_SIG_MAXPENDING] = value;
             t->sig_count[sig]++;
         }
     } else if (!(t->sig_pending & (1u << sig))) {
-        t->sig_count[sig] = 1;
+        /*
+         * 普通信号不排队: 已经 pending 时后到的 sigqueue 只当作
+         * "一次重复投递", 值不覆盖 —— 和 Linux 的标准信号语义一致。
+         */
+        t->sig_count[sig]   = 1;
+        t->sig_value[sig]   = value;
     }
 
     t->sig_pending |= (1u << sig);

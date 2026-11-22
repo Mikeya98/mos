@@ -39,7 +39,8 @@
 #define SYS_SIGRETURN   15      /* 从信号处理函数返回 */
 #define SYS_GETPPID     16      /* 返回父进程 pid, 没有父亲返回 0 */
 #define SYS_SIGPROCMASK 17      /* sigprocmask(how, set, oldset) (v0.7 阶段3) */
-#define SYS_MAX         18
+#define SYS_SIGQUEUE    18      /* sigqueue(pid, sig, value) (v0.7 阶段5) */
+#define SYS_MAX         19
 
 /* =========================== 信号 =========================== */
 #define MOS_NSIG        32
@@ -65,6 +66,7 @@
 /* POSIX 习惯的别名 */
 #define SIGRTMIN        MOS_SIGRTMIN
 #define SIGRTMAX        MOS_SIGRTMAX
+#define MOS_RT_SIGS     (MOS_SIGRTMAX - MOS_SIGRTMIN + 1)
 
 /* sigprocmask 的 how */
 #define SIG_BLOCK       0       /* 把 set 里的信号加入屏蔽字 */

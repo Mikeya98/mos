@@ -231,6 +231,14 @@ static int sys_vm_stats(void *uout)
 #define SIG_FRAME_WORDS 20
 #define SIG_FRAME_MAGIC 0x5349474Eu     /* "SIGN" */
 
+/*
+ * v0.7 阶段5: 信号帧第 17 个字存"进入 handler 前的屏蔽字"。
+ * POSIX 默认在 handler 执行期间把当前信号自动屏蔽 (sa_mask 的语义),
+ * SIGRETURN 时恢复。这样同一个实时信号就不会在它自己的 handler
+ * 里嵌套投递, 把用户侧的状态改乱。
+ */
+#define SIG_FRAME_BLOCKED 17
+
 static int user_code_addr_ok(u32 addr)
 {
     if (addr >= USER_CODE_VADDR && addr < USER_PRIV_VADDR) {
@@ -261,6 +269,10 @@ static int sys_sigaction(task_t *cur, u32 sig, u32 handler, u32 tramp)
         cur->sig_ignore      |= (1u << sig);
         cur->sig_pending     &= ~(1u << sig);
         cur->sig_count[sig]   = 0;
+        cur->sig_value[sig]   = 0;              /* v0.7 阶段5: 值一起丢掉 */
+        if (sig >= MOS_SIGRTMIN && sig <= MOS_SIGRTMAX) {
+            cur->sig_rt_head[sig - MOS_SIGRTMIN] = 0;
+        }
         return 0;
     }
 
@@ -282,6 +294,23 @@ static int sys_kill(u32 pid, u32 sig)
         return -EINVAL;
     }
     if (task_signal_send((s32)pid, sig) < 0) {
+        return -ESRCH;
+    }
+    return 0;
+}
+
+/**
+ * @brief SIGQUEUE: 发一个带值的信号 (v0.7 阶段5)
+ *
+ * 值随信号一起排队, 投递时放进 handler 的 r1 (r0 仍是信号号)。
+ * 普通信号不排队, 已 pending 时后到的值丢弃; 实时信号按 FIFO 排。
+ */
+static int sys_sigqueue(u32 pid, u32 sig, u32 value)
+{
+    if (sig == 0 || sig >= MOS_NSIG) {
+        return -EINVAL;
+    }
+    if (task_signal_queue((s32)pid, sig, value) < 0) {
         return -ESRCH;
     }
     return 0;
@@ -359,6 +388,9 @@ static int sys_sigreturn(u32 *frame)
     frame[FRAME_LR] = kframe[13];
     cur->user_sp    = kframe[14];
 
+    /* v0.7 阶段5: 恢复 handler 执行前的屏蔽字 */
+    cur->sig_blocked = kframe[SIG_FRAME_BLOCKED];
+
     /*
      * 恢复 banked SP/LR。写 LR 之后到异常返回之间不能调度,
      * 否则别的任务跑一轮会把用户态 LR 覆盖掉。
@@ -390,6 +422,7 @@ u32 user_signal_check(u32 *frame, u32 pc)
     u32 tramp;
     u32 old_sp;
     u32 new_sp;
+    u32 value = 0;
     u32 kframe[SIG_FRAME_WORDS];
     u32 i;
 
@@ -435,15 +468,36 @@ u32 user_signal_check(u32 *frame, u32 pc)
     }
 
     /*
-     * 每次投递消耗一份。实时信号还有下一份时保留 pending 位,
-     * 下一次从 SVC/IRQ 返回用户态会接着投递; 普通信号只有一份,
-     * 直接清位。
+     * v0.7 阶段5: 取出这次投递携带的值。
+     * 实时信号从环形队列头部取并推进队头; 普通信号只有一份,
+     * 直接读 sig_value 后清掉。
      */
-    if (cur->sig_count[sig] > 1) {
-        cur->sig_count[sig]--;
-    } else {
-        cur->sig_count[sig] = 0;
-        cur->sig_pending &= ~(1u << sig);
+    {
+        if (sig >= MOS_SIGRTMIN && sig <= MOS_SIGRTMAX) {
+            u32 rt   = sig - MOS_SIGRTMIN;
+            u32 head = cur->sig_rt_head[rt];
+
+            value = cur->sig_rt_queue[rt][head % MOS_SIG_MAXPENDING];
+            cur->sig_rt_head[rt] = (u8)((head + 1u) % MOS_SIG_MAXPENDING);
+        } else {
+            value = cur->sig_value[sig];
+            cur->sig_value[sig] = 0;
+        }
+
+        /*
+         * 每次投递消耗一份。实时信号还有下一份时保留 pending 位,
+         * 下一次从 SVC/IRQ 返回用户态会接着投递; 普通信号只有一份,
+         * 直接清位。
+         */
+        if (cur->sig_count[sig] > 1) {
+            cur->sig_count[sig]--;
+        } else {
+            cur->sig_count[sig] = 0;
+            cur->sig_pending &= ~(1u << sig);
+        }
+
+        /* handler 的第二个参数; 只关心信号号的 C 函数会自然忽略它 */
+        frame[FRAME_R1] = value;
     }
 
     handler = cur->sig_handler[sig];
@@ -464,6 +518,7 @@ u32 user_signal_check(u32 *frame, u32 pc)
     kframe[13] = pc;
     kframe[14] = old_sp;
     kframe[15] = SIG_FRAME_MAGIC;
+    kframe[SIG_FRAME_BLOCKED] = cur->sig_blocked;   /* 阶段5: 保存旧屏蔽字 */
 
     /*
      * 从这里到异常返回之间关中断:
@@ -481,14 +536,21 @@ u32 user_signal_check(u32 *frame, u32 pc)
         task_exit(-11);
     }
 
+    /*
+     * v0.7 阶段5: handler 执行期间自动屏蔽当前信号 (POSIX 默认行为)。
+     * 同一个实时信号排队多份时, 剩下的等这次 handler 返回、SIGRETURN
+     * 恢复旧屏蔽字之后再投递, 不会嵌套进自己的 handler。
+     */
+    cur->sig_blocked |= (1u << sig);
+
     cur->user_sp = new_sp;
     write_user_sp(new_sp);
     write_user_lr(tramp);
 
     frame[FRAME_R0] = sig;
 
-    printf("[SIG] %s: sig %u → handler %X (frame at %X, sp %X)\n",
-           cur->name, sig, handler, new_sp, old_sp);
+    printf("[SIG] %s: sig %u val %X → handler %X (frame at %X, sp %X)\n",
+           cur->name, sig, value, handler, new_sp, old_sp);
     return handler;
 }
 
@@ -655,6 +717,10 @@ void svc_dispatch(u32 svc_num, u32 *frame)
                 cur->sig_handler[si] = 0;
                 cur->sig_tramp[si]   = 0;
                 cur->sig_count[si]   = 0;
+                cur->sig_value[si]   = 0;
+            }
+            for (si = 0; si < MOS_RT_SIGS; si++) {
+                cur->sig_rt_head[si] = 0;
             }
             cur->sig_pending = 0;
             cur->sig_ignore  = 0;
@@ -752,6 +818,10 @@ void svc_dispatch(u32 svc_num, u32 *frame)
                 cur->sig_handler[si] = 0;
                 cur->sig_tramp[si]   = 0;
                 cur->sig_count[si]   = 0;
+                cur->sig_value[si]   = 0;
+            }
+            for (si = 0; si < MOS_RT_SIGS; si++) {
+                cur->sig_rt_head[si] = 0;
             }
             cur->sig_pending = 0;
             cur->sig_ignore  = 0;
@@ -772,6 +842,10 @@ void svc_dispatch(u32 svc_num, u32 *frame)
 
     case SYS_KILL:
         ret = sys_kill(frame[FRAME_R0], frame[FRAME_R1]);
+        break;
+
+    case SYS_SIGQUEUE:
+        ret = sys_sigqueue(frame[FRAME_R0], frame[FRAME_R1], frame[FRAME_R2]);
         break;
 
     case SYS_SIGRETURN:

@@ -14,6 +14,7 @@
 #include "lib/types.h"
 #include "fs/vfs.h"
 #include "kernel/user_prog.h"
+#include "kernel/syscall.h"     /* 信号常量: MOS_NSIG / SIGRTMIN / MOS_RT_SIGS */
 
 /* =========================== 常量 =========================== */
 #define PRIO_COUNT      32         /* 优先级级数 */
@@ -154,6 +155,23 @@ typedef struct task_struct {
     u32             sig_blocked;
     u8              sig_interrupted;
     void          (*block_remove)(void *obj, struct task_struct *t);
+
+    /*
+     * v0.7 阶段5: 信号值 (sigqueue)。
+     *
+     * POSIX 的 sigqueue 允许发送时带一个 sigval。MOS 直接传 32 位整数,
+     * handler 从 r1 拿到它 (r0 仍然是信号号)。
+     *
+     *   sig_value[sig]      普通信号的值。普通信号不排队: 已经 pending
+     *                       时再 sigqueue 一次, 原来那份值保留 (和 Linux
+     *                       一致, 后到的 sigval 丢掉)。
+     *   sig_rt_queue[rt][]  实时信号的环形队列, 每个 RT 信号独立一条,
+     *                       按 FIFO 投递; rt 下标是 sig - SIGRTMIN。
+     *   sig_rt_head[rt]     队头位置。
+     */
+    u32             sig_value[MOS_NSIG];
+    u32             sig_rt_queue[MOS_RT_SIGS][MOS_SIG_MAXPENDING];
+    u8              sig_rt_head[MOS_RT_SIGS];
 
     /* --- 程序映像 / 代码页按需装载 (v0.6 阶段12) ---
      * prog_valid=1 表示 0x09000000 窗口由一个 ELF 文件映射, 段表在
@@ -339,6 +357,9 @@ void task_kill(task_t *t);
  * 没有被屏蔽, 会把它唤醒并让阻塞的系统调用返回 -EINTR。
  */
 s32 task_signal_send(s32 pid, u32 sig);
+
+/** 发一个带值的信号 (v0.7 阶段5); task_signal_send 等于 value=0 */
+s32 task_signal_queue(s32 pid, u32 sig, u32 value);
 
 /* === 睡眠中断处理 (由 timer_isr 触发) === */
 

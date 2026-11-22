@@ -770,6 +770,22 @@ static const char msg_ign1[] USER_RODATA =
 static const char msg_ign2[] USER_RODATA =
     "[user] u_signal: still alive — SIG_IGN dropped the signal\n";
 
+/* v0.7 阶段5: 信号值 (sigqueue) */
+static const char msg_q1[] USER_RODATA =
+    "[user] u_signal: queue SIGUSR2 twice while blocked (1111 then 2222)\n";
+static const char msg_q2[] USER_RODATA =
+    "[user] u_signal: normal signal merged, first value kept — value OK\n";
+static const char msg_q3[] USER_RODATA =
+    "[user] u_signal: queue SIGRTMAX 3 times (C1 C2 C3)\n";
+static const char msg_q4[] USER_RODATA =
+    "[user] u_signal: RT values delivered in FIFO order — queue OK\n";
+static const char msg_q5[] USER_RODATA =
+    "[user] u_signal: sigqueue 0x42 to a forked child, it exits with that value\n";
+static const char msg_q6[] USER_RODATA =
+    "[user] u_signal: cross-task value delivered — sigqueue OK\n";
+static const char msg_qbad[] USER_RODATA =
+    "[user] u_signal: signal value test FAILED\n";
+
 /*
  * 信号处理函数返回后要执行的一小段代码。
  * 内核在进入 handler 之前把用户态 LR 改成这个地址, 所以 handler
@@ -799,11 +815,45 @@ static void USER_TEXT sig_handler(int sig)
 static void USER_TEXT sig_handler_rt(int sig)
 {
     volatile u32 *p = (volatile u32 *)(uintptr_t)USER_DATA_VADDR;
+    u32 i = p[0];
 
-    if (p[0] < 4u) {
-        p[1 + p[0]] = (u32)sig;
+    /* 同 sig_handler_val: 先占槽位, 防止嵌套投递改掉计数 */
+    p[0] = i + 1u;
+    if (i < 4u) {
+        p[1 + i] = (u32)sig;
     }
-    p[0] = p[0] + 1u;
+}
+
+/*
+ * 阶段5 的 handler: 记录 (信号号, 值) 对。
+ * 内核进入 handler 时 r0 = sig, r1 = value。
+ *   p[0]     = 次数
+ *   p[1+2i]  = 第 i 次的信号号
+ *   p[2+2i]  = 第 i 次的值
+ */
+static void USER_TEXT sig_handler_val(int sig, u32 val)
+{
+    volatile u32 *p = (volatile u32 *)(uintptr_t)USER_DATA_VADDR;
+    u32 i = p[0];
+
+    /*
+     * 先占好槽位再写。处理函数执行期间可能被 tick 打断, 而 MOS
+     * 目前不会自动屏蔽"正在处理的这条信号", 于是同一个实时信号
+     * 可能在 handler 里再嵌套投递一次。如果先读 p[0] 再分两次用,
+     * 嵌套的 handler 会把计数改掉, 外层再按新计数写就越界/覆盖。
+     */
+    p[0] = i + 1u;
+    if (i < 6u) {
+        p[1 + 2u * i] = (u32)sig;
+        p[2 + 2u * i] = val;
+    }
+}
+
+/* 收到带值信号后直接以该值退出, 给父进程 wait 验证 */
+static void USER_TEXT sig_exit_val(int sig, u32 val)
+{
+    (void)sig;
+    usys_exit((s32)val);
 }
 
 /**
@@ -1005,6 +1055,88 @@ static void USER_TEXT u_signal(void)
         usys_yield();
     }
     SAY(msg_ign2);
+
+    /* ================= v0.7 阶段5: 信号值 (sigqueue) ================= */
+
+    /*
+     * 普通信号不排队: 屏蔽住 SIGUSR2, 连发两个值。解除屏蔽后
+     * 只投递一次, 而且保留的是第一个值 (后到的 sigval 丢掉)。
+     */
+    SAY(msg_q1);
+    usys_sigaction(SIGUSR2, (void (*)(int))sig_handler_val, sig_tramp);
+    *seen = 0;
+    usys_sigprocmask(SIG_SETMASK, 1u << SIGUSR2, 0);
+    usys_sigqueue(0, SIGUSR2, 0x1111u);
+    usys_sigqueue(0, SIGUSR2, 0x2222u);
+    for (i = 0; i < 50; i++) {
+        usys_yield();
+    }
+    if (*seen != 0) {
+        SAY(msg_qbad);
+    }
+
+    usys_sigprocmask(SIG_SETMASK, 0, 0);
+    for (i = 0; i < 100; i++) {
+        usys_yield();
+    }
+    if (*seen == 1u && seen[1] == SIGUSR2 && seen[2] == 0x1111u) {
+        SAY(msg_q2);
+    } else {
+        SAY(msg_qbad);
+    }
+
+    /*
+     * 实时信号排队: 三个值应该按 FIFO 各投递一次。
+     */
+    SAY(msg_q3);
+    usys_sigaction(SIGRTMAX, (void (*)(int))sig_handler_val, sig_tramp);
+    *seen = 0;
+    usys_sigprocmask(SIG_SETMASK, 1u << SIGRTMAX, 0);
+    usys_sigqueue(0, SIGRTMAX, 0xC1u);
+    usys_sigqueue(0, SIGRTMAX, 0xC2u);
+    usys_sigqueue(0, SIGRTMAX, 0xC3u);
+    usys_sigprocmask(SIG_SETMASK, 0, 0);
+    for (i = 0; i < 100; i++) {
+        usys_yield();
+    }
+    if (*seen == 3u &&
+        seen[1] == SIGRTMAX && seen[2] == 0xC1u &&
+        seen[3] == SIGRTMAX && seen[4] == 0xC2u &&
+        seen[5] == SIGRTMAX && seen[6] == 0xC3u) {
+        SAY(msg_q4);
+    } else {
+        SAY(msg_qbad);
+    }
+
+    /*
+     * 跨任务: 子进程继承 handler, 父进程把 0x42 发过去,
+     * 子进程的 handler 直接以这个值退出, 父进程 wait 拿到退出码。
+     */
+    SAY(msg_q5);
+    usys_sigaction(SIGUSR1, (void (*)(int))sig_exit_val, sig_tramp);
+    child = usys_fork();
+    if (child == 0) {
+        for (i = 0; i < 200; i++) {
+            usys_yield();
+        }
+        usys_exit(0);               /* 没收到信号才会走到这里 */
+    }
+    if (child < 0) {
+        SAY(msg_qbad);
+    } else {
+        for (i = 0; i < 2; i++) {
+            usys_yield();
+        }
+        usys_sigqueue(child, SIGUSR1, 0x42u);
+
+        code = -1;
+        r = usys_wait(child, &code);
+        if (r == child && code == 0x42) {
+            SAY(msg_q6);
+        } else {
+            SAY(msg_qbad);
+        }
+    }
 
     /* 恢复默认动作, 免得影响后面的 demo */
     usys_sigaction(SIGUSR2, 0, 0);
