@@ -139,6 +139,8 @@ typedef struct task_struct {
 #define MOS_NSIG        32
     u32             sig_handler[MOS_NSIG];
     u32             sig_tramp[MOS_NSIG];
+    u8              sig_flags[MOS_NSIG];   /* v0.7 阶段6: SA_NODEFER */
+    u32             sig_mask[MOS_NSIG];    /* v0.7 阶段6: 自定义 sa_mask */
     u32             sig_pending;
 
     /*

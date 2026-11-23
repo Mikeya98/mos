@@ -79,6 +79,9 @@
 #if SYS_SIGPROCMASK != 17
 #error "SVC immediate for SYS_SIGPROCMASK is stale"
 #endif
+#if SYS_SIGACTION_EX != 19
+#error "SVC immediate for SYS_SIGACTION_EX is stale"
+#endif
 
 #define USYS_INLINE  static inline __attribute__((always_inline))
 
@@ -86,7 +89,7 @@
 USYS_INLINE s32 usys_yield(void)
 {
     register u32 r0 __asm__("r0") = 0;
-    __asm__ volatile ("SVC #0" : "+r"(r0) : : "memory");
+    __asm__ volatile ("SVC #0" : "+r"(r0) : : "memory", "lr");
     return (s32)r0;
 }
 
@@ -94,7 +97,7 @@ USYS_INLINE s32 usys_yield(void)
 USYS_INLINE __attribute__((noreturn)) void usys_exit(s32 code)
 {
     register u32 r0 __asm__("r0") = (u32)code;
-    __asm__ volatile ("SVC #1" : "+r"(r0) : : "memory");
+    __asm__ volatile ("SVC #1" : "+r"(r0) : : "memory", "lr");
     /* 内核不会返回到这里; 万一返回也只是死循环, 不再碰用户态数据 */
     while (1) {
         __asm__ volatile ("NOP");
@@ -106,7 +109,7 @@ USYS_INLINE s32 usys_write(const char *buf, u32 len)
 {
     register u32 r0 __asm__("r0") = (u32)(uintptr_t)buf;
     register u32 r1 __asm__("r1") = len;
-    __asm__ volatile ("SVC #2" : "+r"(r0) : "r"(r1) : "memory");
+    __asm__ volatile ("SVC #2" : "+r"(r0) : "r"(r1) : "memory", "lr");
     return (s32)r0;
 }
 
@@ -114,7 +117,7 @@ USYS_INLINE s32 usys_write(const char *buf, u32 len)
 USYS_INLINE s32 usys_sleep(u32 ms)
 {
     register u32 r0 __asm__("r0") = ms;
-    __asm__ volatile ("SVC #3" : "+r"(r0) : : "memory");
+    __asm__ volatile ("SVC #3" : "+r"(r0) : : "memory", "lr");
     return (s32)r0;
 }
 
@@ -122,7 +125,7 @@ USYS_INLINE s32 usys_sleep(u32 ms)
 USYS_INLINE s32 usys_getpid(void)
 {
     register u32 r0 __asm__("r0") = 0;
-    __asm__ volatile ("SVC #4" : "+r"(r0) : : "memory");
+    __asm__ volatile ("SVC #4" : "+r"(r0) : : "memory", "lr");
     return (s32)r0;
 }
 
@@ -130,7 +133,7 @@ USYS_INLINE s32 usys_getpid(void)
 USYS_INLINE s32 usys_sem_wait(u32 id)
 {
     register u32 r0 __asm__("r0") = id;
-    __asm__ volatile ("SVC #5" : "+r"(r0) : : "memory");
+    __asm__ volatile ("SVC #5" : "+r"(r0) : : "memory", "lr");
     return (s32)r0;
 }
 
@@ -138,7 +141,7 @@ USYS_INLINE s32 usys_sem_wait(u32 id)
 USYS_INLINE s32 usys_sem_post(u32 id)
 {
     register u32 r0 __asm__("r0") = id;
-    __asm__ volatile ("SVC #6" : "+r"(r0) : : "memory");
+    __asm__ volatile ("SVC #6" : "+r"(r0) : : "memory", "lr");
     return (s32)r0;
 }
 
@@ -146,7 +149,7 @@ USYS_INLINE s32 usys_sem_post(u32 id)
 USYS_INLINE u32 usys_ttbr0(void)
 {
     register u32 r0 __asm__("r0") = 0;
-    __asm__ volatile ("SVC #7" : "+r"(r0) : : "memory");
+    __asm__ volatile ("SVC #7" : "+r"(r0) : : "memory", "lr");
     return r0;
 }
 
@@ -159,7 +162,7 @@ USYS_INLINE u32 usys_ttbr0(void)
 USYS_INLINE s32 usys_vm_stats(void *out)
 {
     register u32 r0 __asm__("r0") = (u32)(uintptr_t)out;
-    __asm__ volatile ("SVC #8" : "+r"(r0) : : "memory");
+    __asm__ volatile ("SVC #8" : "+r"(r0) : : "memory", "lr");
     return (s32)r0;
 }
 
@@ -173,7 +176,7 @@ USYS_INLINE s32 usys_vm_stats(void *out)
 USYS_INLINE s32 usys_fork(void)
 {
     register u32 r0 __asm__("r0") = 0;
-    __asm__ volatile ("SVC #9" : "+r"(r0) : : "memory");
+    __asm__ volatile ("SVC #9" : "+r"(r0) : : "memory", "lr");
     return (s32)r0;
 }
 
@@ -187,7 +190,7 @@ USYS_INLINE s32 usys_fork(void)
 USYS_INLINE s32 usys_exec(u32 entry)
 {
     register u32 r0 __asm__("r0") = entry;
-    __asm__ volatile ("SVC #10" : "+r"(r0) : : "memory");
+    __asm__ volatile ("SVC #10" : "+r"(r0) : : "memory", "lr");
     return (s32)r0;
 }
 
@@ -201,7 +204,7 @@ USYS_INLINE s32 usys_wait(s32 pid, s32 *code)
 {
     register u32 r0 __asm__("r0") = (u32)pid;
     register u32 r1 __asm__("r1") = (u32)(uintptr_t)code;
-    __asm__ volatile ("SVC #11" : "+r"(r0) : "r"(r1) : "memory");
+    __asm__ volatile ("SVC #11" : "+r"(r0) : "r"(r1) : "memory", "lr");
     return (s32)r0;
 }
 
@@ -215,7 +218,7 @@ USYS_INLINE s32 usys_wait(s32 pid, s32 *code)
 USYS_INLINE s32 usys_exec_elf(const char *path)
 {
     register u32 r0 __asm__("r0") = (u32)(uintptr_t)path;
-    __asm__ volatile ("SVC #12" : "+r"(r0) : : "memory");
+    __asm__ volatile ("SVC #12" : "+r"(r0) : : "memory", "lr");
     return (s32)r0;
 }
 
@@ -236,7 +239,7 @@ USYS_INLINE s32 usys_sigaction(u32 sig, void (*handler)(int), void (*tramp)(void
     register u32 r0 __asm__("r0") = sig;
     register u32 r1 __asm__("r1") = (u32)(uintptr_t)handler;
     register u32 r2 __asm__("r2") = (u32)(uintptr_t)tramp;
-    __asm__ volatile ("SVC #13" : "+r"(r0) : "r"(r1), "r"(r2) : "memory");
+    __asm__ volatile ("SVC #13" : "+r"(r0) : "r"(r1), "r"(r2) : "memory", "lr");
     return (s32)r0;
 }
 
@@ -245,7 +248,7 @@ USYS_INLINE s32 usys_kill(s32 pid, u32 sig)
 {
     register u32 r0 __asm__("r0") = (u32)pid;
     register u32 r1 __asm__("r1") = sig;
-    __asm__ volatile ("SVC #14" : "+r"(r0) : "r"(r1) : "memory");
+    __asm__ volatile ("SVC #14" : "+r"(r0) : "r"(r1) : "memory", "lr");
     return (s32)r0;
 }
 
@@ -253,14 +256,14 @@ USYS_INLINE s32 usys_kill(s32 pid, u32 sig)
 USYS_INLINE void usys_sigreturn(void)
 {
     register u32 r0 __asm__("r0") = 0;
-    __asm__ volatile ("SVC #15" : "+r"(r0) : : "memory");
+    __asm__ volatile ("SVC #15" : "+r"(r0) : : "memory", "lr");
 }
 
 /** 取父进程 pid (fork 出来的子进程才有, 否则 0)。 */
 USYS_INLINE s32 usys_getppid(void)
 {
     register u32 r0 __asm__("r0") = 0;
-    __asm__ volatile ("SVC #16" : "+r"(r0) : : "memory");
+    __asm__ volatile ("SVC #16" : "+r"(r0) : : "memory", "lr");
     return (s32)r0;
 }
 
@@ -275,7 +278,7 @@ USYS_INLINE s32 usys_sigprocmask(u32 how, u32 set, u32 *oldset)
     register u32 r0 __asm__("r0") = how;
     register u32 r1 __asm__("r1") = set;
     register u32 r2 __asm__("r2") = (u32)(uintptr_t)oldset;
-    __asm__ volatile ("SVC #17" : "+r"(r0) : "r"(r1), "r"(r2) : "memory");
+    __asm__ volatile ("SVC #17" : "+r"(r0) : "r"(r1), "r"(r2) : "memory", "lr");
     return (s32)r0;
 }
 
@@ -291,7 +294,30 @@ USYS_INLINE s32 usys_sigqueue(s32 pid, u32 sig, u32 value)
     register u32 r0 __asm__("r0") = (u32)pid;
     register u32 r1 __asm__("r1") = sig;
     register u32 r2 __asm__("r2") = value;
-    __asm__ volatile ("SVC #18" : "+r"(r0) : "r"(r1), "r"(r2) : "memory");
+    __asm__ volatile ("SVC #18" : "+r"(r0) : "r"(r1), "r"(r2) : "memory", "lr");
+    return (s32)r0;
+}
+
+/**
+ * 安装信号处理函数, 带 flags 和附加屏蔽字 (v0.7 阶段6)。
+ *
+ * @param flags  SA_NODEFER = 1 表示 handler 里不自动屏蔽当前信号
+ * @param mask   handler 执行期间额外屏蔽的信号位图
+ *
+ * 普通 usys_sigaction 等价于 flags=0、mask=0。
+ */
+USYS_INLINE s32 usys_sigaction_ex(u32 sig, void (*handler)(int),
+                                  void (*tramp)(void), u32 flags, u32 mask)
+{
+    register u32 r0 __asm__("r0") = sig;
+    register u32 r1 __asm__("r1") = (u32)(uintptr_t)handler;
+    register u32 r2 __asm__("r2") = (u32)(uintptr_t)tramp;
+    register u32 r3 __asm__("r3") = flags;
+    register u32 r4 __asm__("r4") = mask;
+    __asm__ volatile ("SVC #19"
+                      : "+r"(r0)
+                      : "r"(r1), "r"(r2), "r"(r3), "r"(r4)
+                      : "memory", "lr");
     return (s32)r0;
 }
 

@@ -786,17 +786,38 @@ static const char msg_q6[] USER_RODATA =
 static const char msg_qbad[] USER_RODATA =
     "[user] u_signal: signal value test FAILED\n";
 
+/* v0.7 阶段6: SA_NODEFER + sa_mask */
+static const char msg_sa1[] USER_RODATA =
+    "[user] u_signal: queue 3 RT signals, default handler mask\n";
+static const char msg_sa2[] USER_RODATA =
+    "[user] u_signal: handler never nested — auto-block OK\n";
+static const char msg_sa3[] USER_RODATA =
+    "[user] u_signal: reinstall with SA_NODEFER, queue 2 again\n";
+static const char msg_sa4[] USER_RODATA =
+    "[user] u_signal: handler nested inside itself — SA_NODEFER OK\n";
+static const char msg_sa5[] USER_RODATA =
+    "[user] u_signal: install SIGUSR1 with sa_mask = SIGUSR2\n";
+static const char msg_sa6[] USER_RODATA =
+    "[user] u_signal: SIGUSR2 waited for the USR1 handler — sa_mask OK\n";
+static const char msg_sabad[] USER_RODATA =
+    "[user] u_signal: SA_NODEFER / sa_mask test FAILED\n";
+
 /*
  * 信号处理函数返回后要执行的一小段代码。
  * 内核在进入 handler 之前把用户态 LR 改成这个地址, 所以 handler
  * 正常 return 就会落到这里, 再发 SVC SIGRETURN 让内核恢复现场。
+ *
+ * 必须是 naked 函数: SIGRETURN 靠 SP_usr 定位内核压好的信号帧,
+ * 跳板只要 push/pop 一下 SP 就偏了。usys_* 声明了 lr clobber 之后,
+ * 编译器会在普通函数里 push {lr}, 所以这里用纯汇编。
  */
-static void USER_TEXT sig_tramp(void)
+static void USER_TEXT __attribute__((naked)) sig_tramp(void)
 {
-    usys_sigreturn();
-    while (1) {
-        __asm__ volatile ("NOP");
-    }
+    __asm__ volatile (
+        "mov r0, #0\n\t"
+        "SVC #15\n\t"
+        "1:\tB 1b\n\t"
+    );
 }
 
 static void USER_TEXT sig_handler(int sig)
@@ -854,6 +875,55 @@ static void USER_TEXT sig_exit_val(int sig, u32 val)
 {
     (void)sig;
     usys_exit((s32)val);
+}
+
+/*
+ * 阶段6: 记录 handler 的嵌套深度。
+ *   p[0] = 当前深度
+ *   p[1] = 达到过的最大深度
+ *
+ * handler 里做一次系统调用, 内核在 SVC 返回用户态之前会检查
+ * pending; 如果没有屏蔽当前信号, 第二个信号就在这里嵌套进来。
+ */
+static void USER_TEXT sig_handler_nest(int sig, u32 val)
+{
+    volatile u32 *p = (volatile u32 *)(uintptr_t)USER_DATA_VADDR;
+
+    (void)sig;
+    (void)val;
+
+    p[0] = p[0] + 1u;
+    if (p[0] > p[1]) {
+        p[1] = p[0];
+    }
+
+    usys_yield();               /* 投递点 */
+
+    p[0] = p[0] - 1u;
+}
+
+/*
+ * 阶段6: 自定义 sa_mask 的观察点。
+ *   p[0] = SIGUSR2 收到的次数
+ *   p[1] = SIGUSR2 到达时是否正处在 SIGUSR1 的 handler 里
+ *   p[2] = 当前是否在 SIGUSR1 handler 里
+ */
+static void USER_TEXT sig_handler_mask(int sig, u32 val)
+{
+    volatile u32 *p = (volatile u32 *)(uintptr_t)USER_DATA_VADDR;
+
+    (void)val;
+
+    if (sig == SIGUSR1) {
+        p[2] = 1;
+        usys_yield();
+        usys_yield();
+        usys_yield();
+        p[2] = 0;
+    } else {
+        p[0] = p[0] + 1u;
+        p[1] = p[2];
+    }
 }
 
 /**
@@ -1030,8 +1100,17 @@ static void USER_TEXT u_signal(void)
      * 的编号更小。
      */
     *seen = 0;
-    /* USR1 换成记录顺序的 handler, 否则它会覆盖掉计数 */
+    /*
+     * USR1 换成记录顺序的 handler, 否则它会覆盖掉计数。
+     *
+     * RTMIN 的 handler 里把 USR1 一起屏蔽掉 (v0.7 阶段6 的 sa_mask):
+     * 不这么做的话, 如果 tick 恰好在 RT handler 刚进入、还没记录
+     * 的时候到达, 嵌套的 USR1 会先写槽位, 记录的"顺序"就不代表
+     * 内核的投递顺序了。屏蔽之后 RT handler 一定先完整跑完。
+     */
     usys_sigaction(SIGUSR1, sig_handler_rt, sig_tramp);
+    usys_sigaction_ex(SIGRTMIN, sig_handler_rt, sig_tramp,
+                      0, 1u << SIGUSR1);
     usys_sigprocmask(SIG_SETMASK, (1u << SIGRTMIN) | (1u << SIGUSR1), 0);
     usys_kill(0, SIGUSR1);
     usys_kill(0, SIGRTMIN);
@@ -1138,8 +1217,84 @@ static void USER_TEXT u_signal(void)
         }
     }
 
+    /* ================= v0.7 阶段6: SA_NODEFER / sa_mask ================= */
+
+    /*
+     * 默认行为: 同一个实时信号排队 3 份, handler 里不会嵌套自己。
+     * handler 每次记录当前深度和最大深度。
+     */
+    SAY(msg_sa1);
+    usys_sigaction(SIGRTMIN, (void (*)(int))sig_handler_nest, sig_tramp);
+    seen[0] = 0;
+    seen[1] = 0;
+    usys_sigprocmask(SIG_SETMASK, 1u << SIGRTMIN, 0);
+    usys_sigqueue(0, SIGRTMIN, 0xE1u);
+    usys_sigqueue(0, SIGRTMIN, 0xE2u);
+    usys_sigqueue(0, SIGRTMIN, 0xE3u);
+    usys_sigprocmask(SIG_SETMASK, 0, 0);
+    for (i = 0; i < 200; i++) {
+        usys_yield();
+    }
+
+    if (seen[0] == 0 && seen[1] == 1) {
+        SAY(msg_sa2);
+    } else {
+        SAY(msg_sabad);
+    }
+
+    /* SA_NODEFER: 不自动屏蔽当前信号, 同一个信号可以嵌套 */
+    SAY(msg_sa3);
+    if (usys_sigaction_ex(SIGRTMIN, (void (*)(int))sig_handler_nest,
+                          sig_tramp, SA_NODEFER, 0) < 0) {
+        SAY(msg_sabad);
+    }
+    seen[0] = 0;
+    seen[1] = 0;
+    usys_sigprocmask(SIG_SETMASK, 1u << SIGRTMIN, 0);
+    usys_sigqueue(0, SIGRTMIN, 0xE1u);
+    usys_sigqueue(0, SIGRTMIN, 0xE2u);
+    usys_sigprocmask(SIG_SETMASK, 0, 0);
+    for (i = 0; i < 200; i++) {
+        usys_yield();
+    }
+
+    if (seen[0] == 0 && seen[1] >= 2) {
+        SAY(msg_sa4);
+    } else {
+        SAY(msg_sabad);
+    }
+
+    /*
+     * sa_mask: SIGUSR1 的 handler 期间额外屏蔽 SIGUSR2。
+     * 两个信号同时挂起时 USR1 先投递 (编号小), 它在 handler 里
+     * 主动让出几次 CPU; 如果 sa_mask 生效, USR2 只能等 handler
+     * 返回之后才进来。
+     */
+    SAY(msg_sa5);
+    usys_sigaction_ex(SIGUSR1, (void (*)(int))sig_handler_mask, sig_tramp,
+                      0, 1u << SIGUSR2);
+    usys_sigaction(SIGUSR2, (void (*)(int))sig_handler_mask, sig_tramp);
+    seen[0] = 0;
+    seen[1] = 0xFFFFFFFFu;
+    seen[2] = 0;
+    usys_sigprocmask(SIG_SETMASK, (1u << SIGUSR1) | (1u << SIGUSR2), 0);
+    usys_kill(0, SIGUSR1);
+    usys_kill(0, SIGUSR2);
+    usys_sigprocmask(SIG_SETMASK, 0, 0);
+    for (i = 0; i < 200; i++) {
+        usys_yield();
+    }
+
+    if (seen[0] == 1 && seen[1] == 0) {
+        SAY(msg_sa6);
+    } else {
+        SAY(msg_sabad);
+    }
+
     /* 恢复默认动作, 免得影响后面的 demo */
+    usys_sigaction(SIGUSR1, 0, 0);
     usys_sigaction(SIGUSR2, 0, 0);
+    usys_sigaction(SIGRTMIN, 0, 0);
     usys_sigprocmask(SIG_SETMASK, 0, 0);
 
     usys_exit(0);

@@ -423,6 +423,13 @@ int vm_fault(u32 va, u32 write)
                 printf("[COW] %s: %X last owner, made writable\n",
                        t->name, page);
             }
+
+            /*
+             * COW 改了 PTE。只按 VA 刷一项在 ASID/QEMU TLB 的边界上
+             * 可能留下旧映射, 表现为用户读回改动前的值。COW 不常发生,
+             * 直接把整个 ASID 的 TLB 清掉, 代价比"偶发一次旧映射"小。
+             */
+            mmu_flush_asid(t->asid);
             return VM_OK;
         }
 

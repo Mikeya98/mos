@@ -1,6 +1,9 @@
 # ===========================
 # MOS RTOS — 构建系统
 # ===========================
+# .d 文件里也有目标规则, 不固定默认目标的话 make 会挑第一个 .o
+# （比如 string.o）来构建。
+.DEFAULT_GOAL := all
 # 用法:
 #   make         编译所有, 生成 build/mos.elf
 #   make qemu    编译 + 启动 QEMU 仿真

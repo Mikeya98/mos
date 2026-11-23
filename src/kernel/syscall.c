@@ -250,12 +250,23 @@ static int user_code_addr_ok(u32 addr)
     return 0;
 }
 
-static int sys_sigaction(task_t *cur, u32 sig, u32 handler, u32 tramp)
+/**
+ * @brief 安装信号处理函数 (v0.7 阶段6 起带 flags / sa_mask)
+ *
+ * flags 目前只认 SA_NODEFER。mask 是安装时给的附加屏蔽字,
+ * handler 执行期间额外屏蔽这些信号; 默认还会屏蔽当前信号本身,
+ * SA_NODEFER 可以关掉这一条。
+ */
+static int sys_sigaction_ex(task_t *cur, u32 sig, u32 handler, u32 tramp,
+                            u32 flags, u32 mask)
 {
     if (!cur || !cur->is_user) {
         return -EPERM;
     }
     if (sig == 0 || sig >= MOS_NSIG) {
+        return -EINVAL;
+    }
+    if (flags & ~SA_NODEFER) {
         return -EINVAL;
     }
 
@@ -266,6 +277,8 @@ static int sys_sigaction(task_t *cur, u32 sig, u32 handler, u32 tramp)
     if (handler == SIG_IGN) {
         cur->sig_handler[sig] = 0;
         cur->sig_tramp[sig]   = 0;
+        cur->sig_flags[sig]   = 0;
+        cur->sig_mask[sig]    = 0;
         cur->sig_ignore      |= (1u << sig);
         cur->sig_pending     &= ~(1u << sig);
         cur->sig_count[sig]   = 0;
@@ -284,8 +297,16 @@ static int sys_sigaction(task_t *cur, u32 sig, u32 handler, u32 tramp)
 
     cur->sig_handler[sig] = handler;
     cur->sig_tramp[sig]   = (handler != 0) ? tramp : 0;
+    cur->sig_flags[sig]   = (handler != 0) ? (u8)(flags & SA_NODEFER) : 0;
+    cur->sig_mask[sig]    = (handler != 0) ? (mask & 0xFFFFFFFEu) : 0;
     cur->sig_ignore      &= ~(1u << sig);
     return 0;
+}
+
+/* 老接口: 没有 flags / sa_mask, 行为保持上一阶段的样子 */
+static int sys_sigaction(task_t *cur, u32 sig, u32 handler, u32 tramp)
+{
+    return sys_sigaction_ex(cur, sig, handler, tramp, 0, 0);
 }
 
 static int sys_kill(u32 pid, u32 sig)
@@ -496,8 +517,6 @@ u32 user_signal_check(u32 *frame, u32 pc)
             cur->sig_pending &= ~(1u << sig);
         }
 
-        /* handler 的第二个参数; 只关心信号号的 C 函数会自然忽略它 */
-        frame[FRAME_R1] = value;
     }
 
     handler = cur->sig_handler[sig];
@@ -521,6 +540,13 @@ u32 user_signal_check(u32 *frame, u32 pc)
     kframe[SIG_FRAME_BLOCKED] = cur->sig_blocked;   /* 阶段5: 保存旧屏蔽字 */
 
     /*
+     * v0.7 阶段6 修的坑: handler 的第二个参数必须等现场存进 kframe
+     * 之后再写。嵌套投递时 frame 是被打断的那个 handler 的上下文,
+     * 提前写 r1 会把它的局部变量覆盖掉, SIGRETURN 恢复回来就是错的值。
+     */
+    frame[FRAME_R1] = value;
+
+    /*
      * 从这里到异常返回之间关中断:
      *   - 读到的是本任务被打断时的用户 LR;
      *   - 写完 banked SP/LR 之后不允许别的任务跑进用户态。
@@ -537,11 +563,17 @@ u32 user_signal_check(u32 *frame, u32 pc)
     }
 
     /*
-     * v0.7 阶段5: handler 执行期间自动屏蔽当前信号 (POSIX 默认行为)。
-     * 同一个实时信号排队多份时, 剩下的等这次 handler 返回、SIGRETURN
-     * 恢复旧屏蔽字之后再投递, 不会嵌套进自己的 handler。
+     * v0.7 阶段5/6: handler 期间的屏蔽字。
+     *
+     * 默认在旧屏蔽字上再加当前信号 (POSIX 行为), 同一个实时信号
+     * 剩下的几份会等 SIGRETURN 恢复之后再投递; 安装时给的 sa_mask
+     * 也一起加进去。SA_NODEFER 表示不自动屏蔽当前信号, 允许同一个
+     * 信号嵌套进自己的 handler。
      */
-    cur->sig_blocked |= (1u << sig);
+    cur->sig_blocked |= cur->sig_mask[sig];
+    if (!(cur->sig_flags[sig] & SA_NODEFER)) {
+        cur->sig_blocked |= (1u << sig);
+    }
 
     cur->user_sp = new_sp;
     write_user_sp(new_sp);
@@ -716,6 +748,8 @@ void svc_dispatch(u32 svc_num, u32 *frame)
             for (si = 0; si < MOS_NSIG; si++) {
                 cur->sig_handler[si] = 0;
                 cur->sig_tramp[si]   = 0;
+                cur->sig_flags[si]   = 0;
+                cur->sig_mask[si]    = 0;
                 cur->sig_count[si]   = 0;
                 cur->sig_value[si]   = 0;
             }
@@ -817,6 +851,8 @@ void svc_dispatch(u32 svc_num, u32 *frame)
             for (si = 0; si < MOS_NSIG; si++) {
                 cur->sig_handler[si] = 0;
                 cur->sig_tramp[si]   = 0;
+                cur->sig_flags[si]   = 0;
+                cur->sig_mask[si]    = 0;
                 cur->sig_count[si]   = 0;
                 cur->sig_value[si]   = 0;
             }
@@ -837,6 +873,14 @@ void svc_dispatch(u32 svc_num, u32 *frame)
         task_t *cur = get_current();
         ret = sys_sigaction(cur, frame[FRAME_R0], frame[FRAME_R1],
                             frame[FRAME_R2]);
+        break;
+    }
+
+    case SYS_SIGACTION_EX: {
+        task_t *cur = get_current();
+        ret = sys_sigaction_ex(cur, frame[FRAME_R0], frame[FRAME_R1],
+                               frame[FRAME_R2], frame[FRAME_R3],
+                               frame[FRAME_R4]);
         break;
     }
 

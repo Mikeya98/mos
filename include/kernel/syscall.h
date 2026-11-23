@@ -40,7 +40,8 @@
 #define SYS_GETPPID     16      /* 返回父进程 pid, 没有父亲返回 0 */
 #define SYS_SIGPROCMASK 17      /* sigprocmask(how, set, oldset) (v0.7 阶段3) */
 #define SYS_SIGQUEUE    18      /* sigqueue(pid, sig, value) (v0.7 阶段5) */
-#define SYS_MAX         19
+#define SYS_SIGACTION_EX 19     /* sigaction_ex(sig, handler, tramp, flags, mask) (v0.7 阶段6) */
+#define SYS_MAX         20
 
 /* =========================== 信号 =========================== */
 #define MOS_NSIG        32
@@ -62,6 +63,20 @@
 #define MOS_SIGRTMIN    24
 #define MOS_SIGRTMAX    31
 #define MOS_SIG_MAXPENDING 8
+
+/*
+ * v0.7 阶段6: sigaction 的 flags 和附加屏蔽字 (sa_mask)。
+ *
+ * 默认行为是"handler 执行期间自动屏蔽当前信号" (上一阶段的修复)。
+ * 两种方式可以改:
+ *   sa_mask   安装时指定一组信号, handler 期间额外屏蔽它们
+ *   SA_NODEFER 不支持自定义屏蔽时反过来用 —— handler 里不再自动
+ *             屏蔽当前信号, 同一个信号可以嵌套投递
+ *
+ * MOS 只实现 SA_NODEFER 这一位, 其他位报 EINVAL, 免得以后加功能
+ * 时用户传进来的未知标志被静默忽略。
+ */
+#define SA_NODEFER      1u
 
 /* POSIX 习惯的别名 */
 #define SIGRTMIN        MOS_SIGRTMIN

@@ -1025,6 +1025,8 @@ task_t *task_fork(task_t *parent, u32 user_pc)
     for (i = 0; i < MOS_NSIG; i++) {
         child->sig_handler[i] = parent->sig_handler[i];
         child->sig_tramp[i]   = parent->sig_tramp[i];
+        child->sig_flags[i]   = parent->sig_flags[i];   /* 处置方式继承 */
+        child->sig_mask[i]    = parent->sig_mask[i];
         child->sig_count[i]   = 0;                  /* 排队份数不继承 */
         child->sig_value[i]   = 0;                  /* 待投递的值也不继承 */
     }
