@@ -738,7 +738,15 @@ void svc_dispatch(u32 svc_num, u32 *frame)
          * 跳板再把 SPSR 设成 USR, 返回用户态的新入口。
          */
         {
+            /*
+             * v0.7 阶段7 修复: SPSR_svc 是 CPU 全局寄存器, 不跟任务走。
+             * 这里改成 SVC 之后如果被时钟中断切走, 别的任务从系统调用
+             * 返回时 MOVS pc, lr 会读到 SVC, 留在内核态执行用户代码。
+             * 信号 handler 因此会在 SVC 模式跑, SIGRETURN 永远不执行,
+             * 用户 SP 停在信号帧上。改 SPSR 到跳板执行之间必须关中断。
+             */
             u32 svc_mode = 0x13u;
+            ENTER_CRITICAL();
             __asm__ volatile ("MSR SPSR_cxsf, %0" :: "r"(svc_mode) : "memory");
         }
 
@@ -841,7 +849,15 @@ void svc_dispatch(u32 svc_num, u32 *frame)
         frame[FRAME_R5] = entry;
         frame[FRAME_LR] = (u32)(uintptr_t)fork_return_trampoline;
         {
+            /*
+             * v0.7 阶段7 修复: SPSR_svc 是 CPU 全局寄存器, 不跟任务走。
+             * 这里改成 SVC 之后如果被时钟中断切走, 别的任务从系统调用
+             * 返回时 MOVS pc, lr 会读到 SVC, 留在内核态执行用户代码。
+             * 信号 handler 因此会在 SVC 模式跑, SIGRETURN 永远不执行,
+             * 用户 SP 停在信号帧上。改 SPSR 到跳板执行之间必须关中断。
+             */
             u32 svc_mode = 0x13u;
+            ENTER_CRITICAL();
             __asm__ volatile ("MSR SPSR_cxsf, %0" :: "r"(svc_mode) : "memory");
         }
 
@@ -931,8 +947,19 @@ void svc_dispatch(u32 svc_num, u32 *frame)
      * 返回用户态前投递 pending 信号 (v0.7 阶段2)。
      * 放在最后: 信号处理函数保存的 r0 就是这次系统调用的返回值,
      * sigreturn 恢复现场后用户态能正常拿到它。
+     *
+     * v0.7 阶段7: exec 路径为了先回到 SVC 跳板, 会把 SPSR_svc 临时
+     * 改成 SVC。这种情况下不能投递信号 —— 异常返回会按 SPSR 留在
+     * SVC, handler 就在内核态执行, 永远不会走 SIGRETURN。信号留在
+     * pending 里, 等下一次从用户态返回再投递。
      */
-    frame[FRAME_LR] = user_signal_check(frame, frame[FRAME_LR]);
+    {
+        u32 spsr_v;
+        __asm__ volatile ("mrs %0, spsr" : "=r"(spsr_v));
+        if ((spsr_v & 0x1Fu) == 0x10u) {
+            frame[FRAME_LR] = user_signal_check(frame, frame[FRAME_LR]);
+        }
+    }
 }
 
 /* =========================== 初始化 =========================== */

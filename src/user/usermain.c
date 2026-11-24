@@ -792,7 +792,7 @@ static const char msg_sa1[] USER_RODATA =
 static const char msg_sa2[] USER_RODATA =
     "[user] u_signal: handler never nested — auto-block OK\n";
 static const char msg_sa3[] USER_RODATA =
-    "[user] u_signal: reinstall with SA_NODEFER, queue 2 again\n";
+    "[user] u_signal: reinstall with SA_NODEFER, nest 3 levels\n";
 static const char msg_sa4[] USER_RODATA =
     "[user] u_signal: handler nested inside itself — SA_NODEFER OK\n";
 static const char msg_sa5[] USER_RODATA =
@@ -895,6 +895,18 @@ static void USER_TEXT sig_handler_nest(int sig, u32 val)
     p[0] = p[0] + 1u;
     if (p[0] > p[1]) {
         p[1] = p[0];
+    }
+
+    /*
+     * SA_NODEFER 测试: 由 handler 自己再排同号信号, 一共三层。
+     * 这样后两份一定在前一层 handler 已经进入之后才投递,
+     * 深度计数器才量得到嵌套 —— 从外面提前排队的话, 后一份可能
+     * 在 handler 第一条指令之前就被 IRQ 投递, 看起来像没嵌套。
+     * 三层能跑稳, 也说明阶段6 的深层嵌套跑飞问题已经修掉。
+     */
+    if (p[3] != 0) {
+        p[3] = p[3] - 1u;
+        usys_sigqueue(0, SIGRTMIN, 0xE2u);
     }
 
     usys_yield();               /* 投递点 */
@@ -1227,6 +1239,7 @@ static void USER_TEXT u_signal(void)
     usys_sigaction(SIGRTMIN, (void (*)(int))sig_handler_nest, sig_tramp);
     seen[0] = 0;
     seen[1] = 0;
+    seen[3] = 0;                /* auto-block 测试不重排 */
     usys_sigprocmask(SIG_SETMASK, 1u << SIGRTMIN, 0);
     usys_sigqueue(0, SIGRTMIN, 0xE1u);
     usys_sigqueue(0, SIGRTMIN, 0xE2u);
@@ -1250,15 +1263,15 @@ static void USER_TEXT u_signal(void)
     }
     seen[0] = 0;
     seen[1] = 0;
+    seen[3] = 2;                /* handler 里再排两份, 共三层 */
     usys_sigprocmask(SIG_SETMASK, 1u << SIGRTMIN, 0);
     usys_sigqueue(0, SIGRTMIN, 0xE1u);
-    usys_sigqueue(0, SIGRTMIN, 0xE2u);
     usys_sigprocmask(SIG_SETMASK, 0, 0);
     for (i = 0; i < 200; i++) {
         usys_yield();
     }
 
-    if (seen[0] == 0 && seen[1] >= 2) {
+    if (seen[0] == 0 && seen[1] >= 3) {
         SAY(msg_sa4);
     } else {
         SAY(msg_sabad);

@@ -421,7 +421,22 @@ u32 irq_dispatch_frame(u32 *frame, u32 pc)
         gic_send_eoi(irq_id);
     }
 
-    /* 返回用户态之前投递 pending 信号 */
+    /*
+     * 返回用户态之前投递 pending 信号。
+     *
+     * v0.7 阶段7 修复: 只有被中断的现场本来就是用户态时才投递。
+     * 如果 tick 打断了内核代码 (SPSR_irq = SVC), RFE 会按 SPSR_irq
+     * 回到 SVC 模式 —— 这时候把 PC 换成用户 handler, handler 就在
+     * 内核态执行, bx lr 会跳回内核, SIGRETURN 永远不会跑, 用户栈
+     * 也停在信号帧上。信号留在 pending 里, 等下一次从用户态返回
+     * (SVC 或用户态 IRQ) 再投递。
+     *
+     * frame[15] 是 SRSFD 保存的 spsr_irq。
+     */
+    if ((frame[15] & 0x1Fu) != 0x10u) {
+        return pc;
+    }
+
     return user_signal_check(frame, pc);
 }
 
