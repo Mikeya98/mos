@@ -937,7 +937,29 @@ static void task_save_user_lr(task_t *t)
     irq_restore(cpsr);
 }
 
-task_t *task_fork(task_t *parent, u32 user_pc)
+/*
+ * fork 子进程第一次返回用户态前的准备 (sched_asm.S 的跳板调用)。
+ *
+ * 用户栈顶和返回 PC 都从 TCB 读, 不再用 r4/r5 当载体 —— r4-r11 是
+ * AAPCS 的 callee-saved 寄存器, 父进程的函数可能正把活值放在里面
+ * (v0.7 阶段8 就踩到了: u_signal 把 sig_tramp 地址留在 r5, 子进程
+ * fork 之后拿到的却是返回 PC)。
+ *
+ * 这个函数在 SVC 模式跑, 只改 SP_usr 和返回值, 不碰 r4-r11。
+ */
+u32 fork_child_setup(void)
+{
+    task_t *t = get_current();
+
+    if (!t || !t->is_user) {
+        return 0;
+    }
+
+    write_user_sp(t->user_sp);
+    return (u32)(uintptr_t)t->entry;
+}
+
+task_t *task_fork(task_t *parent, u32 user_pc, const u32 *parent_frame)
 {
     task_t *child;
     user_space_t parent_as;
@@ -975,25 +997,27 @@ task_t *task_fork(task_t *parent, u32 user_pc)
 
     /*
      * 3. 覆盖 task_create 伪造的"首次执行 entry"上下文帧, 换成
-     *    直接返回用户态的 fork 跳板帧:
+     *    返回用户态的 fork 跳板帧:
      *
-     *      sp[0] = r4 = 子进程用户栈顶
-     *      sp[1] = r5 = 子进程返回用户态后的 PC
-     *      sp[2..7] = r6-r11 (清零, fork 之后未定义)
-     *      sp[8] = lr = fork_return_trampoline
+     *      sp[0..7] = r4-r11, 取父进程进 SVC 时的现场
+     *      sp[8]    = lr = fork_return_trampoline
      *
-     *    context_switch 恢复这 9 个字后 BX 到跳板, 跳板负责设置
+     *    r4-r11 是 callee-saved 寄存器, 父进程调用 fork 的函数可能正
+     *    拿它们存着活值。子进程必须原样继承, 否则从 fork 返回之后
+     *    一用就是错的。用户栈顶和返回 PC 改由跳板从 TCB 读
+     *    (fork_child_setup), 不再占用 r4/r5。
+     *
+     *    context_switch 恢复这 9 个字后 BX 到跳板, 跳板设置
      *    SP_usr / SPSR 并异常返回用户态。
      */
     kstack_top = (u32 *)(((u32)(uintptr_t)child->stack_base) & ~0x7u);
     sp = kstack_top - 9;
-    sp[0] = parent->user_sp;                /* r4 → 用户栈 */
-    sp[1] = user_pc;                        /* r5 → 用户 PC */
-    for (i = 2; i < 8; i++) {
-        sp[i] = 0;                          /* r6-r11 */
+    for (i = 0; i < 8; i++) {
+        sp[i] = parent_frame ? parent_frame[4 + i] : 0;   /* r4-r11 */
     }
     sp[8] = (u32)(uintptr_t)fork_return_trampoline;
     child->sp = (u32)(uintptr_t)sp;
+    child->entry = (void (*)(void))(uintptr_t)user_pc;    /* 跳板从这里取 */
 
     /* 4. 绑定新的地址空间和用户态状态 */
     child->is_user  = 1;
@@ -1029,9 +1053,17 @@ task_t *task_fork(task_t *parent, u32 user_pc)
         child->sig_mask[i]    = parent->sig_mask[i];
         child->sig_count[i]   = 0;                  /* 排队份数不继承 */
         child->sig_value[i]   = 0;                  /* 待投递的值也不继承 */
+        child->sig_sender[i]  = 0;                  /* 阶段8: 发送方同样不继承 */
+        child->sig_code[i]    = SI_USER;
     }
     for (i = 0; i < MOS_RT_SIGS; i++) {
+        u32 k;
+
         child->sig_rt_head[i] = 0;
+        for (k = 0; k < MOS_SIG_MAXPENDING; k++) {
+            child->sig_rt_sender[i][k] = 0;
+            child->sig_rt_code[i][k]   = SI_USER;
+        }
     }
     child->sig_pending     = 0;
     child->sig_ignore      = parent->sig_ignore;    /* SIG_IGN 是处置方式, 继承 */
@@ -1303,23 +1335,32 @@ void task_kill(task_t *t)
 
 s32 task_signal_send(s32 pid, u32 sig)
 {
-    return task_signal_queue(pid, sig, 0);
+    u32 sender = current_task ? current_task->pid : 0;
+
+    return task_signal_send_info(pid, sig, 0, sender, SI_USER);
 }
 
 s32 task_signal_queue(s32 pid, u32 sig, u32 value)
+{
+    u32 sender = current_task ? current_task->pid : 0;
+
+    return task_signal_send_info(pid, sig, value, sender, SI_QUEUE);
+}
+
+s32 task_signal_send_info(s32 pid, u32 sig, u32 value, u32 sender, u32 code)
 {
     task_t *t;
     int woke = 0;
     int preempt = 0;
 
     if (sig == 0 || sig >= MOS_NSIG) {
-        return -1;
+        return -EINVAL;
     }
 
     t = (pid == 0) ? current_task : find_task_by_pid((u32)pid);
     if (!t || t == &idle_tcb || t->state == TASK_DEAD ||
         t->state == TASK_ZOMBIE) {
-        return -1;
+        return -ESRCH;
     }
 
     ENTER_CRITICAL();
@@ -1340,16 +1381,30 @@ s32 task_signal_queue(s32 pid, u32 sig, u32 value)
      * POSIX 的规则: 普通信号在 pending 期间再来一次只保留一份;
      * SIGRTMIN..SIGRTMAX 每次投递都占一个位置, handler 要跑同样
      * 的次数。这里用 sig_count 计数, 上限 MOS_SIG_MAXPENDING。
+     *
+     * v0.7 阶段8: 队列满不再静默丢弃, 返回 -EAGAIN 让发送方知道。
+     * 普通信号已经 pending 时再发仍然返回 0 —— POSIX 的 kill/sigqueue
+     * 对标准信号就是这么报的 (后来那份值丢掉, 但调用成功)。
      */
     if (sig >= MOS_SIGRTMIN && sig <= MOS_SIGRTMAX) {
-        if (t->sig_count[sig] < MOS_SIG_MAXPENDING) {
-            u32 rt = sig - MOS_SIGRTMIN;
+        u32 rt;
+
+        if (t->sig_count[sig] >= MOS_SIG_MAXPENDING) {
+            EXIT_CRITICAL();
+            return -EAGAIN;
+        }
+
+        rt = sig - MOS_SIGRTMIN;
+        {
             u32 tail = (u32)t->sig_rt_head[rt] + t->sig_count[sig];
+            u32 pos  = tail % MOS_SIG_MAXPENDING;
 
             /* 环形队列: 队头 + 已有份数 = 新一份的位置 */
-            t->sig_rt_queue[rt][tail % MOS_SIG_MAXPENDING] = value;
-            t->sig_count[sig]++;
+            t->sig_rt_queue[rt][pos]  = value;
+            t->sig_rt_sender[rt][pos] = sender;
+            t->sig_rt_code[rt][pos]   = (u8)code;
         }
+        t->sig_count[sig]++;
     } else if (!(t->sig_pending & (1u << sig))) {
         /*
          * 普通信号不排队: 已经 pending 时后到的 sigqueue 只当作
@@ -1357,6 +1412,8 @@ s32 task_signal_queue(s32 pid, u32 sig, u32 value)
          */
         t->sig_count[sig]   = 1;
         t->sig_value[sig]   = value;
+        t->sig_sender[sig]  = sender;
+        t->sig_code[sig]    = (u8)code;
     }
 
     t->sig_pending |= (1u << sig);

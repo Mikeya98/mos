@@ -73,10 +73,41 @@
  *   SA_NODEFER 不支持自定义屏蔽时反过来用 —— handler 里不再自动
  *             屏蔽当前信号, 同一个信号可以嵌套投递
  *
- * MOS 只实现 SA_NODEFER 这一位, 其他位报 EINVAL, 免得以后加功能
- * 时用户传进来的未知标志被静默忽略。
+ * v0.7 阶段8 增加两位:
+ *   SA_SIGINFO    handler 原型变成 handler(sig, siginfo_t *, void *),
+ *                 第二个参数指向信号帧里的 mos_siginfo_t, 第三个参数
+ *                 目前固定为 0 (没有实现 ucontext)。
+ *   SA_RESETHAND  handler 进入后处置方式复位成默认动作。同一个实时
+ *                 信号还有排队副本时, 从第二份开始按默认动作终止。
+ *
+ * 未定义的位仍然报 EINVAL, 不静默忽略。
  */
 #define SA_NODEFER      1u
+#define SA_SIGINFO      2u
+#define SA_RESETHAND    4u
+#define SA_VALID_FLAGS  (SA_NODEFER | SA_SIGINFO | SA_RESETHAND)
+
+/*
+ * v0.7 阶段8: 信号发送方信息 (对应 POSIX siginfo_t 里常用的四个字段)。
+ *
+ * 不算 si_uid/si_addr 这些 MOS 暂时用不到的东西, 只保留能填对的部分:
+ *   si_signo  信号号
+ *   si_code   SI_USER (kill) / SI_QUEUE (sigqueue)
+ *   si_pid    发送者 pid
+ *   si_value  sigqueue 携带的值, kill 发的是 0
+ *
+ * 结构体压在信号帧里 (见 syscall.c 的布局), SA_SIGINFO 时 handler 的
+ * 第二个参数指向它。普通 handler 仍然只从 r1 拿 si_value。
+ */
+#define SI_USER         0
+#define SI_QUEUE        1
+
+typedef struct {
+    u32 si_signo;
+    s32 si_code;
+    s32 si_pid;
+    u32 si_value;
+} mos_siginfo_t;
 
 /* POSIX 习惯的别名 */
 #define SIGRTMIN        MOS_SIGRTMIN
@@ -99,6 +130,7 @@
 #define ECHILD          10      /* 没有这个子进程 (wait) */
 #define ESRCH           3       /* 没有这个进程 (kill) */
 #define EINTR           4       /* 阻塞的系统调用被信号打断 (v0.7 阶段3) */
+#define EAGAIN          11      /* 实时信号队列满 (v0.7 阶段8) */
 
 /* =========================== 用户地址范围 =========================== */
 /* 定义在 mm/mmu.h: 0x08000000 - 0x08111000 */

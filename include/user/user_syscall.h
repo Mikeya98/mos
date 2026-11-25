@@ -285,8 +285,10 @@ USYS_INLINE s32 usys_sigprocmask(u32 how, u32 set, u32 *oldset)
 /**
  * 发一个带值的信号 (v0.7 阶段5)。
  *
- * handler 收到 r0 = 信号号、r1 = value。普通信号已经 pending 时
- * 后到的值会丢弃; 实时信号按 FIFO 排队, 每个值都会投递一次。
+ * handler 收到 r0 = 信号号、r1 = value; 装 SA_SIGINFO 时 r1 是指向
+ * mos_siginfo_t 的指针, si_code = SI_QUEUE、si_pid = 发送者 pid。
+ * 普通信号已经 pending 时后到的值会丢弃; 实时信号按 FIFO 排队,
+ * 每个值都会投递一次。实时队列满时返回 -EAGAIN (v0.7 阶段8)。
  * pid=0 表示自己。
  */
 USYS_INLINE s32 usys_sigqueue(s32 pid, u32 sig, u32 value)
@@ -299,12 +301,15 @@ USYS_INLINE s32 usys_sigqueue(s32 pid, u32 sig, u32 value)
 }
 
 /**
- * 安装信号处理函数, 带 flags 和附加屏蔽字 (v0.7 阶段6)。
+ * 安装信号处理函数, 带 flags 和附加屏蔽字 (v0.7 阶段6, 阶段8 扩 flags)。
  *
- * @param flags  SA_NODEFER = 1 表示 handler 里不自动屏蔽当前信号
+ * @param flags  SA_NODEFER (1) handler 里不自动屏蔽当前信号
+ *               SA_SIGINFO (2) handler 原型改成 handler(sig, siginfo, ucontext),
+ *                              第二个参数指向信号帧里的 mos_siginfo_t
+ *               SA_RESETHAND (4) handler 进入后处置方式复位成默认动作
  * @param mask   handler 执行期间额外屏蔽的信号位图
  *
- * 普通 usys_sigaction 等价于 flags=0、mask=0。
+ * 普通 usys_sigaction 等价于 flags=0、mask=0。未定义的位返回 -EINVAL。
  */
 USYS_INLINE s32 usys_sigaction_ex(u32 sig, void (*handler)(int),
                                   void (*tramp)(void), u32 flags, u32 mask)

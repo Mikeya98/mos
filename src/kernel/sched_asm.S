@@ -169,37 +169,35 @@ write_user_lr:
     BX      lr
 
 /* ============================================================
- * fork 子进程的首次返回 (v0.6 阶段8)
+ * fork / exec 子进程的首次返回 (v0.6 阶段8, v0.7 阶段8 修订)
  *
- * task_fork 伪造的上下文帧里:
- *   r4 = 子进程的用户栈顶
- *   r5 = 子进程从 SVC 返回的用户 PC
- *   lr = 本跳板
- * context_switch 恢复 r4-r11/lr 后 BX 到这里。
+ * context_switch 恢复 r4-r11/lr 后 BX 到这里, r4-r11 是父进程
+ * 进 SVC 时的原值。用户栈顶和返回 PC 存在 TCB 里, 由
+ * fork_child_setup() 读出来写进 SP_usr 并返回 PC。
  *
- * 这里把 SP_usr 设成子进程自己的栈, 把 SPSR 设成 USR 模式,
- * r0 = 0 (fork 在子进程里返回 0), 然后异常返回用户态。
+ * 不能再用 r4/r5 当载体: 它们是 callee-saved 寄存器, 父进程的函数
+ * 可能正把活值放在里面, 清掉之后子进程从 fork 返回就拿到错的值。
+ *
+ * C 函数按 AAPCS 保证 r4-r11 不变, 所以这里只动 r0-r3/r12/lr。
  * ============================================================ */
 .global fork_return_trampoline
+.extern fork_child_setup
 fork_return_trampoline:
-    @ 1. 设置子进程自己的用户栈
-    CPS     #T_MOD_SYS
-    MOV     sp, r4
-    CPS     #T_MOD_SVC
+    @ 1. TCB → SP_usr, 返回用户 PC
+    BL      fork_child_setup
+    MOV     lr, r0
 
-    @ 2. 用户 PC → lr, 准备异常返回
-    MOV     lr, r5
-
-    @ 3. fork 在子进程里的返回值 = 0, 其余参数寄存器无意义
+    @ 2. fork 在子进程里的返回值 = 0, 其余参数寄存器无意义
     MOV     r0, #0
     MOV     r1, #0
     MOV     r2, #0
     MOV     r3, #0
     MOV     r12, #0
 
-    @ 4. 返回目标模式 = USR
-    MOV     r4, #T_MOD_USR
-    MSR     SPSR_cxsf, r4
+    @ 3. 返回目标模式 = USR
+    MOV     r0, #T_MOD_USR
+    MSR     SPSR_cxsf, r0
+    MOV     r0, #0
 
-    @ 5. 异常返回, 从 SVC 系统调用的下一条指令继续执行
+    @ 4. 异常返回, 从 SVC 系统调用的下一条指令继续执行
     MOVS    pc, lr

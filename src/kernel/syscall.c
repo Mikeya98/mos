@@ -217,18 +217,20 @@ static int sys_vm_stats(void *uout)
 /* =========================== 信号 (v0.7 阶段2) =========================== */
 
 /*
- * 信号帧压在用户栈上, 布局 (20 个字, 80 字节):
+ * 信号帧压在用户栈上, 布局 (24 个字, 96 字节):
  *   [0..12]  r0-r12
  *   [13]     被打断的用户 PC
  *   [14]     被打断时的用户 SP
  *   [15]     魔数 (sigreturn 校验用)
  *   [16]     被打断时的用户 LR
- *   [17..19] 对齐填充
+ *   [17]     进入 handler 前的屏蔽字
+ *   [18..21] mos_siginfo_t (signo / code / pid / value)
+ *   [22..23] 保留, 以后放 ucontext 或 si_addr
  *
  * 为什么 LR 也要存: LR 是 banked 寄存器, 进入 handler 时内核把它改成
  * tramp, 原值不存下来就恢复不了。
  */
-#define SIG_FRAME_WORDS 20
+#define SIG_FRAME_WORDS 24
 #define SIG_FRAME_MAGIC 0x5349474Eu     /* "SIGN" */
 
 /*
@@ -238,6 +240,13 @@ static int sys_vm_stats(void *uout)
  * 里嵌套投递, 把用户侧的状态改乱。
  */
 #define SIG_FRAME_BLOCKED 17
+
+/*
+ * v0.7 阶段8: siginfo 接在屏蔽字后面。SA_SIGINFO 时 handler 的
+ * 第二个参数就是 new_sp + SIG_FRAME_SI * 4。
+ */
+#define SIG_FRAME_SI      18
+#define SIG_FRAME_SI_WORDS 4
 
 static int user_code_addr_ok(u32 addr)
 {
@@ -266,7 +275,7 @@ static int sys_sigaction_ex(task_t *cur, u32 sig, u32 handler, u32 tramp,
     if (sig == 0 || sig >= MOS_NSIG) {
         return -EINVAL;
     }
-    if (flags & ~SA_NODEFER) {
+    if (flags & ~(unsigned)SA_VALID_FLAGS) {
         return -EINVAL;
     }
 
@@ -283,6 +292,8 @@ static int sys_sigaction_ex(task_t *cur, u32 sig, u32 handler, u32 tramp,
         cur->sig_pending     &= ~(1u << sig);
         cur->sig_count[sig]   = 0;
         cur->sig_value[sig]   = 0;              /* v0.7 阶段5: 值一起丢掉 */
+        cur->sig_sender[sig]  = 0;              /* v0.7 阶段8: 发送方一起清 */
+        cur->sig_code[sig]    = SI_USER;
         if (sig >= MOS_SIGRTMIN && sig <= MOS_SIGRTMAX) {
             cur->sig_rt_head[sig - MOS_SIGRTMIN] = 0;
         }
@@ -297,7 +308,7 @@ static int sys_sigaction_ex(task_t *cur, u32 sig, u32 handler, u32 tramp,
 
     cur->sig_handler[sig] = handler;
     cur->sig_tramp[sig]   = (handler != 0) ? tramp : 0;
-    cur->sig_flags[sig]   = (handler != 0) ? (u8)(flags & SA_NODEFER) : 0;
+    cur->sig_flags[sig]   = (handler != 0) ? (u8)(flags & SA_VALID_FLAGS) : 0;
     cur->sig_mask[sig]    = (handler != 0) ? (mask & 0xFFFFFFFEu) : 0;
     cur->sig_ignore      &= ~(1u << sig);
     return 0;
@@ -309,15 +320,16 @@ static int sys_sigaction(task_t *cur, u32 sig, u32 handler, u32 tramp)
     return sys_sigaction_ex(cur, sig, handler, tramp, 0, 0);
 }
 
-static int sys_kill(u32 pid, u32 sig)
+static int sys_kill(task_t *cur, u32 pid, u32 sig)
 {
+    s32 r;
+
     if (sig == 0 || sig >= MOS_NSIG) {
         return -EINVAL;
     }
-    if (task_signal_send((s32)pid, sig) < 0) {
-        return -ESRCH;
-    }
-    return 0;
+    r = task_signal_send_info((s32)pid, sig, 0,
+                              cur ? cur->pid : 0, SI_USER);
+    return (r < 0) ? (int)r : 0;
 }
 
 /**
@@ -326,15 +338,16 @@ static int sys_kill(u32 pid, u32 sig)
  * 值随信号一起排队, 投递时放进 handler 的 r1 (r0 仍是信号号)。
  * 普通信号不排队, 已 pending 时后到的值丢弃; 实时信号按 FIFO 排。
  */
-static int sys_sigqueue(u32 pid, u32 sig, u32 value)
+static int sys_sigqueue(task_t *cur, u32 pid, u32 sig, u32 value)
 {
+    s32 r;
+
     if (sig == 0 || sig >= MOS_NSIG) {
         return -EINVAL;
     }
-    if (task_signal_queue((s32)pid, sig, value) < 0) {
-        return -ESRCH;
-    }
-    return 0;
+    r = task_signal_send_info((s32)pid, sig, value,
+                              cur ? cur->pid : 0, SI_QUEUE);
+    return (r < 0) ? (int)r : 0;
 }
 
 /**
@@ -444,6 +457,9 @@ u32 user_signal_check(u32 *frame, u32 pc)
     u32 old_sp;
     u32 new_sp;
     u32 value = 0;
+    u32 sender = 0;
+    u32 si_code = SI_USER;
+    u32 flags = 0;
     u32 kframe[SIG_FRAME_WORDS];
     u32 i;
 
@@ -497,12 +513,19 @@ u32 user_signal_check(u32 *frame, u32 pc)
         if (sig >= MOS_SIGRTMIN && sig <= MOS_SIGRTMAX) {
             u32 rt   = sig - MOS_SIGRTMIN;
             u32 head = cur->sig_rt_head[rt];
+            u32 pos  = head % MOS_SIG_MAXPENDING;
 
-            value = cur->sig_rt_queue[rt][head % MOS_SIG_MAXPENDING];
+            value   = cur->sig_rt_queue[rt][pos];
+            sender  = cur->sig_rt_sender[rt][pos];
+            si_code = cur->sig_rt_code[rt][pos];
             cur->sig_rt_head[rt] = (u8)((head + 1u) % MOS_SIG_MAXPENDING);
         } else {
-            value = cur->sig_value[sig];
-            cur->sig_value[sig] = 0;
+            value   = cur->sig_value[sig];
+            sender  = cur->sig_sender[sig];
+            si_code = cur->sig_code[sig];
+            cur->sig_value[sig]  = 0;
+            cur->sig_sender[sig] = 0;
+            cur->sig_code[sig]   = SI_USER;
         }
 
         /*
@@ -528,6 +551,7 @@ u32 user_signal_check(u32 *frame, u32 pc)
     }
 
     tramp  = cur->sig_tramp[sig];
+    flags  = cur->sig_flags[sig];
     old_sp = cur->user_sp;
     new_sp = (old_sp - SIG_FRAME_WORDS * 4u) & ~0x7u;
 
@@ -540,11 +564,32 @@ u32 user_signal_check(u32 *frame, u32 pc)
     kframe[SIG_FRAME_BLOCKED] = cur->sig_blocked;   /* 阶段5: 保存旧屏蔽字 */
 
     /*
+     * v0.7 阶段8: 发送方信息跟着信号帧一起进用户栈。
+     * SA_SIGINFO 的 handler 拿到的指针就指向这 4 个字, handler 里
+     * 不管做什么系统调用, 这块内存都还在栈上, 不会被复用。
+     */
+    kframe[SIG_FRAME_SI + 0] = sig;
+    kframe[SIG_FRAME_SI + 1] = si_code;
+    kframe[SIG_FRAME_SI + 2] = sender;
+    kframe[SIG_FRAME_SI + 3] = value;
+    for (i = SIG_FRAME_SI + SIG_FRAME_SI_WORDS; i < SIG_FRAME_WORDS; i++) {
+        kframe[i] = 0;
+    }
+
+    /*
      * v0.7 阶段6 修的坑: handler 的第二个参数必须等现场存进 kframe
      * 之后再写。嵌套投递时 frame 是被打断的那个 handler 的上下文,
      * 提前写 r1 会把它的局部变量覆盖掉, SIGRETURN 恢复回来就是错的值。
+     *
+     * v0.7 阶段8: SA_SIGINFO 时 r1 换成 siginfo 指针, r2 放 ucontext
+     * (暂时没有实现, 置 0); 普通 handler 的 r1 仍然是信号值。
      */
-    frame[FRAME_R1] = value;
+    if (flags & SA_SIGINFO) {
+        frame[FRAME_R1] = new_sp + SIG_FRAME_SI * 4u;
+    } else {
+        frame[FRAME_R1] = value;
+    }
+    frame[FRAME_R2] = 0;
 
     /*
      * 从这里到异常返回之间关中断:
@@ -571,8 +616,21 @@ u32 user_signal_check(u32 *frame, u32 pc)
      * 信号嵌套进自己的 handler。
      */
     cur->sig_blocked |= cur->sig_mask[sig];
-    if (!(cur->sig_flags[sig] & SA_NODEFER)) {
+    if (!(flags & SA_NODEFER)) {
         cur->sig_blocked |= (1u << sig);
+    }
+
+    /*
+     * v0.7 阶段8: SA_RESETHAND 在 handler 进入时复位处置方式。
+     * 屏蔽字照常设置, 所以 handler 本身不会被打断; 但 SIGRETURN
+     * 恢复屏蔽字之后, 还排着的副本就会按默认动作处理 —— 该终止
+     * 就终止。复位放在屏蔽字计算之后, 不能影响本次投递。
+     */
+    if (flags & SA_RESETHAND) {
+        cur->sig_handler[sig] = 0;
+        cur->sig_tramp[sig]   = 0;
+        cur->sig_flags[sig]   = 0;
+        cur->sig_mask[sig]    = 0;
     }
 
     cur->user_sp = new_sp;
@@ -581,8 +639,11 @@ u32 user_signal_check(u32 *frame, u32 pc)
 
     frame[FRAME_R0] = sig;
 
-    printf("[SIG] %s: sig %u val %X → handler %X (frame at %X, sp %X)\n",
-           cur->name, sig, value, handler, new_sp, old_sp);
+    printf("[SIG] %s: sig %u val %X from %u (%s) → handler %X "
+           "(frame at %X, sp %X)\n",
+           cur->name, sig, value, sender,
+           (si_code == SI_QUEUE) ? "queue" : "kill",
+           handler, new_sp, old_sp);
     return handler;
 }
 
@@ -648,7 +709,7 @@ void svc_dispatch(u32 svc_num, u32 *frame)
          * 子进程从 fork_return_trampoline 返回用户态, 走的是
          * frame[FRAME_LR] 这个返回地址; 父进程在这里拿到子进程 pid。
          */
-        task_t *child = task_fork(get_current(), frame[FRAME_LR]);
+        task_t *child = task_fork(get_current(), frame[FRAME_LR], frame);
         ret = child ? (int)child->pid : -ENOMEM;
         break;
     }
@@ -722,11 +783,9 @@ void svc_dispatch(u32 svc_num, u32 *frame)
         cur->entry      = (void (*)(void))(uintptr_t)entry;
 
         /*
-         * 复用 fork 的返回跳板: POP 恢复 r4/r5/lr 之后,
-         * r4 = 新用户栈顶, r5 = 新入口, lr = 跳板。
+         * 复用 fork 的返回跳板。跳板从 TCB 读 user_sp / entry,
+         * 不再依赖 r4/r5 (v0.7 阶段8 起 r4-r11 必须原样保留)。
          */
-        frame[FRAME_R4] = USER_STACK_TOP;
-        frame[FRAME_R5] = entry;
         frame[FRAME_LR] = (u32)(uintptr_t)fork_return_trampoline;
 
         /*
@@ -760,9 +819,17 @@ void svc_dispatch(u32 svc_num, u32 *frame)
                 cur->sig_mask[si]    = 0;
                 cur->sig_count[si]   = 0;
                 cur->sig_value[si]   = 0;
+                cur->sig_sender[si]  = 0;
+                cur->sig_code[si]    = SI_USER;
             }
             for (si = 0; si < MOS_RT_SIGS; si++) {
+                u32 k;
+
                 cur->sig_rt_head[si] = 0;
+                for (k = 0; k < MOS_SIG_MAXPENDING; k++) {
+                    cur->sig_rt_sender[si][k] = 0;
+                    cur->sig_rt_code[si][k]   = SI_USER;
+                }
             }
             cur->sig_pending = 0;
             cur->sig_ignore  = 0;
@@ -845,8 +912,6 @@ void svc_dispatch(u32 svc_num, u32 *frame)
         cur->swap_in    = 0;
 
         /* 和 SYS_EXEC 一样, 复用 fork 跳板回到用户态的新入口 */
-        frame[FRAME_R4] = USER_STACK_TOP;
-        frame[FRAME_R5] = entry;
         frame[FRAME_LR] = (u32)(uintptr_t)fork_return_trampoline;
         {
             /*
@@ -871,9 +936,17 @@ void svc_dispatch(u32 svc_num, u32 *frame)
                 cur->sig_mask[si]    = 0;
                 cur->sig_count[si]   = 0;
                 cur->sig_value[si]   = 0;
+                cur->sig_sender[si]  = 0;
+                cur->sig_code[si]    = SI_USER;
             }
             for (si = 0; si < MOS_RT_SIGS; si++) {
+                u32 k;
+
                 cur->sig_rt_head[si] = 0;
+                for (k = 0; k < MOS_SIG_MAXPENDING; k++) {
+                    cur->sig_rt_sender[si][k] = 0;
+                    cur->sig_rt_code[si][k]   = SI_USER;
+                }
             }
             cur->sig_pending = 0;
             cur->sig_ignore  = 0;
@@ -901,11 +974,12 @@ void svc_dispatch(u32 svc_num, u32 *frame)
     }
 
     case SYS_KILL:
-        ret = sys_kill(frame[FRAME_R0], frame[FRAME_R1]);
+        ret = sys_kill(get_current(), frame[FRAME_R0], frame[FRAME_R1]);
         break;
 
     case SYS_SIGQUEUE:
-        ret = sys_sigqueue(frame[FRAME_R0], frame[FRAME_R1], frame[FRAME_R2]);
+        ret = sys_sigqueue(get_current(), frame[FRAME_R0], frame[FRAME_R1],
+                           frame[FRAME_R2]);
         break;
 
     case SYS_SIGRETURN:
@@ -984,4 +1058,5 @@ void syscall_init(void)
     user_sem_used[1] = 1;
     user_sem_used[2] = 1;
     user_sem_used[3] = 1;       /* v0.6 阶段8: u_fork 父子同步 */
+    user_sem_used[4] = 1;       /* v0.7 阶段8: u_signal 验证 SA_RESETHAND */
 }

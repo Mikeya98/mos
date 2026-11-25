@@ -175,6 +175,18 @@ typedef struct task_struct {
     u32             sig_rt_queue[MOS_RT_SIGS][MOS_SIG_MAXPENDING];
     u8              sig_rt_head[MOS_RT_SIGS];
 
+    /*
+     * v0.7 阶段8: 发送方信息。
+     *
+     * 普通信号只有一份, 发送方存在 sig_sender/sig_code 里; 实时信号
+     * 每一份都要单独记, 所以和值队列平行地开两条数组。sigqueue 与
+     * kill 的区别就落在 si_code 上 (SI_QUEUE / SI_USER)。
+     */
+    u32             sig_sender[MOS_NSIG];
+    u8              sig_code[MOS_NSIG];
+    u32             sig_rt_sender[MOS_RT_SIGS][MOS_SIG_MAXPENDING];
+    u8              sig_rt_code[MOS_RT_SIGS][MOS_SIG_MAXPENDING];
+
     /* --- 程序映像 / 代码页按需装载 (v0.6 阶段12) ---
      * prog_valid=1 表示 0x09000000 窗口由一个 ELF 文件映射, 段表在
      * prog 里。缺页时按页读文件, 页表见 l2_code_phys。
@@ -255,7 +267,7 @@ task_t *task_create_user(void (*entry)(void), const char *name,
  * @param  user_pc  父进程 SVC 之后要返回的用户 PC (即 frame[13])
  * @return 子任务, 失败返回 NULL
  */
-task_t *task_fork(task_t *parent, u32 user_pc);
+task_t *task_fork(task_t *parent, u32 user_pc, const u32 *parent_frame);
 
 /** 把当前任务的 SP_usr 保存进 TCB (进入内核时调用) */
 void task_save_user_sp(void);
@@ -362,6 +374,18 @@ s32 task_signal_send(s32 pid, u32 sig);
 
 /** 发一个带值的信号 (v0.7 阶段5); task_signal_send 等于 value=0 */
 s32 task_signal_queue(s32 pid, u32 sig, u32 value);
+
+/**
+ * @brief  发送信号并记录发送方 (v0.7 阶段8)
+ *
+ * @param  sender  发送者 pid, 写进 si_pid
+ * @param  code    SI_USER (kill) 或 SI_QUEUE (sigqueue)
+ * @return 0 成功, -ESRCH 目标不存在, -EAGAIN 实时队列已满
+ *
+ * task_signal_send / task_signal_queue 是它的两个薄封装, 默认把当前
+ * 任务当作发送者。队列满时旧实现静默丢弃, 现在把 -EAGAIN 返回给用户。
+ */
+s32 task_signal_send_info(s32 pid, u32 sig, u32 value, u32 sender, u32 code);
 
 /* === 睡眠中断处理 (由 timer_isr 触发) === */
 

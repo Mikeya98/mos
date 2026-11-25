@@ -802,6 +802,32 @@ static const char msg_sa6[] USER_RODATA =
 static const char msg_sabad[] USER_RODATA =
     "[user] u_signal: SA_NODEFER / sa_mask test FAILED\n";
 
+/* v0.7 阶段8: siginfo / 队列满 / SA_RESETHAND */
+static const char msg_in1[] USER_RODATA =
+    "[user] u_signal: install SIGUSR1 with SA_SIGINFO, fork a sender\n";
+static const char msg_in2[] USER_RODATA =
+    "[user] u_signal: kill: si_pid = child, si_code = SI_USER, value 0 — OK\n";
+static const char msg_in3[] USER_RODATA =
+    "[user] u_signal: sigqueue self, expect SI_QUEUE and value 0x77\n";
+static const char msg_in4[] USER_RODATA =
+    "[user] u_signal: sigqueue: si_pid = self, si_code = SI_QUEUE — OK\n";
+static const char msg_in5[] USER_RODATA =
+    "[user] u_signal: unknown sa_flags rejected with -EINVAL\n";
+static const char msg_inbad[] USER_RODATA =
+    "[user] u_signal: siginfo test FAILED\n";
+static const char msg_qf1[] USER_RODATA =
+    "[user] u_signal: fill the RT queue (8 slots), the 9th must fail\n";
+static const char msg_qf2[] USER_RODATA =
+    "[user] u_signal: 9th sigqueue returned -EAGAIN, 8 delivered — OK\n";
+static const char msg_qfbad[] USER_RODATA =
+    "[user] u_signal: RT queue-full test FAILED\n";
+static const char msg_rs1[] USER_RODATA =
+    "[user] u_signal: SA_RESETHAND: first copy handled, second kills the child\n";
+static const char msg_rs2[] USER_RODATA =
+    "[user] u_signal: child died with -SIGRTMIN after one handler run — OK\n";
+static const char msg_rsbad[] USER_RODATA =
+    "[user] u_signal: SA_RESETHAND test FAILED\n";
+
 /*
  * 信号处理函数返回后要执行的一小段代码。
  * 内核在进入 handler 之前把用户态 LR 改成这个地址, 所以 handler
@@ -938,6 +964,37 @@ static void USER_TEXT sig_handler_mask(int sig, u32 val)
     }
 }
 
+/*
+ * 阶段8: SA_SIGINFO 的 handler。
+ *   p[0] = 次数
+ *   p[1] = 信号号
+ *   p[2] = si_pid
+ *   p[3] = si_code
+ *   p[4] = si_value
+ */
+static void USER_TEXT sig_handler_info(int sig, mos_siginfo_t *info)
+{
+    volatile u32 *p = (volatile u32 *)(uintptr_t)USER_DATA_VADDR;
+
+    p[0] = p[0] + 1u;
+    p[1] = (u32)sig;
+    if (info != 0) {
+        p[2] = (u32)info->si_pid;
+        p[3] = (u32)info->si_code;
+        p[4] = info->si_value;
+    } else {
+        p[2] = 0xFFFFFFFFu;
+    }
+}
+
+/* 阶段8: SA_RESETHAND 测试用。handler 跑一次就给父进程的信号量加一 */
+static void USER_TEXT sig_handler_reset(int sig, mos_siginfo_t *info)
+{
+    (void)sig;
+    (void)info;
+    usys_sem_post(4);
+}
+
 /**
  * 信号演示。
  *
@@ -954,6 +1011,7 @@ static void USER_TEXT u_signal(void)
     s32 code;
     s32 r;
     u32 i;
+    u32 ok;
 
     *seen = 0;
 
@@ -1304,10 +1362,131 @@ static void USER_TEXT u_signal(void)
         SAY(msg_sabad);
     }
 
+    /* ================= v0.7 阶段8: siginfo / 队列满 / SA_RESETHAND ================= */
+
+    /*
+     * SA_SIGINFO: 子进程用 kill 发 SIGUSR1, handler 检查 si_pid 是不是
+     * 子进程、si_code 是不是 SI_USER、value 是不是 0。
+     */
+    SAY(msg_in1);
+    usys_sigaction_ex(SIGUSR1, (void (*)(int))sig_handler_info, sig_tramp,
+                      SA_SIGINFO, 0);
+    seen[0] = 0;
+    seen[1] = 0;
+    seen[2] = 0;
+    seen[3] = 0xFFFFFFFFu;
+    seen[4] = 0xFFFFFFFFu;
+
+    child = usys_fork();
+    if (child == 0) {
+        for (i = 0; i < 300; i++) {
+            usys_yield();
+        }
+        usys_kill(usys_getppid(), SIGUSR1);
+        usys_exit(0);
+    }
+    if (child < 0) {
+        SAY(msg_sg7);
+        usys_exit(0);
+    }
+
+    for (i = 0; i < 5000 && seen[0] == 0; i++) {
+        usys_yield();
+    }
+    if (seen[0] == 1u && seen[1] == SIGUSR1 && seen[2] == (u32)child &&
+        seen[3] == SI_USER && seen[4] == 0u) {
+        SAY(msg_in2);
+    } else {
+        SAY(msg_inbad);
+    }
+    code = -1;
+    usys_wait(child, &code);
+
+    /* sigqueue 自己: si_pid 是自己, si_code 是 SI_QUEUE, 值 0x77 */
+    SAY(msg_in3);
+    seen[0] = 0;
+    seen[3] = 0xFFFFFFFFu;
+    seen[4] = 0xFFFFFFFFu;
+    usys_sigprocmask(SIG_SETMASK, 1u << SIGUSR1, 0);
+    usys_sigqueue(0, SIGUSR1, 0x77u);
+    usys_sigprocmask(SIG_SETMASK, 0, 0);
+    for (i = 0; i < 200; i++) {
+        usys_yield();
+    }
+    if (seen[0] == 1u && seen[2] == (u32)usys_getpid() &&
+        seen[3] == SI_QUEUE && seen[4] == 0x77u) {
+        SAY(msg_in4);
+    } else {
+        SAY(msg_inbad);
+    }
+
+    /* 未定义的 flags 位必须被拒绝, 不能静默忽略 */
+    if (usys_sigaction_ex(SIGUSR2, (void (*)(int))sig_handler_info,
+                          sig_tramp, 8u, 0) == -EINVAL) {
+        SAY(msg_in5);
+    } else {
+        SAY(msg_inbad);
+    }
+
+    /*
+     * 实时队列满: 8 个槽位全部占满之后, 第 9 次 sigqueue 返回 -EAGAIN。
+     * 解除屏蔽后 8 份都要投递, 说明前 8 次没有丢。
+     */
+    SAY(msg_qf1);
+    usys_sigaction(SIGRTMAX, (void (*)(int))sig_handler_val, sig_tramp);
+    seen[0] = 0;
+    usys_sigprocmask(SIG_SETMASK, 1u << SIGRTMAX, 0);
+    ok = 1;
+    for (i = 0; i < MOS_SIG_MAXPENDING; i++) {
+        if (usys_sigqueue(0, SIGRTMAX, i + 1u) < 0) {
+            ok = 0;
+        }
+    }
+    r = usys_sigqueue(0, SIGRTMAX, 9u);
+    usys_sigprocmask(SIG_SETMASK, 0, 0);
+    for (i = 0; i < 300; i++) {
+        usys_yield();
+    }
+    if (ok && r == -EAGAIN && seen[0] == (u32)MOS_SIG_MAXPENDING) {
+        SAY(msg_qf2);
+    } else {
+        SAY(msg_qfbad);
+    }
+
+    /*
+     * SA_RESETHAND: 子进程装 SA_RESETHAND 后排队两份 SIGRTMIN。
+     * 第一份进 handler, 处置方式随即复位; handler 返回、屏蔽字恢复后
+     * 第二份按默认动作把子进程杀掉, 父进程 wait 拿到 -SIGRTMIN。
+     * 信号量 4 的计数用来证明 handler 确实跑过一次。
+     */
+    SAY(msg_rs1);
+    child = usys_fork();
+    if (child == 0) {
+        usys_sigaction_ex(SIGRTMIN, (void (*)(int))sig_handler_reset, sig_tramp,
+                          SA_RESETHAND | SA_SIGINFO, 0);
+        usys_sigprocmask(SIG_SETMASK, 1u << SIGRTMIN, 0);
+        usys_sigqueue(0, SIGRTMIN, 1u);
+        usys_sigqueue(0, SIGRTMIN, 2u);
+        usys_sigprocmask(SIG_SETMASK, 0, 0);
+        usys_exit(7);               /* 第二份没杀掉的话会走到这里 */
+    }
+    if (child < 0) {
+        SAY(msg_rsbad);
+    } else {
+        code = 0;
+        r = usys_wait(child, &code);
+        if (r == child && code == -SIGRTMIN && usys_sem_wait(4) == 0) {
+            SAY(msg_rs2);
+        } else {
+            SAY(msg_rsbad);
+        }
+    }
+
     /* 恢复默认动作, 免得影响后面的 demo */
     usys_sigaction(SIGUSR1, 0, 0);
     usys_sigaction(SIGUSR2, 0, 0);
     usys_sigaction(SIGRTMIN, 0, 0);
+    usys_sigaction(SIGRTMAX, 0, 0);
     usys_sigprocmask(SIG_SETMASK, 0, 0);
 
     usys_exit(0);
@@ -1455,7 +1634,7 @@ void user_demo_init(void)
 {
     printf("========================================\n");
     printf("  User Mode Demo (v0.7: fork/COW + exec + wait + lazy ELF + page cache\n");
-    printf("                  + signals + sigprocmask/EINTR)\n");
+    printf("                  + signals/siginfo + sigprocmask/EINTR)\n");
     printf("  user code : %X - %X (shared, read-only)\n",
            (u32)(uintptr_t)&_user_text_start,
            (u32)(uintptr_t)&_user_text_end);

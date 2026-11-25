@@ -39,6 +39,8 @@ MOS 是我从零手写的一个实时操作系统内核，跑在 ARM Cortex-A9 �
 - **信号屏蔽与可中断等待（v0.7 阶段3）**：`SYS_SIGPROCMASK`（BLOCK/UNBLOCK/SETMASK）维护每任务屏蔽字，被屏蔽的信号只挂在 pending 里，解除屏蔽后在下一次返回用户态时投递。信号可以打断阻塞中的 `sem_wait`、`wait` 和 `sleep`：目标任务在信号量等待队列上时由 TCB 里的 `block_remove` 回调摘链并退还计数，阻塞的系统调用返回 `-EINTR`。阻塞前也会检查一次 pending，避免"信号先到、任务随后睡死"的窗口
 - **信号值 sigqueue（v0.7 阶段5）**：`SYS_SIGQUEUE(pid, sig, value)` 让信号带一个 32 位值，handler 从 r1 拿到（r0 仍是信号号）。普通信号不排队，已 pending 时后到的值丢弃、只保留第一份；实时信号每个值进独立的环形队列，按 FIFO 依次投递。内核在 handler 执行期间自动屏蔽当前信号（POSIX 默认语义），旧屏蔽字存进信号帧第 17 个字、`SIGRETURN` 时恢复，这样同一个实时信号不会嵌套进自己的 handler。`u_signal` 验证了三件事：普通信号合并保留第一个值、RT 三个值按 C1/C2/C3 顺序到达、跨任务把 0x42 发给孩子进程并由退出码带回
 - **sa_mask 与 SA_NODEFER（v0.7 阶段6）**：`SYS_SIGACTION_EX(sig, handler, tramp, flags, mask)` 在安装 handler 时指定附加屏蔽字；handler 期间的屏蔽字 = 旧屏蔽字 + `sa_mask` + 当前信号，当前信号那一位可以用 `SA_NODEFER` 关掉，从而允许同一个信号嵌套进自己的 handler。`u_signal` 用深度计数验证了默认不嵌套、NODEFER 下深度到 2；另用 `sa_mask` 让 SIGUSR2 等 SIGUSR1 的 handler 返回再投递。顺带修了两个现场问题：嵌套投递时 r1 参数会覆盖外层 handler 的现场（改成先保存 r0-r12、再写 handler 参数）；用户态 SVC 封装没声明 `lr` 被破坏，编译器把局部变量放在 LR 里，跨信号投递会被 tramp 覆盖
+- **siginfo_t、SA_SIGINFO / SA_RESETHAND、队列满通知（v0.7 阶段8）**：信号帧从 20 字扩到 24 字，后面接一个 `mos_siginfo_t`（signo/code/pid/value）。装 `SA_SIGINFO` 时 handler 原型是 `handler(sig, siginfo, ucontext)`，第二个参数指向栈上的发送方信息，`si_code` 区分 `SI_USER`（kill）和 `SI_QUEUE`（sigqueue）；第三个参数暂时没有实现，置 0。`SA_RESETHAND` 在 handler 进入时把处置方式复位成默认动作，同一个实时信号剩下的排队副本从第二份开始按默认动作终止。实时队列满时 `sigqueue` 返回 `-EAGAIN`，不再静默丢信号；未定义的 flags 位仍然报 `EINVAL`
+- **fork 的 callee-saved 寄存器修复（v0.7 阶段8）**：查 `SA_RESETHAND` 测试时发现子进程把 `sig_tramp` 的地址读成了 fork 的返回地址。根因是 fork 跳板把 r4/r5 当作用户栈顶和返回 PC 的载体，r6-r11 清零，而 r4-r11 是 AAPCS 的 callee-saved 寄存器，父进程的函数可能正把活值放在里面。现在子进程的 r4-r11 从父进程进 SVC 时的现场原样复制，用户栈顶和 PC 改存 TCB、由 `fork_child_setup()` 写回，跳板只动 caller-saved 寄存器。exec 两条路径同步改成从 TCB 取入口
 - **信号返回模式修复（v0.7 阶段7）**：根因是 SPSR 是 CPU 全局寄存器，不跟任务走。IRQ 在内核态打断时 `spsr_irq` 是 SVC，原来照样投递信号，handler 就会在 SVC 模式执行，`bx lr` 跳回内核、`SIGRETURN` 永不执行，用户 SP 停在信号帧上（表现为跨任务 sigqueue 后 `wait(&code)` 偶尔读回 -1，以及三层嵌套跑飞）。现在 IRQ/SVC 两条返回路径都只在 SPSR 模式位是 USR 时投递；exec 临时改 SPSR_svc 前后关中断，避免被 tick 切走后污染别的任务。`SA_NODEFER` 测试改成 handler 内自排队，稳定跑到三层嵌套；QEMU 连续 10 次 0 失败
 - **信号（v0.7 阶段2）**：`SYS_SIGACTION / KILL / SIGRETURN / GETPPID`。handler 地址存在 TCB 里，kill 只置 pending 位；任务下一次从内核返回用户态时，内核把 r0-r12/PC/SP/LR 压成信号帧放到用户栈上，把用户态 LR 改成用户传入的 tramp，再跳进 handler。handler 返回时 tramp 发 `SIGRETURN`，内核从信号帧恢复现场继续跑。没装 handler 的信号按默认动作终止进程；fork 继承处理函数但清空 pending，exec 全部复位；`u_signal` 演示了 handler 投递、sigreturn 恢复和默认终止（退出码 -12）三种路径
 - **系统调用**：SVC 栈帧传参，`SYS_YIELD / EXIT / WRITE / SLEEP / GETPID / SEM_WAIT / SEM_POST / GET_TTBR0 / VM_STATS / FORK / EXEC / WAIT / EXEC_ELF / SIGACTION / KILL / SIGRETURN / GETPPID / SIGPROCMASK / SIGQUEUE`；`copy_from_user` / `copy_to_user` 先代用户补页，再走当前任务的页表检查用户指针（区分读/写权限）
@@ -232,6 +234,7 @@ Starting scheduler...
 | v0.7 阶段5 | 信号值 sigqueue、RT FIFO 值队列、handler 自动屏蔽当前信号 | ✅ |
 | v0.7 阶段6 | sa_mask、SA_NODEFER、嵌套投递现场保护 | ✅ |
 | v0.7 阶段7 | 信号返回模式修复：IRQ/SVC 投递条件、SPSR 临界区、三层嵌套 | ✅ |
+| v0.7 阶段8 | siginfo_t、SA_SIGINFO、SA_RESETHAND、RT 队列满 EAGAIN、fork 寄存器现场修复 | ✅ |
 | v0.6 | MMU + 用户态 + 权限隔离 + 每任务独立页表 + ASID + 资源回收 + 按需分页 + 页面换出 + fork/COW + exec + ELF 装载 + 僵尸回收（阶段1 开 MMU、2 模式切换、3 隔离/异常恢复、4 TTBR0 切换、5 ASID/reclaim、6 缺页处理、7 swap、8 fork/写时复制、9 exec/重置、10 僵尸/wait、11 真实 ELF、12 代码页按需装载） | ✅ |
 | 下一步 | 多核调度、进程间共享内存、块设备/持久化 | 🔜 |
 
