@@ -156,6 +156,15 @@ typedef struct task_struct {
     u32             sig_ignore;
     u32             sig_blocked;
     u8              sig_interrupted;
+    /*
+     * v0.7 阶段9: sigsuspend 挂起标志。
+     *
+     * sigsuspend 换完屏蔽字之后把任务挂起, 和普通阻塞的区别是:
+     * 它没有等待队列 (block_remove 为 NULL), 唤醒条件只有"有未被
+     * 屏蔽的信号到达"。sig_suspended 让 task_signal_send_info 认出
+     * 这种情况, 否则任务会永远睡下去。
+     */
+    u8              sig_suspended;
     void          (*block_remove)(void *obj, struct task_struct *t);
 
     /*

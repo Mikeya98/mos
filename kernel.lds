@@ -123,13 +123,13 @@ SECTIONS
      * 链接器会按输入段的对齐 (4 字节) 放, 结果页表没对齐, TTBR0 一换就飞。 */
     .l1_pool (NOLOAD) : ALIGN(16384) {
         _l1_pool_start = .;
-        . += 0x38000;           /* 14 × 16KB L1 页表 */
+        . += 0x40000;           /* 16 × 16KB L1 页表 */
         _l1_pool_end = .;
     } > DDR
 
     .l2_pool (NOLOAD) : ALIGN(1024) {
         _l2_pool_start = .;
-        . += 0x3800;            /* 14 × 1KB L2 页表 */
+        . += 0x4000;            /* 16 × 1KB L2 页表 */
         _l2_pool_end = .;
     } > DDR
 
@@ -140,7 +140,7 @@ SECTIONS
      */
     .l2_code_pool (NOLOAD) : ALIGN(1024) {
         _l2_code_pool_start = .;
-        . += 0x3800;            /* 14 × 1KB */
+        . += 0x4000;            /* 16 × 1KB */
         _l2_code_pool_end = .;
     } > DDR
 

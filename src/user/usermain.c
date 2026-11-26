@@ -1492,6 +1492,205 @@ static void USER_TEXT u_signal(void)
     usys_exit(0);
 }
 
+/* =========================== SIGCHLD / sigsuspend 演示 (v0.7 阶段9) =========================== */
+
+static const char msg_cd1[] USER_RODATA =
+    "[user] u_chld  : install SIGCHLD handler, fork a child that exits 7\n";
+static const char msg_cd2[] USER_RODATA =
+    "[user] u_chld  : wait reaped the child, SIGCHLD carried pid/code/value — OK\n";
+static const char msg_cd3[] USER_RODATA =
+    "[user] u_chld  : SIGCHLD did not interrupt wait — FAILED\n";
+static const char msg_cd4[] USER_RODATA =
+    "[user] u_chld  : block SIGCHLD, fork a child, then sigsuspend for it\n";
+static const char msg_cd5[] USER_RODATA =
+    "[user] u_chld  : sigsuspend returned -EINTR and the old mask came back — OK\n";
+static const char msg_cd6[] USER_RODATA =
+    "[user] u_chld  : sigsuspend test FAILED\n";
+static const char msg_cd7[] USER_RODATA =
+    "[user] u_chld  : restore default action, let a child exit, keep sleeping\n";
+static const char msg_cd8[] USER_RODATA =
+    "[user] u_chld  : still alive — SIGCHLD default action is ignore — OK\n";
+static const char msg_cd10[] USER_RODATA =
+    "[user] u_chld  : block SIGUSR1, kill self, read sigpending\n";
+static const char msg_cd11[] USER_RODATA =
+    "[user] u_chld  : sigpending reported the blocked signal — OK\n";
+static const char msg_cd12[] USER_RODATA =
+    "[user] u_chld  : sigpending test FAILED\n";
+static const char msg_cd13[] USER_RODATA =
+    "[user] u_chld  : fork FAILED\n";
+
+static void USER_TEXT sig_handler_chld(int sig, mos_siginfo_t *info)
+{
+    volatile u32 *p = (volatile u32 *)(uintptr_t)USER_DATA_VADDR;
+
+    p[0] = p[0] + 1u;
+    p[1] = (u32)sig;
+    if (info != 0) {
+        p[2] = (u32)info->si_pid;
+        p[3] = (u32)info->si_code;
+        p[4] = info->si_value;
+    } else {
+        p[2] = 0xFFFFFFFFu;
+    }
+}
+
+static void USER_TEXT sig_handler_count(int sig, u32 val)
+{
+    volatile u32 *p = (volatile u32 *)(uintptr_t)USER_DATA_VADDR;
+
+    (void)sig;
+    (void)val;
+    p[7] = p[7] + 1u;
+}
+
+/**
+ * SIGCHLD / sigsuspend / sigpending 演示 (v0.7 阶段9)。
+ *
+ * 数据页布局:
+ *   p[0]  SIGCHLD handler 次数
+ *   p[1]  si_signo
+ *   p[2]  si_pid
+ *   p[3]  si_code
+ *   p[4]  si_value (子进程退出码)
+ *   p[6]  sigpending 读回的位图
+ *   p[7]  SIGUSR1 handler 次数
+ */
+static void USER_TEXT u_chld(void)
+{
+    volatile u32 *p = (volatile u32 *)(uintptr_t)USER_DATA_VADDR;
+    s32 child;
+    s32 code;
+    s32 r;
+    u32 i;
+    u32 pend = 0;
+
+    for (i = 0; i < 8; i++) {
+        p[i] = 0;
+    }
+
+    /* ---------- 1. 子进程退出 → SIGCHLD, wait 照常拿到退出码 ---------- */
+    SAY(msg_cd1);
+    if (usys_sigaction_ex(SIGCHLD, (void (*)(int))sig_handler_chld, sig_tramp,
+                          SA_SIGINFO, 0) < 0) {
+        SAY(msg_cd6);
+        usys_exit(0);
+    }
+
+    child = usys_fork();
+    if (child == 0) {
+        usys_exit(7);
+    }
+    if (child < 0) {
+        SAY(msg_cd13);
+        usys_exit(0);
+    }
+
+    code = -1;
+    r = usys_wait(child, &code);
+
+    /*
+     * wait 在阻塞期间被子进程退出唤醒。如果内核把这次唤醒当成
+     * "被信号打断", r 会是 -EINTR 而不是子进程 pid —— 这是阶段9
+     * 要修的语义。返回用户态时 SIGCHLD handler 已经跑过。
+     */
+    if (r == child && code == 7 &&
+        p[0] == 1u && p[1] == SIGCHLD &&
+        p[2] == (u32)child && p[3] == SI_CHLD && p[4] == 7u) {
+        SAY(msg_cd2);
+    } else {
+        SAY(msg_cd3);
+        say_hex(msg_empty, (u32)r, msg_nl);
+        say_hex(msg_empty, (u32)code, msg_nl);
+    }
+
+    /* ---------- 2. sigsuspend 等子进程 ---------- */
+    SAY(msg_cd4);
+    p[0] = 0;
+    p[4] = 0;
+
+    /*
+     * 先把 SIGCHLD 屏蔽住, 再用 sigsuspend 临时换成"只放行 SIGCHLD"
+     * 的屏蔽字挂起 —— 这是 sigsuspend 的标准用法: 检查 pending 和
+     * 挂起之间没有窗口。子进程退出把父进程唤醒之后, 内核恢复原来的
+     * 屏蔽字 (SIGCHLD 仍被屏蔽), 所以下面还要手动解除一次。
+     */
+    usys_sigprocmask(SIG_BLOCK, 1u << SIGCHLD, 0);
+
+    child = usys_fork();
+    if (child == 0) {
+        usys_exit(5);
+    }
+    if (child < 0) {
+        SAY(msg_cd13);
+        usys_exit(0);
+    }
+
+    r = usys_sigsuspend(0xFFFFFFFFu & ~(1u << SIGCHLD));
+
+    usys_sigprocmask(SIG_UNBLOCK, 1u << SIGCHLD, 0);
+    for (i = 0; i < 100; i++) {
+        usys_yield();
+    }
+
+    code = -1;
+    if (usys_wait(child, &code) == child && code == 5 &&
+        r == -EINTR && p[0] == 1u && p[4] == 5u) {
+        SAY(msg_cd5);
+    } else {
+        SAY(msg_cd6);
+        say_hex(msg_empty, (u32)r, msg_nl);
+        say_hex(msg_empty, (u32)code, msg_nl);
+        say_hex(msg_empty, p[0], msg_nl);
+    }
+
+    /* ---------- 3. 默认动作: 忽略 ---------- */
+    SAY(msg_cd7);
+    usys_sigaction(SIGCHLD, 0, 0);
+
+    child = usys_fork();
+    if (child == 0) {
+        usys_exit(0);
+    }
+    if (child < 0) {
+        SAY(msg_cd13);
+        usys_exit(0);
+    }
+
+    usys_wait(child, &code);
+    usys_sleep(20);             /* 给 SIGCHLD 投递留出一次 tick */
+
+    /*
+     * 走到这里说明 SIGCHLD 的默认动作没有终止进程。
+     * 如果内核把它当成"没装 handler 就杀", 本任务根本回不来。
+     */
+    SAY(msg_cd8);
+
+    /* ---------- 4. sigpending 查询 ---------- */
+    SAY(msg_cd10);
+    usys_sigaction_ex(SIGUSR1, (void (*)(int))sig_handler_count, sig_tramp,
+                      SA_SIGINFO, 0);
+    usys_sigprocmask(SIG_BLOCK, 1u << SIGUSR1, 0);
+    usys_kill(0, SIGUSR1);
+    p[6] = 0;
+    if (usys_sigpending(&pend) == 0 && (pend & (1u << SIGUSR1)) != 0) {
+        SAY(msg_cd11);
+    } else {
+        SAY(msg_cd12);
+        say_hex(msg_empty, pend, msg_nl);
+    }
+
+    usys_sigprocmask(SIG_SETMASK, 0, 0);
+    for (i = 0; i < 100; i++) {
+        usys_yield();
+    }
+    if (p[7] != 1u) {
+        SAY(msg_cd12);
+    }
+
+    usys_sigaction(SIGUSR1, 0, 0);
+    usys_exit(0);
+}
+
 /* =========================== 内核侧初始化 =========================== */
 
 extern u8 _user_text_start;
@@ -1670,11 +1869,16 @@ void user_demo_init(void)
      */
     if (!create_user("u_wait",    u_wait,    2)) return;
     if (!create_user("u_signal",  u_signal,  2)) return;
+    /*
+     * u_chld 用优先级 3: 它要 fork 子进程, 等前面两批 (优先级 1/2)
+     * 的 demo 退出、地址空间槽位空出来之后再跑。
+     */
+    if (!create_user("u_chld",    u_chld,    3)) return;
     if (!create_user("u_demand",  u_demand,  1)) return;
     if (!create_user("u_overflow", u_overflow, 1)) return;
     if (!create_user("u_swap",    u_swap,    1)) return;
 
-    printf("\n[DEMO] 14 user tasks created, each with its own L1 page table\n");
+    printf("\n[DEMO] 15 user tasks created, each with its own L1 page table\n");
 
     /*
      * 回收演示的驱动任务: 内核态, 优先级 30 (只比 IDLE 高)。

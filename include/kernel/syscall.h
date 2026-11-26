@@ -41,12 +41,15 @@
 #define SYS_SIGPROCMASK 17      /* sigprocmask(how, set, oldset) (v0.7 阶段3) */
 #define SYS_SIGQUEUE    18      /* sigqueue(pid, sig, value) (v0.7 阶段5) */
 #define SYS_SIGACTION_EX 19     /* sigaction_ex(sig, handler, tramp, flags, mask) (v0.7 阶段6) */
-#define SYS_MAX         20
+#define SYS_SIGSUSPEND  20      /* sigsuspend(set) 原子换屏蔽字并等信号 (v0.7 阶段9) */
+#define SYS_SIGPENDING  21      /* sigpending(&set) 取待处理信号位图 (v0.7 阶段9) */
+#define SYS_MAX         22
 
 /* =========================== 信号 =========================== */
 #define MOS_NSIG        32
 #define SIGUSR1         10
 #define SIGUSR2         12
+#define SIGCHLD         17      /* 子进程退出时由内核发给父进程 (v0.7 阶段9) */
 
 /*
  * v0.7 阶段4: 实时信号 + SIG_IGN
@@ -101,6 +104,7 @@
  */
 #define SI_USER         0
 #define SI_QUEUE        1
+#define SI_CHLD         2       /* 子进程退出 (v0.7 阶段9) */
 
 typedef struct {
     u32 si_signo;

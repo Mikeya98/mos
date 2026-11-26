@@ -326,4 +326,32 @@ USYS_INLINE s32 usys_sigaction_ex(u32 sig, void (*handler)(int),
     return (s32)r0;
 }
 
+/**
+ * 原子地换屏蔽字并挂起, 直到有可投递信号 (v0.7 阶段9)。
+ *
+ * set 是挂起期间使用的屏蔽字 (位图, 信号 0 保留)。换屏蔽字和
+ * 挂起在同一个临界区里完成, 所以不会漏掉两步之间到达的信号。
+ * 返回时恢复调用前的屏蔽字, 返回值为 -EINTR; 信号 handler 在
+ * 返回用户态之后、本调用之后执行。
+ */
+USYS_INLINE s32 usys_sigsuspend(u32 set)
+{
+    register u32 r0 __asm__("r0") = set;
+    __asm__ volatile ("SVC #20" : "+r"(r0) : : "memory", "lr");
+    return (s32)r0;
+}
+
+/**
+ * 取当前待处理信号位图 (v0.7 阶段9)。
+ *
+ * 被屏蔽但已到达的也算; 被 SIG_IGN 丢掉的不算。
+ * 返回 0 或 -EFAULT。
+ */
+USYS_INLINE s32 usys_sigpending(u32 *set)
+{
+    register u32 r0 __asm__("r0") = (u32)(uintptr_t)set;
+    __asm__ volatile ("SVC #21" : "+r"(r0) : : "memory", "lr");
+    return (s32)r0;
+}
+
 #endif /* _MOS_USER_SYSCALL_H */

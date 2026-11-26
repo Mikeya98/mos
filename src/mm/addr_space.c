@@ -2,9 +2,10 @@
  * @file    addr_space.c
  * @brief   用户地址空间的物理资源分配 (v0.6 阶段4/5/6)
  *
- * 两个静态池 (kernel.lds):
- *   _l1_pool     8 × 16KB   L1 页表
- *   _l2_pool     8 × 1KB    L2 页表
+ * 静态池 (kernel.lds):
+ *   _l1_pool      16 × 16KB  L1 页表
+ *   _l2_pool      16 × 1KB   L2 页表
+ *   _l2_code_pool 16 × 1KB   程序区 L2 页表
  *
  * 两份池子用同一个槽位号索引, 分配时找一个空闲槽位, 释放时把
  * 槽位还回去。槽位号同时用来生成 ASID (slot + 1), ASID 0 留给内核。

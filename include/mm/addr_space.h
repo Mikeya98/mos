@@ -28,7 +28,7 @@
 /* 静态池的槽位数量, 与 kernel.lds 里的池大小一致
  * 阶段7 增加了 u_swap 演示任务, 从 8 扩到 12; 阶段11 又加了 u_elf, 扩到 13;
  * v0.7 阶段2 加了 u_signal, 扩到 14。 */
-#define USER_SPACE_SLOTS    14
+#define USER_SPACE_SLOTS    16
 
 /* 一个用户地址空间的物理资源 */
 typedef struct {

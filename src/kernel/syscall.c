@@ -386,6 +386,90 @@ static int sys_sigprocmask(task_t *cur, u32 how, u32 set, u32 oldp)
 }
 
 /**
+ * @brief SIGSUSPEND: 原子地替换屏蔽字并挂起, 直到有可投递信号 (v0.7 阶段9)
+ *
+ * 它解决的是"检查 pending"和"睡眠"之间的窗口: 先用 sigprocmask 屏蔽、
+ * 看一遍 pending、再 sleep 的话, 两步之间到达的信号会让任务睡死。
+ * 这里换屏蔽字和挂起在同一个临界区里完成。
+ *
+ * 返回时恢复调用前的屏蔽字并返回 -EINTR; 信号本身在返回用户态的
+ * 路上由 user_signal_check 投递, handler 跑完之后用户才看到这个返回值。
+ */
+static int sys_sigsuspend(task_t *cur, u32 set)
+{
+    u32 old;
+    u32 flags;
+
+    if (!cur || !cur->is_user) {
+        return -EPERM;
+    }
+
+    set &= 0xFFFFFFFEu;         /* 信号 0 保留 */
+
+    flags = irq_save();
+
+    old = cur->sig_blocked;
+    cur->sig_blocked = set;
+
+    /*
+     * 换完屏蔽字之后已经有一条能送达的信号: 不睡, 直接恢复。
+     * 返回用户态时投递, 语义和"刚睡下就被唤醒"一样。
+     */
+    if (cur->sig_pending & ~cur->sig_blocked & ~cur->sig_ignore &
+        0xFFFFFFFEu) {
+        cur->sig_blocked = old;
+        irq_restore(flags);
+        return -EINTR;
+    }
+
+    cur->sig_suspended = 1;
+    cur->state         = TASK_BLOCKED;
+    cur->block_obj     = NULL;
+    cur->block_remove  = NULL;
+    ready_dequeue(cur);
+
+    irq_restore(flags);
+
+    schedule();
+
+    /*
+     * task_signal_send_info (或子进程退出的 SIGCHLD 路径) 把任务放回
+     * 就绪队列时已经清掉 sig_suspended。这里恢复旧屏蔽字、清掉
+     * sig_interrupted —— sigsuspend 本来就要被信号唤醒, 不是"打断"。
+     */
+    flags = irq_save();
+    cur->sig_blocked    = old;
+    cur->sig_suspended  = 0;
+    cur->sig_interrupted = 0;
+    irq_restore(flags);
+
+    return -EINTR;
+}
+
+/**
+ * @brief SIGPENDING: 取当前待处理信号位图 (v0.7 阶段9)
+ *
+ * 只返回"已收到但还没投递"的信号, 被屏蔽的也算 (它们正等着解除
+ * 屏蔽), 被 SIG_IGN 丢掉的不算。和 POSIX 的 sigpending 一致。
+ */
+static int sys_sigpending(task_t *cur, u32 up)
+{
+    u32 p;
+
+    if (!cur || !cur->is_user) {
+        return -EPERM;
+    }
+
+    p = cur->sig_pending & ~cur->sig_ignore & 0xFFFFFFFEu;
+
+    if (up != 0 && copy_to_user((void *)(uintptr_t)up, &p,
+                                (u32)sizeof(p)) < 0) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
+/**
  * @brief SIGRETURN: 从信号帧恢复被打断的用户现场
  *
  * 此时用户 SP 指向 handler 进入前内核压好的信号帧 (handler 正常
@@ -545,6 +629,15 @@ u32 user_signal_check(u32 *frame, u32 pc)
     handler = cur->sig_handler[sig];
 
     if (handler == 0) {
+        /*
+         * v0.7 阶段9: SIGCHLD 的默认动作是"忽略"。pending 位和值
+         * 在上面取队列时已经消费掉了, 直接回去继续跑。
+         *
+         * 其它信号仍然按默认动作终止进程 (task_exit 永不返回)。
+         */
+        if (sig == SIGCHLD) {
+            return pc;
+        }
         printf("[SIG] %s: signal %u has no handler, default = terminate\n",
                cur->name, sig);
         task_exit(-(s32)sig);
@@ -642,7 +735,8 @@ u32 user_signal_check(u32 *frame, u32 pc)
     printf("[SIG] %s: sig %u val %X from %u (%s) → handler %X "
            "(frame at %X, sp %X)\n",
            cur->name, sig, value, sender,
-           (si_code == SI_QUEUE) ? "queue" : "kill",
+           (si_code == SI_QUEUE) ? "queue" :
+           (si_code == SI_CHLD)  ? "chld"  : "kill",
            handler, new_sp, old_sp);
     return handler;
 }
@@ -998,6 +1092,14 @@ void svc_dispatch(u32 svc_num, u32 *frame)
     case SYS_SIGPROCMASK:
         ret = sys_sigprocmask(get_current(), frame[FRAME_R0],
                               frame[FRAME_R1], frame[FRAME_R2]);
+        break;
+
+    case SYS_SIGSUSPEND:
+        ret = sys_sigsuspend(get_current(), frame[FRAME_R0]);
+        break;
+
+    case SYS_SIGPENDING:
+        ret = sys_sigpending(get_current(), frame[FRAME_R0]);
         break;
 
     default: {

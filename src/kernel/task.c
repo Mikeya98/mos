@@ -43,6 +43,9 @@ extern void fork_return_trampoline(void);
 #define ENTER_CRITICAL()  __asm__ volatile("CPSID i" ::: "memory", "cc")
 #define EXIT_CRITICAL()   __asm__ volatile("CPSIE i" ::: "memory", "cc")
 
+/* 信号投递的内部实现, 定义在文件后半段; 调度器里也要用 */
+static int sig_post_locked(task_t *t, u32 sig, u32 value, u32 sender, u32 code);
+
 /* =========================== 调度器全局变量 =========================== */
 
 /** 32-bit 位图: bit31=prio0, bit0=prio31, 1 表示该优先级有待运行任务 */
@@ -465,9 +468,34 @@ void schedule(void)
 
         current_task->state = TASK_ZOMBIE;
 
+        /*
+         * v0.7 阶段9: 子进程退出时给父进程挂一个 SIGCHLD。
+         *
+         * 这里已经在调度器里、紧挨着 context_switch, 不能走
+         * task_signal_send_info 的唤醒/抢占路径 (那会递归进
+         * schedule), 所以只挂 pending, 唤醒由下面两段自己处理。
+         * SIGCHLD 携带的值就是子进程的退出码, si_pid 是子进程。
+         */
+        if (parent && parent != current_task) {
+            sig_post_locked(parent, SIGCHLD, (u32)current_task->exit_code,
+                            current_task->pid, SI_CHLD);
+        }
+
         if (parent && parent->wait_active && parent->state == TASK_BLOCKED &&
             (parent->wait_pid == 0 || parent->wait_pid == current_task->pid)) {
             parent->wait_active = 0;
+            ready_enqueue(parent);
+        } else if (parent && parent->sig_suspended &&
+                   parent->state == TASK_BLOCKED &&
+                   !(parent->sig_blocked & (1u << SIGCHLD)) &&
+                   !(parent->sig_ignore & (1u << SIGCHLD))) {
+            /*
+             * 父进程正卡在 sigsuspend 里等子进程: 这是一条能送达的
+             * 信号, 把它放回就绪队列, sigsuspend 会按 -EINTR 返回。
+             * 被忽略的 SIGCHLD 不唤醒 —— SIG_IGN 的信号不该产生任何
+             * 可见效果。
+             */
+            parent->sig_suspended = 0;
             ready_enqueue(parent);
         }
     }
@@ -1333,45 +1361,25 @@ void task_kill(task_t *t)
 
 /* =========================== 信号投递 (v0.7 阶段2) =========================== */
 
-s32 task_signal_send(s32 pid, u32 sig)
+/**
+ * @brief  在临界区里把一条信号挂到目标任务上 (只置 pending, 不唤醒)
+ *
+ * v0.7 阶段9 从 task_signal_send_info 里抽出来: 调度器在子进程转
+ * 僵尸时也要给父进程挂 SIGCHLD, 那里已经处在 schedule() 内部,
+ * 不能再走唤醒/抢占路径, 否则会递归调度。
+ *
+ * 调用者负责进入/退出临界区。
+ *
+ * @return 0 成功, -EAGAIN 实时队列满
+ */
+static int sig_post_locked(task_t *t, u32 sig, u32 value, u32 sender, u32 code)
 {
-    u32 sender = current_task ? current_task->pid : 0;
-
-    return task_signal_send_info(pid, sig, 0, sender, SI_USER);
-}
-
-s32 task_signal_queue(s32 pid, u32 sig, u32 value)
-{
-    u32 sender = current_task ? current_task->pid : 0;
-
-    return task_signal_send_info(pid, sig, value, sender, SI_QUEUE);
-}
-
-s32 task_signal_send_info(s32 pid, u32 sig, u32 value, u32 sender, u32 code)
-{
-    task_t *t;
-    int woke = 0;
-    int preempt = 0;
-
-    if (sig == 0 || sig >= MOS_NSIG) {
-        return -EINVAL;
-    }
-
-    t = (pid == 0) ? current_task : find_task_by_pid((u32)pid);
-    if (!t || t == &idle_tcb || t->state == TASK_DEAD ||
-        t->state == TASK_ZOMBIE) {
-        return -ESRCH;
-    }
-
-    ENTER_CRITICAL();
-
     /*
      * v0.7 阶段4: 被忽略的信号连 pending 都不置。
      * sigaction 和 kill 可能并发 (比如一个任务刚装 SIG_IGN, 另一个
-     * 正在发), 所以判断放进临界区。
+     * 正在发), 所以判断放在临界区里。
      */
     if (t->sig_ignore & (1u << sig)) {
-        EXIT_CRITICAL();
         return 0;
     }
 
@@ -1390,7 +1398,6 @@ s32 task_signal_send_info(s32 pid, u32 sig, u32 value, u32 sender, u32 code)
         u32 rt;
 
         if (t->sig_count[sig] >= MOS_SIG_MAXPENDING) {
-            EXIT_CRITICAL();
             return -EAGAIN;
         }
 
@@ -1417,6 +1424,47 @@ s32 task_signal_send_info(s32 pid, u32 sig, u32 value, u32 sender, u32 code)
     }
 
     t->sig_pending |= (1u << sig);
+    return 0;
+}
+
+s32 task_signal_send(s32 pid, u32 sig)
+{
+    u32 sender = current_task ? current_task->pid : 0;
+
+    return task_signal_send_info(pid, sig, 0, sender, SI_USER);
+}
+
+s32 task_signal_queue(s32 pid, u32 sig, u32 value)
+{
+    u32 sender = current_task ? current_task->pid : 0;
+
+    return task_signal_send_info(pid, sig, value, sender, SI_QUEUE);
+}
+
+s32 task_signal_send_info(s32 pid, u32 sig, u32 value, u32 sender, u32 code)
+{
+    task_t *t;
+    int woke = 0;
+    int preempt = 0;
+    int ret;
+
+    if (sig == 0 || sig >= MOS_NSIG) {
+        return -EINVAL;
+    }
+
+    t = (pid == 0) ? current_task : find_task_by_pid((u32)pid);
+    if (!t || t == &idle_tcb || t->state == TASK_DEAD ||
+        t->state == TASK_ZOMBIE) {
+        return -ESRCH;
+    }
+
+    ENTER_CRITICAL();
+
+    ret = sig_post_locked(t, sig, value, sender, code);
+    if (ret < 0) {
+        EXIT_CRITICAL();
+        return ret;
+    }
 
     /*
      * v0.7 阶段3: 目标正阻塞、且这条信号没有被屏蔽 → 唤醒它。
@@ -1427,21 +1475,39 @@ s32 task_signal_send_info(s32 pid, u32 sig, u32 value, u32 sender, u32 code)
      *
      * 被屏蔽的信号不唤醒, 留在 pending 里等 sigprocmask 解除屏蔽。
      */
-    if (t->is_user && !(t->sig_blocked & (1u << sig)) &&
-        (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING)) {
-        t->sig_interrupted = 1;
+    if (t->is_user && !(t->sig_blocked & (1u << sig))) {
+        if (t->sig_suspended && t->state == TASK_BLOCKED) {
+            /*
+             * v0.7 阶段9: sigsuspend 挂起的任务没有等待队列, 来一条
+             * 能送达的信号就把它放回就绪队列。sigsuspend 醒来后恢复
+             * 旧屏蔽字、返回 -EINTR, 真正的投递在返回用户态时做。
+             */
+            t->sig_suspended = 0;
+            ready_enqueue(t);
+            woke = 1;
+        } else if (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) {
+            /*
+             * v0.7 阶段9: SIGCHLD 唤醒的 wait 不算被打断。父进程就是
+             * 来等子进程退出的, 这次唤醒正是它要的结果; 如果置
+             * sig_interrupted, task_wait 会先返回 -EINTR 而不是去
+             * 回收僵尸。信号仍在 pending 里, wait 返回用户态后投递。
+             */
+            if (!(t->wait_active && sig == SIGCHLD)) {
+                t->sig_interrupted = 1;
+            }
 
-        if (t->state == TASK_BLOCKED && t->block_remove) {
-            t->block_remove(t->block_obj, t);
+            if (t->state == TASK_BLOCKED && t->block_remove) {
+                t->block_remove(t->block_obj, t);
+            }
+            t->sleep_ticks  = 0;
+            t->block_obj    = NULL;
+            t->block_remove = NULL;
+
+            ready_enqueue(t);   /* 内部把 state 改成 TASK_READY */
+            woke = 1;
         }
-        t->sleep_ticks  = 0;
-        t->block_obj    = NULL;
-        t->block_remove = NULL;
 
-        ready_enqueue(t);       /* 内部把 state 改成 TASK_READY */
-        woke = 1;
-
-        if (current_task && t->priority < current_task->priority) {
+        if (woke && current_task && t->priority < current_task->priority) {
             preempt = 1;
         }
     }
