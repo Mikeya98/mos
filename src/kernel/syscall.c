@@ -186,6 +186,21 @@ static int sys_sem_post(u32 id)
 }
 
 /**
+ * @brief 读用户信号量的当前计数 (v0.7 阶段10)
+ *
+ * 主要给 demo/调试用: u_stop 要靠计数变化判断子进程真的停住了。
+ * count 为负表示有任务在等待, 和错误码的负值会混淆, 所以这里
+ * 只返回非负计数; 有等待者时返回 0。
+ */
+static int sys_sem_value(u32 id)
+{
+    if (id >= SYS_SEM_MAX || !user_sem_used[id]) {
+        return -EINVAL;
+    }
+    return (user_sems[id].count > 0) ? (int)user_sems[id].count : 0;
+}
+
+/**
  * 缺页/页框统计。
  *
  * 数据是内核态填的, 但要写进用户缓冲区 —— 这条路径本身就是
@@ -273,6 +288,13 @@ static int sys_sigaction_ex(task_t *cur, u32 sig, u32 handler, u32 tramp,
         return -EPERM;
     }
     if (sig == 0 || sig >= MOS_NSIG) {
+        return -EINVAL;
+    }
+    /*
+     * v0.7 阶段10: SIGKILL / SIGSTOP 不可捕获、不可忽略。
+     * 装 handler 和设 SIG_IGN 都按无效参数拒绝。
+     */
+    if (sig == SIGKILL || sig == SIGSTOP) {
         return -EINVAL;
     }
     if (flags & ~(unsigned)SA_VALID_FLAGS) {
@@ -789,6 +811,10 @@ void svc_dispatch(u32 svc_num, u32 *frame)
         ret = sys_sem_post(frame[FRAME_R0]);
         break;
 
+    case SYS_SEM_VALUE:
+        ret = sys_sem_value(frame[FRAME_R0]);
+        break;
+
     case SYS_GET_TTBR0:
         /* 调试用: 用户任务读自己的 TTBR0 (页表基址 | ASID) */
         ret = (int)(mmu_current_l1() | mmu_current_asid());
@@ -1161,4 +1187,5 @@ void syscall_init(void)
     user_sem_used[2] = 1;
     user_sem_used[3] = 1;       /* v0.6 阶段8: u_fork 父子同步 */
     user_sem_used[4] = 1;       /* v0.7 阶段8: u_signal 验证 SA_RESETHAND */
+    user_sem_used[5] = 1;       /* v0.7 阶段10: u_stop 子进程心跳 */
 }

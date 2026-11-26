@@ -43,13 +43,17 @@
 #define SYS_SIGACTION_EX 19     /* sigaction_ex(sig, handler, tramp, flags, mask) (v0.7 阶段6) */
 #define SYS_SIGSUSPEND  20      /* sigsuspend(set) 原子换屏蔽字并等信号 (v0.7 阶段9) */
 #define SYS_SIGPENDING  21      /* sigpending(&set) 取待处理信号位图 (v0.7 阶段9) */
-#define SYS_MAX         22
+#define SYS_SEM_VALUE   22      /* sem_value(id) 读信号量计数 (v0.7 阶段10) */
+#define SYS_MAX         23
 
 /* =========================== 信号 =========================== */
 #define MOS_NSIG        32
+#define SIGKILL         9       /* 不可捕获、不可忽略 (v0.7 阶段10) */
 #define SIGUSR1         10
 #define SIGUSR2         12
 #define SIGCHLD         17      /* 子进程退出时由内核发给父进程 (v0.7 阶段9) */
+#define SIGCONT         18      /* 继续被停止的任务 (v0.7 阶段10) */
+#define SIGSTOP         19      /* 停止任务, 不可捕获/忽略/屏蔽 (v0.7 阶段10) */
 
 /*
  * v0.7 阶段4: 实时信号 + SIG_IGN

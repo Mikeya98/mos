@@ -1427,6 +1427,56 @@ static int sig_post_locked(task_t *t, u32 sig, u32 value, u32 sender, u32 code)
     return 0;
 }
 
+/* =========================== 作业控制 (v0.7 阶段10) =========================== */
+
+/*
+ * SIGSTOP 的实现: 把任务从所有调度结构里摘出来, 状态改成 TASK_STOPPED。
+ *
+ * 它可能正在就绪队列里, 也可能阻塞在信号量上 —— 后者要调 block_remove
+ * 摘链 (信号量会把预减的名额退回来), 否则 sem_post 时会对着一个已经
+ * 不在链表里的任务操作。
+ */
+static void task_stop_one(task_t *t)
+{
+    if (!t || t == &idle_tcb) {
+        return;
+    }
+    if (t->state == TASK_DEAD || t->state == TASK_ZOMBIE ||
+        t->state == TASK_EXITING || t->state == TASK_STOPPED) {
+        return;
+    }
+
+    if (t->state == TASK_READY || t->state == TASK_RUNNING) {
+        ready_dequeue(t);
+    }
+    if (t->state == TASK_BLOCKED && t->block_remove) {
+        t->block_remove(t->block_obj, t);
+    }
+
+    t->block_obj       = NULL;
+    t->block_remove    = NULL;
+    t->wait_active     = 0;
+    t->wait_pid        = 0;
+    t->sig_suspended   = 0;
+    t->sig_interrupted = 0;
+    t->sleep_ticks     = 0;
+    t->state           = TASK_STOPPED;
+
+    printf("[STOP] %s(pid %u) stopped\n", t->name, t->pid);
+}
+
+static void task_continue_one(task_t *t)
+{
+    if (!t || t == &idle_tcb || t->state != TASK_STOPPED) {
+        return;
+    }
+
+    t->state = TASK_READY;
+    ready_enqueue(t);
+
+    printf("[STOP] %s(pid %u) continued\n", t->name, t->pid);
+}
+
 s32 task_signal_send(s32 pid, u32 sig)
 {
     u32 sender = current_task ? current_task->pid : 0;
@@ -1456,6 +1506,38 @@ s32 task_signal_send_info(s32 pid, u32 sig, u32 value, u32 sender, u32 code)
     if (!t || t == &idle_tcb || t->state == TASK_DEAD ||
         t->state == TASK_ZOMBIE) {
         return -ESRCH;
+    }
+
+    /*
+     * v0.7 阶段10: SIGSTOP / SIGCONT 直接改任务状态, 不挂 pending。
+     * 它们没有可安装的 handler, 也不排队 —— POSIX 里 SIGSTOP 的
+     * "默认动作"就是停止, 送多少次都只停一次。
+     */
+    if (sig == SIGSTOP) {
+        ENTER_CRITICAL();
+        task_stop_one(t);
+        EXIT_CRITICAL();
+
+        if (t == current_task) {
+            schedule();         /* 停自己: 切走, 等 CONT 唤醒 */
+        }
+        return 0;
+    }
+
+    if (sig == SIGCONT) {
+        int wake = 0;
+
+        ENTER_CRITICAL();
+        if (t->state == TASK_STOPPED) {
+            task_continue_one(t);
+            wake = 1;
+        }
+        EXIT_CRITICAL();
+
+        if (wake && current_task && t->priority < current_task->priority) {
+            schedule();
+        }
+        return 0;
     }
 
     ENTER_CRITICAL();
@@ -1508,6 +1590,22 @@ s32 task_signal_send_info(s32 pid, u32 sig, u32 value, u32 sender, u32 code)
         }
 
         if (woke && current_task && t->priority < current_task->priority) {
+            preempt = 1;
+        }
+    }
+
+    /*
+     * v0.7 阶段10: SIGKILL 必须能杀掉被停止的任务。
+     *
+     * 被 SIGSTOP 的任务不会主动从内核返回用户态, 光把 SIGKILL 放进
+     * pending 它永远看不到。这里把它放回就绪队列, 下一次从系统调用
+     * 返回时按默认动作终止 —— 走的是正常的僵尸路径, 父进程还能
+     * wait 到退出码 -9。
+     */
+    if (sig == SIGKILL && t->state == TASK_STOPPED) {
+        t->state = TASK_READY;
+        ready_enqueue(t);
+        if (current_task && t->priority < current_task->priority) {
             preempt = 1;
         }
     }

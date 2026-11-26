@@ -145,6 +145,19 @@ USYS_INLINE s32 usys_sem_post(u32 id)
     return (s32)r0;
 }
 
+/**
+ * 读信号量当前计数 (v0.7 阶段10)。
+ *
+ * 有等待者时返回 0（计数为负不外露），所以它适合做"进度有没有
+ * 增长"的判断，不适合判断有没有任务在等。
+ */
+USYS_INLINE s32 usys_sem_value(u32 id)
+{
+    register u32 r0 __asm__("r0") = id;
+    __asm__ volatile ("SVC #22" : "+r"(r0) : : "memory", "lr");
+    return (s32)r0;
+}
+
 /** 读取当前任务的 TTBR0 (页表基址), 调试/验证地址空间切换用 */
 USYS_INLINE u32 usys_ttbr0(void)
 {

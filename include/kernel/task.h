@@ -31,7 +31,8 @@ typedef enum {
     TASK_SLEEPING   = 3,   /* 睡眠: 等待超时唤醒 */
     TASK_DEAD       = 4,   /* 终止: 任务已退出 */
     TASK_ZOMBIE     = 5,   /* 僵尸: 已退出, 等父进程 wait 回收 (v0.6 阶段10) */
-    TASK_EXITING    = 6    /* 正在退出: 已经离开就绪队列, 但还站在自己的内核栈上 */
+    TASK_EXITING    = 6,   /* 正在退出: 已经离开就绪队列, 但还站在自己的内核栈上 */
+    TASK_STOPPED    = 7    /* 已停止: SIGSTOP, 等 SIGCONT 唤醒 (v0.7 阶段10) */
 } task_state_t;
 
 /* =========================== 任务控制块 =========================== */

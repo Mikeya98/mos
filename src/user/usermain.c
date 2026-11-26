@@ -1691,6 +1691,154 @@ static void USER_TEXT u_chld(void)
     usys_exit(0);
 }
 
+/* =========================== SIGSTOP / SIGCONT 演示 (v0.7 阶段10) =========================== */
+
+static const char msg_sp1[] USER_RODATA =
+    "[user] u_stop  : SIGSTOP/SIGKILL cannot be caught — sigaction rejected\n";
+static const char msg_sp2[] USER_RODATA =
+    "[user] u_stop  : fork a child that posts sem 5 once per round\n";
+static const char msg_sp3[] USER_RODATA =
+    "[user] u_stop  : child stopped, counter frozen — SIGSTOP OK\n";
+static const char msg_sp4[] USER_RODATA =
+    "[user] u_stop  : counter still moving after SIGSTOP — FAILED\n";
+static const char msg_sp5[] USER_RODATA =
+    "[user] u_stop  : child resumed and the counter grows again — SIGCONT OK\n";
+static const char msg_sp6[] USER_RODATA =
+    "[user] u_stop  : child did not resume — SIGCONT FAILED\n";
+static const char msg_sp7[] USER_RODATA =
+    "[user] u_stop  : SIGKILL reaped with -9 — OK\n";
+static const char msg_sp8[] USER_RODATA =
+    "[user] u_stop  : SIGKILL test FAILED\n";
+static const char msg_sp9[] USER_RODATA =
+    "[user] u_stop  : fork FAILED\n";
+static const char msg_sp10[] USER_RODATA =
+    "[user] u_stop  : SIGSTOP was catchable — FAILED\n";
+
+/** 子进程: 每轮给信号量 5 加一, 再让出 CPU —— 计数器就是它的"心跳" */
+static void USER_TEXT u_stop_child(void)
+{
+    u32 i;
+
+    for (i = 0; i < 5000; i++) {
+        usys_sem_post(5);
+        usys_yield();
+    }
+    usys_exit(0);
+}
+
+/**
+ * SIGSTOP / SIGCONT / SIGKILL 演示。
+ *
+ * 父进程 fork 一个不停给信号量加一的子进程:
+ *   1. 给它发 SIGSTOP, 睡一会, 看计数是否冻结
+ *   2. 发 SIGCONT, 看计数是否继续增长
+ *   3. 发 SIGKILL, wait 回收, 退出码应该是 -9
+ *
+ * 父子同优先级, yield 轮转, 所以父进程读计数和子进程加计数会
+ * 交错进行。
+ */
+static void USER_TEXT u_stop(void)
+{
+    volatile u32 *seen = (volatile u32 *)(uintptr_t)USER_DATA_VADDR;
+    s32 child;
+    s32 code;
+    s32 r;
+    s32 v1;
+    s32 v2;
+    u32 i;
+
+    for (i = 0; i < 8; i++) {
+        seen[i] = 0;
+    }
+
+    /* ---------- 1. SIGSTOP / SIGKILL 不可捕获 ---------- */
+    if (usys_sigaction(SIGSTOP, (void (*)(int))sig_handler_count,
+                       sig_tramp) == -EINVAL &&
+        usys_sigaction(SIGKILL, (void (*)(int))sig_handler_count,
+                       sig_tramp) == -EINVAL) {
+        SAY(msg_sp1);
+    } else {
+        SAY(msg_sp10);
+    }
+
+    /*
+     * SIGCHLD 用 handler 记下退出码。SIGKILL 的退出码既可以通过
+     * wait 的 code 输出拿, 也会随 SIGCHLD 的 si_value 一起送到,
+     * 这里以后者为准 —— 两个通道都通才是真的通。
+     */
+    usys_sigaction_ex(SIGCHLD, (void (*)(int))sig_handler_chld, sig_tramp,
+                      SA_SIGINFO, 0);
+
+    /* ---------- 2. fork 一个持续"心跳"的子进程 ---------- */
+    SAY(msg_sp2);
+    child = usys_fork();
+    if (child == 0) {
+        u_stop_child();
+        usys_exit(0);
+    }
+    if (child < 0) {
+        SAY(msg_sp9);
+        usys_exit(0);
+    }
+
+    /* 等心跳跑起来 */
+    for (i = 0; i < 5000 && usys_sem_value(5) < 20; i++) {
+        usys_yield();
+    }
+
+    /* ---------- 3. SIGSTOP: 计数应该冻结 ---------- */
+    usys_kill(child, SIGSTOP);
+
+    /*
+     * 让出很多轮来"等一段时间"。这里不用 sleep: 父子同优先级,
+     * yield 会轮转, 子进程如果没停住就有充分机会继续加计数。
+     */
+    for (i = 0; i < 300; i++) {
+        usys_yield();
+    }
+    v1 = usys_sem_value(5);
+
+    for (i = 0; i < 2000; i++) {
+        usys_yield();
+    }
+    v2 = usys_sem_value(5);
+
+    if (v2 == v1) {
+        SAY(msg_sp3);
+    } else {
+        SAY(msg_sp4);
+        say_hex(msg_empty, (u32)v1, msg_nl);
+        say_hex(msg_empty, (u32)v2, msg_nl);
+    }
+
+    /* ---------- 4. SIGCONT: 计数继续增长 ---------- */
+    usys_kill(child, SIGCONT);
+    for (i = 0; i < 5000 && usys_sem_value(5) < v2 + 20; i++) {
+        usys_yield();
+    }
+    if (usys_sem_value(5) >= v2 + 20) {
+        SAY(msg_sp5);
+    } else {
+        SAY(msg_sp6);
+    }
+
+    /* ---------- 5. SIGKILL: 立即终止, 父进程 wait 到 -9 ---------- */
+    usys_kill(child, SIGKILL);
+    code = 0;
+    r = usys_wait(child, &code);
+    if (r == child && code == -SIGKILL &&
+        seen[2] == (u32)child && (s32)seen[4] == -SIGKILL) {
+        SAY(msg_sp7);
+    } else {
+        SAY(msg_sp8);
+        say_hex(msg_empty, (u32)r, msg_nl);
+        say_hex(msg_empty, (u32)code, msg_nl);
+        say_hex(msg_empty, seen[4], msg_nl);
+    }
+
+    usys_exit(0);
+}
+
 /* =========================== 内核侧初始化 =========================== */
 
 extern u8 _user_text_start;
@@ -1874,11 +2022,15 @@ void user_demo_init(void)
      * 的 demo 退出、地址空间槽位空出来之后再跑。
      */
     if (!create_user("u_chld",    u_chld,    3)) return;
+    /*
+     * u_stop 也要 fork, 排在 u_chld 后面 (优先级 4), 等它退出后再跑。
+     */
+    if (!create_user("u_stop",    u_stop,    4)) return;
     if (!create_user("u_demand",  u_demand,  1)) return;
     if (!create_user("u_overflow", u_overflow, 1)) return;
     if (!create_user("u_swap",    u_swap,    1)) return;
 
-    printf("\n[DEMO] 15 user tasks created, each with its own L1 page table\n");
+    printf("\n[DEMO] 16 user tasks created, each with its own L1 page table\n");
 
     /*
      * 回收演示的驱动任务: 内核态, 优先级 30 (只比 IDLE 高)。
